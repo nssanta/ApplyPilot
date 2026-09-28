@@ -331,3 +331,10 @@ SOURCE_DIR=/absolute/path/to/OPERATION_EXIT
 Устройство модулей и границы данных описаны в
 [архитектуре](docs/ARCHITECTURE.md). Локальные профили, отчёты и рабочие
 журналы остаются в `private/` и не входят в публичный репозиторий.
+
+## Участники
+
+Спасибо участникам, чьи изменения вошли в основной код проекта:
+
+- [@Vova4o](https://github.com/Vova4o) — grounded cover-letter workflow и улучшения надёжности откликов ([PR #1](https://github.com/nssanta/ApplyPilot/pull/1)).
+- [@artemius125](https://github.com/artemius125) — LLM-скрининг вакансий, локальная веб-админка, треки, watcher/packaging и основа hardening-прохода ([PR #3](https://github.com/nssanta/ApplyPilot/pull/3); заменил PR #2).
