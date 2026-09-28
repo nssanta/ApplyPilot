@@ -78,7 +78,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
 
 
 def resolve_search(search: dict[str, Any], preset_name: str | None = None) -> dict[str, Any]:
-    """Apply a public role preset, then let private search settings override it."""
+    """Применяет публичный пресет роли, после чего приватные search-настройки могут его переопределить."""
     name = preset_name or search.get("preset")
     base = deepcopy(ROLE_PRESETS.get(str(name), {})) if name else {}
     preset_fields = {

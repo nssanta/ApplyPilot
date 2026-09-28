@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 #
-# build-deb.sh — build a self-contained Debian package for ApplyPilot.
+# build-deb.sh — сборка самодостаточного Debian-пакета ApplyPilot.
 #
-# The resulting .deb bundles a Python virtual environment with the
-# application installed under /opt/applypilot, plus a small launcher
-# at /usr/local/bin/applypilot.
+# Полученный .deb содержит Python virtualenv с установленным приложением
+# в /opt/applypilot и небольшой launcher /usr/local/bin/applypilot.
 #
-# Usage:
+# Использование:
 #   bash packaging/build-deb.sh
 #   VERSION=1.2.3 bash packaging/build-deb.sh
 #   WITH_BROWSER=1 bash packaging/build-deb.sh
 #
-# Environment variables:
-#   VERSION       Override the package version (default: [project].version
-#                 from pyproject.toml).
-#   WITH_BROWSER  If set to 1, install the optional "browser" extra
-#                 (Playwright) into the bundled venv.
+# Переменные окружения:
+#   VERSION       Переопределить версию пакета. По умолчанию читается
+#                 [project].version из pyproject.toml.
+#   WITH_BROWSER  При значении 1 установить необязательную зависимость
+#                 "browser" (Playwright) во встроенный virtualenv.
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Resolve paths.
+# Определяем пути.
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -31,37 +30,38 @@ ARCH="amd64"
 MAINTAINER="${MAINTAINER:-ApplyPilot Maintainers <maintainers@example.invalid>}"
 
 # ---------------------------------------------------------------------------
-# Preflight checks.
+# Предварительные проверки.
 # ---------------------------------------------------------------------------
-echo "==> Checking build prerequisites"
+echo "==> Проверка зависимостей сборки"
 
 if ! command -v dpkg-deb >/dev/null 2>&1; then
-  echo "ERROR: dpkg-deb not found. Install it with: sudo apt-get install dpkg-dev" >&2
+  echo "ОШИБКА: dpkg-deb не найден. Установите: sudo apt-get install dpkg-dev" >&2
   exit 1
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: python3 not found. Install Python 3.12 or newer." >&2
+  echo "ОШИБКА: python3 не найден. Нужен Python 3.12 или новее." >&2
   exit 1
 fi
 
 if [ ! -f "${PYPROJECT}" ]; then
-  echo "ERROR: pyproject.toml not found at ${PYPROJECT}" >&2
+  echo "ОШИБКА: pyproject.toml не найден: ${PYPROJECT}" >&2
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Determine the version.
+# Определяем версию.
 # ---------------------------------------------------------------------------
 if [ -n "${VERSION:-}" ]; then
   version="${VERSION}"
-  echo "==> Using version from VERSION env: ${version}"
+  echo "==> Версия из VERSION: ${version}"
 else
   version="$(python3 - "${PYPROJECT}" <<'PYEOF'
 import sys
+
 try:
     import tomllib
-except ModuleNotFoundError:  # Python < 3.11
+except ModuleNotFoundError:  # Совместимый fallback для Python < 3.11.
     tomllib = None
 
 path = sys.argv[1]
@@ -70,7 +70,7 @@ if tomllib is not None:
         data = tomllib.load(fh)
     print(data["project"]["version"])
 else:
-    # Minimal fallback parser: find version under [project].
+    # Минимальный fallback-парсер: ищем version внутри [project].
     in_project = False
     for line in open(path, encoding="utf-8"):
         stripped = line.strip()
@@ -84,14 +84,14 @@ else:
 PYEOF
 )"
   if [ -z "${version}" ]; then
-    echo "ERROR: could not determine version from pyproject.toml" >&2
+    echo "ОШИБКА: не удалось определить версию из pyproject.toml" >&2
     exit 1
   fi
-  echo "==> Detected version from pyproject.toml: ${version}"
+  echo "==> Версия из pyproject.toml: ${version}"
 fi
 
 # ---------------------------------------------------------------------------
-# Prepare the build layout in a temporary directory.
+# Готовим временную структуру пакета.
 # ---------------------------------------------------------------------------
 BUILD_ROOT="$(mktemp -d)"
 cleanup() {
@@ -100,35 +100,35 @@ cleanup() {
 trap cleanup EXIT
 
 STAGE="${BUILD_ROOT}/${PACKAGE}_${version}_${ARCH}"
-echo "==> Preparing package layout in ${STAGE}"
+echo "==> Подготовка структуры пакета: ${STAGE}"
 
 mkdir -p "${STAGE}/opt/applypilot"
 mkdir -p "${STAGE}/usr/local/bin"
 mkdir -p "${STAGE}/DEBIAN"
 
 # ---------------------------------------------------------------------------
-# Create the bundled virtual environment and install the application.
+# Создаём встроенный virtualenv и устанавливаем приложение.
 # ---------------------------------------------------------------------------
 VENV_DIR="${STAGE}/opt/applypilot/venv"
-echo "==> Creating virtual environment at ${VENV_DIR}"
+echo "==> Создание virtualenv: ${VENV_DIR}"
 python3 -m venv "${VENV_DIR}"
 
-echo "==> Upgrading pip inside the venv"
+echo "==> Обновление pip внутри virtualenv"
 "${VENV_DIR}/bin/pip" install --upgrade pip >/dev/null
 
 if [ "${WITH_BROWSER:-0}" = "1" ]; then
-  echo "==> Installing applypilot with the 'browser' extra (this needs network access)"
+  echo "==> Установка ApplyPilot с browser-extra (нужен доступ к сети)"
   "${VENV_DIR}/bin/pip" install "${REPO_ROOT}[browser]"
 else
-  echo "==> Installing applypilot (this needs network access)"
+  echo "==> Установка ApplyPilot (нужен доступ к сети)"
   "${VENV_DIR}/bin/pip" install "${REPO_ROOT}"
 fi
 
 # ---------------------------------------------------------------------------
-# Install the launcher.
+# Устанавливаем launcher.
 # ---------------------------------------------------------------------------
 LAUNCHER="${STAGE}/usr/local/bin/applypilot"
-echo "==> Writing launcher to /usr/local/bin/applypilot"
+echo "==> Создание launcher: /usr/local/bin/applypilot"
 cat > "${LAUNCHER}" <<'LAUNCHEOF'
 #!/bin/sh
 exec /opt/applypilot/venv/bin/python -m applypilot "$@"
@@ -136,9 +136,9 @@ LAUNCHEOF
 chmod 755 "${LAUNCHER}"
 
 # ---------------------------------------------------------------------------
-# Write the DEBIAN/control file.
+# Создаём DEBIAN/control.
 # ---------------------------------------------------------------------------
-echo "==> Writing DEBIAN/control"
+echo "==> Создание DEBIAN/control"
 cat > "${STAGE}/DEBIAN/control" <<CONTROLEOF
 Package: ${PACKAGE}
 Version: ${version}
@@ -147,27 +147,25 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: ${MAINTAINER}
 Depends: python3 (>= 3.12)
-Description: Local, explainable HH.ru job-search and application workflow
- ApplyPilot is a local command-line tool that helps search for jobs on
- HH.ru, score and review vacancies, draft cover letters and manage the
- application workflow in an explainable way.
+Description: Локальный инструмент поиска вакансий и откликов на HH.ru
+ ApplyPilot помогает искать, оценивать и просматривать вакансии, готовить
+ сопроводительные письма и контролируемо вести процесс откликов.
  .
- This package bundles a self-contained Python virtual environment under
- /opt/applypilot and exposes the "applypilot" command via
- /usr/local/bin. Playwright browsers and HH.ru sign-in are configured by
- the user after installation.
+ Пакет содержит отдельный Python virtualenv в /opt/applypilot и команду
+ applypilot в /usr/local/bin. Браузеры Playwright и вход в HH.ru
+ пользователь настраивает после установки.
 CONTROLEOF
 
 # ---------------------------------------------------------------------------
-# Build the .deb.
+# Собираем .deb.
 # ---------------------------------------------------------------------------
 OUTPUT="${REPO_ROOT}/${PACKAGE}_${version}_${ARCH}.deb"
-echo "==> Building package with dpkg-deb"
+echo "==> Сборка пакета через dpkg-deb"
 dpkg-deb --build --root-owner-group "${STAGE}" "${OUTPUT}"
 
 echo
-echo "==> Done. Package written to:"
+echo "==> Готово. Пакет:"
 echo "    ${OUTPUT}"
 echo
-echo "Install it with:"
+echo "Установка:"
 echo "    sudo dpkg -i ${OUTPUT}"

@@ -57,7 +57,7 @@ def test_delete_track_keeps_other_tracks_and_files(tmp_path):
     assert app.settings_public()["tracks"][0]["key"] == "keep"
     assert tomllib.loads(config_path.read_text(encoding="utf-8"))["track"][0]["screen_report"] == "private/reports/custom-keep.json"
 
-    # Reloading the app must not restore removed tracks from built-in defaults.
+    # Повторная загрузка приложения не должна восстанавливать удалённые треки из дефолтов.
     fresh = AdminApp(AppConfig.discover(root=tmp_path))
     assert [t["key"] for t in fresh.tracks_overview()["tracks"]] == ["keep"]
 

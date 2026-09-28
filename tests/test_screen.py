@@ -65,7 +65,7 @@ def test_screen_vacancies_merges_and_caches(tmp_path):
     assert first[0]["source"] == "generated" and first[0]["url"] == "https://hh.ru/vacancy/1"
     assert calls["n"] == 1
 
-    # Second run must hit the cache and not call the model again.
+    # Второй запуск должен попасть в кэш и не вызывать модель повторно.
     second = screen_vacancies(items, profile, tmp_path, track="ai",
                               api_key="test-key", post=fake_post)
     assert second[0]["source"] == "cache"
@@ -118,6 +118,41 @@ def test_empty_profile_does_not_add_candidate_or_job_preferences():
     assert "Junior/Middle" not in prompt
     assert "частичная занятость" not in prompt
     assert "зарплата не влияет на вердикт" in prompt
+
+
+def test_cli_screen_forwards_private_aitunnel_key_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    key_file = tmp_path / "private/config/aitunnel.key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("file-key\n", encoding="utf-8")
+
+    data = tmp_path / "private/data"
+    source = tmp_path / "scan.json"
+    source.write_text(json.dumps({"items": [{
+        "id": "1", "name": "AI Agent Engineer", "description": "Python LLM RAG",
+    }]}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "applypilot.cli.filter_candidates",
+        lambda items, *_args, **_kwargs: [
+            SimpleNamespace(id=str(item["id"]), score=80) for item in items
+        ],
+    )
+    captured = {}
+
+    def fake_screen(items, *args, **kwargs):
+        captured["api_key"] = kwargs.get("api_key")
+        return [{**item, "verdict": "FIT", "fit_score": 80} for item in items]
+
+    monkeypatch.setattr("applypilot.cli.screen_vacancies", fake_screen)
+
+    result = main([
+        "--data-dir", str(data), "screen", "--input", str(source), "--track", "ai",
+        "--output", str(tmp_path / "screen.json"),
+    ])
+
+    assert result == 0
+    assert captured["api_key"] == "file-key"
 
 
 def test_cli_screen_keeps_vacancy_reported_by_another_track(tmp_path, monkeypatch):

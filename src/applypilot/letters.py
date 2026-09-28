@@ -1,14 +1,12 @@
-"""LLM cover-letter generator.
+"""LLM-генератор сопроводительных писем.
 
-An optional pass that drafts a short, individual cover letter for one vacancy
-with a cheap OpenAI-compatible model.  The letter is built strictly from facts
-already present in the private profile — the model is instructed never to invent
-experience, employers, years or results — and is tailored to the specific
-vacancy by referencing one or two genuinely relevant facts about the candidate.
+Необязательный этап создаёт короткое индивидуальное письмо для конкретной вакансии
+через OpenAI-compatible модель. Письмо строится только на фактах из приватного
+профиля: модели запрещено выдумывать опыт, работодателей, сроки и результаты.
 
-The API key is read from the ``AITUNNEL_API_KEY`` environment variable; nothing
-secret is written to disk.  Generated letters are cached on disk keyed by the
-vacancy, the allowlisted profile subset, the model and the prompt version.
+API-ключ читается из ``AITUNNEL_API_KEY`` или передаётся вызывающим кодом.
+Сгенерированные письма кэшируются по вакансии, allowlist-подмножеству профиля,
+модели и версии prompt.
 """
 
 from __future__ import annotations
@@ -30,11 +28,11 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 class LettersError(RuntimeError):
-    """The cover-letter pass could not run (configuration or transport)."""
+    """Генерация письма не может выполниться из-за конфигурации или транспорта."""
 
 
 def _string_list(value: Any) -> list[str]:
-    """Coerce a value into a clean list of non-empty strings."""
+    """Преобразует значение в очищенный список непустых строк."""
     if isinstance(value, str):
         items = [value]
     elif isinstance(value, (list, tuple)):
@@ -51,7 +49,7 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _professional_subset(profile: dict[str, Any]) -> dict[str, Any]:
-    """Extract a compact, allowlisted professional description from the profile."""
+    """Извлекает компактное профессиональное описание только из разрешённых полей профиля."""
     raw = profile.get("professional")
     if not isinstance(raw, dict):
         return {}
@@ -84,7 +82,7 @@ def _professional_subset(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def candidate_context(profile: dict[str, Any]) -> dict[str, Any]:
-    """Assemble a compact, allowlisted candidate description for the model."""
+    """Собирает компактное описание кандидата для модели только из разрешённых полей."""
     ctx: dict[str, Any] = {
         key: profile[key] for key in ("name", "location") if profile.get(key)
     }
@@ -165,10 +163,10 @@ def letter_messages(item: dict[str, Any], candidate: dict[str, Any]) -> list[dic
 
 
 def tidy_letter(text: str) -> str:
-    """Normalise typography the model tends to slip in despite the prompt.
+    """Нормализует типографику, которую модель иногда добавляет вопреки prompt.
 
-    Non-breaking hyphens/spaces become plain ones, em dashes between words become
-    commas, arrows become words, and markdown emphasis markers are dropped.
+    Неразрывные дефисы и пробелы заменяются обычными, длинные тире между словами —
+    запятыми, стрелки — словами, а markdown-маркеры выделения удаляются.
     """
     out = text.replace("‑", "-").replace("‐", "-").replace(" ", " ")
     out = out.replace(" — ", ", ").replace(" – ", ", ").replace("—", ", ").replace("→", " до ")
@@ -195,16 +193,16 @@ def letter_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str
 def _post_letter(post: Callable[..., Any], url: str, model: str, key: str,
                  messages: list[dict[str, str]], deadline: float,
                  max_retries: int = 5) -> str:
-    """POST one letter request with jittered exponential backoff on 429/5xx."""
+    """Отправляет один запрос письма с jittered exponential backoff для 429/5xx."""
     import httpx
 
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    # Reasoning models spend tokens on hidden reasoning before the text, so give
-    # generous headroom; too small a budget returns an empty message.
+    # Reasoning-модели тратят токены на скрытое рассуждение до текста, поэтому даём
+    # достаточный запас: слишком маленький budget может вернуть пустое сообщение.
     payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.7,
                                "max_tokens": 3000}
-    # gpt-5 / o-series models otherwise spend minutes (and the whole token budget)
-    # on hidden reasoning for a 120-word letter; low effort answers in ~15s.
+    # gpt-5 / o-series иначе могут потратить минуты и весь token budget
+    # на скрытое рассуждение ради короткого письма; low effort отвечает заметно быстрее.
     if model.lower().startswith(("gpt-5", "o1", "o3", "o4")):
         payload["reasoning_effort"] = "low"
     last_error: Exception | None = None
@@ -241,11 +239,11 @@ def generate_letter(item: dict[str, Any], profile: dict[str, Any], cache_dir: Pa
                     api_key: str | None = None,
                     post: Callable[..., Any] | None = None,
                     deadline: float = 240.0) -> dict[str, Any]:
-    """Generate an individual cover letter for one vacancy.
+    """Генерирует индивидуальное сопроводительное письмо для одной вакансии.
 
-    Returns ``{"text": str, "source": "cache"|"generated"}``.  Cached letters
-    (per vacancy + allowlisted profile + model + prompt version) are reused.
-    ``post`` is injectable for testing; by default a shared httpx client is used.
+    Возвращает ``{"text": str, "source": "cache"|"generated"}``. Кэш переиспользуется
+    по вакансии, allowlist-профилю, модели и версии prompt. ``post`` можно подменить
+    в тестах; по умолчанию используется общий httpx-клиент.
     """
     if not str(model).strip():
         raise LettersError("letter generation requires an explicit model")

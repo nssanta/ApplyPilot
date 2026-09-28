@@ -127,6 +127,18 @@ def test_admin_refuses_public_bind_addresses(tmp_path):
         serve(AppConfig.discover(root=tmp_path), host="0.0.0.0")
 
 
+def test_admin_reads_private_aitunnel_key_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("AITUNNEL_API_KEY", raising=False)
+    key_file = tmp_path / "private/config/aitunnel.key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("file-key\n", encoding="utf-8")
+
+    app = AdminApp(AppConfig.discover(root=tmp_path))
+
+    assert app.settings_public()["key_set"] is True
+    assert app._api_key() == "file-key"
+
+
 def test_admin_rejects_insecure_remote_provider_url(tmp_path):
     app = AdminApp(AppConfig.discover(root=tmp_path))
 

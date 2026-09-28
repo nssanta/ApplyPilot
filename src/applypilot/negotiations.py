@@ -12,7 +12,7 @@ from .storage import Store
 
 
 class SyncError(RuntimeError):
-    """Read-only status sync could not produce a trustworthy snapshot."""
+    """Read-only синхронизация статусов не смогла получить достоверный snapshot."""
 
 
 STATUS_MAP = {
@@ -80,7 +80,7 @@ def _parse_topics(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def sync_statuses(state_path: Path, store: Store, account: str = "default",
                   max_pages: int | None = None, timeout: float = 20.0) -> list[dict[str, Any]]:
-    """Read negotiation statuses only; messages and chat endpoints are excluded."""
+    """Читает только статусы откликов; сообщения и chat-endpoints не используются."""
     client: requests.Session | None = None
     try:
         if max_pages is not None and max_pages < 1:

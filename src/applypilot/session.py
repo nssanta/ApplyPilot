@@ -18,7 +18,7 @@ class SessionCheck:
 
 
 def classify_session_page(url: str, body: str) -> SessionCheck:
-    """Classify an HH applicant page using host, URL and account markers."""
+    """Классифицирует страницу кандидата HH по host, URL и маркерам аккаунта."""
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
     path = parsed.path.lower()
@@ -71,7 +71,7 @@ def login(path: Path) -> None:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        raise RuntimeError("Install browser support with: pip install -e '.[browser]'") from exc
+        raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=False)
         context = None
@@ -88,7 +88,7 @@ def login(path: Path) -> None:
 
 
 def check_session(path: Path) -> SessionCheck:
-    """Classify the real HH session without using the user's existing browser."""
+    """Проверяет реальную HH-сессию без использования текущего браузера пользователя."""
     ok, detail = validate_state(path)
     if not ok:
         return SessionCheck("missing" if detail == "missing" else "invalid", detail)
@@ -106,7 +106,7 @@ def check_session(path: Path) -> SessionCheck:
             page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
             body = page.locator("body").inner_text(timeout=5000)
             return classify_session_page(page.url, body)
-    except Exception as exc:  # noqa: BLE001 - browser/network errors are classified together
+    except Exception as exc:  # noqa: BLE001 — ошибки браузера и сети классифицируются вместе
         return SessionCheck("network_error", str(exc))
     finally:
         if context is not None:

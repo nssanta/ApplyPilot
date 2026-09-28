@@ -17,6 +17,7 @@ from .analytics import report
 from .config import (
     AppConfig,
     ConfigError,
+    aitunnel_api_key,
     effective_search,
     ensure_data_dirs,
     search_groups,
@@ -59,37 +60,37 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--data-dir", help="runtime data directory")
-    parser.add_argument("--profile", help="private TOML profile")
-    parser.add_argument("--search", help="TOML search configuration")
+    parser.add_argument("--data-dir", help="каталог рабочих данных")
+    parser.add_argument("--profile", help="приватный TOML-профиль")
+    parser.add_argument("--search", help="TOML-конфигурация поиска")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="applypilot", description="Local HH.ru application workflow")
+    parser = argparse.ArgumentParser(prog="applypilot", description="Локальный процесс поиска вакансий и откликов на HH.ru")
     parser.add_argument("--version", action="version", version=__version__)
     _common(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor", help="check local setup")
-    doctor.add_argument("--online", action="store_true", help="perform a small public network check")
+    doctor = sub.add_parser("doctor", help="проверить локальную установку")
+    doctor.add_argument("--online", action="store_true", help="выполнить небольшой публичный сетевой тест")
 
-    sub.add_parser("login", help="open an isolated browser for manual login")
-    session = sub.add_parser("session", help="inspect the saved session")
+    sub.add_parser("login", help="открыть изолированный браузер для ручного входа")
+    session = sub.add_parser("session", help="проверить сохранённую сессию")
     session.add_argument("action", choices=["check"])
 
-    scan_cmd = sub.add_parser("scan", help="fetch a vacancy snapshot")
+    scan_cmd = sub.add_parser("scan", help="получить снимок вакансий")
     scan_cmd.add_argument("--query")
     scan_cmd.add_argument("--add-query", action="append",
-                          help="append a query without replacing preset queries")
+                          help="добавить запрос, не заменяя запросы пресета")
     scan_cmd.add_argument("--area", type=int, action="append")
     scan_cmd.add_argument("--page", type=int)
     scan_cmd.add_argument("--pages", type=int)
     scan_cmd.add_argument("--request-budget", type=int,
-                          help="maximum search HTTP requests; overrides TOML")
+                          help="максимум поисковых HTTP-запросов; имеет приоритет над TOML")
     scan_cmd.add_argument(
         "--sort-mode",
         choices=("relevance", "newest", "balanced"),
-        help="search ordering strategy; default comes from TOML (legacy default: relevance)",
+        help="стратегия сортировки; по умолчанию из TOML (исторически relevance)",
     )
     scan_cmd.add_argument("--days", type=int)
     scan_cmd.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
@@ -101,113 +102,113 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--experience", action="append")
     scan_cmd.add_argument("--work-format", action="append")
 
-    for name, help_text in (("plan", "select candidates offline"), ("apply", "prepare or send applications")):
+    for name, help_text in (("plan", "офлайн-отбор кандидатов"), ("apply", "подготовить или отправить отклики")):
         cmd = sub.add_parser(name, help=help_text)
         cmd.add_argument("--input", required=True, type=Path)
-        cmd.add_argument("--limit", type=int, help="maximum selected vacancies")
+        cmd.add_argument("--limit", type=int, help="максимум выбранных вакансий")
         cmd.add_argument("--min-score", type=int)
         cmd.add_argument("--rescore", action="store_true",
-                         help="recalculate legacy snapshots instead of preserving historical score")
+                         help="пересчитать старые snapshots вместо сохранения исторического score")
         cmd.add_argument("--skip-security", action="store_true")
         if name == "apply":
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--run", action="store_true")
             cmd.add_argument(
                 "--target-success", type=int,
-                help="stop after this many confirmed successes; --limit is the candidate ceiling",
+                help="остановиться после указанного числа подтверждённых откликов; --limit задаёт потолок кандидатов",
             )
         else:
-            cmd.add_argument("--output", type=Path, help="private JSON plan output")
+            cmd.add_argument("--output", type=Path, help="путь к приватному JSON-плану")
         cmd.add_argument("--preset", choices=PRESET_CHOICES)
 
-    inspect_cmd = sub.add_parser("inspect", help="read vacancy pages without actions")
+    inspect_cmd = sub.add_parser("inspect", help="читать страницы вакансий без действий")
     inspect_cmd.add_argument("--input", type=Path)
     inspect_cmd.add_argument("--limit", type=int, default=3)
     inspect_cmd.add_argument("--page-timeout", type=float, default=10.0,
-                             help="per-page read-only deadline in seconds")
-    inspect_cmd.add_argument("--selected", action="store_true", help="inspect top confirmed candidates only")
-    inspect_cmd.add_argument("--resumes", action="store_true", help="read available HH resume titles only")
+                             help="read-only таймаут одной страницы в секундах")
+    inspect_cmd.add_argument("--selected", action="store_true", help="проверить только верхние подтверждённые кандидаты")
+    inspect_cmd.add_argument("--resumes", action="store_true", help="прочитать только доступные названия резюме HH")
     inspect_cmd.add_argument("--preset", choices=PRESET_CHOICES)
     inspect_cmd.add_argument("--min-score", type=int)
 
-    llm = sub.add_parser("llm", help="LLM utilities")
+    llm = sub.add_parser("llm", help="LLM-инструменты")
     llm_sub = llm.add_subparsers(dest="llm_action", required=True)
     preview = llm_sub.add_parser("preview")
     preview.add_argument("--input", required=True, type=Path)
     preview.add_argument("--id", required=True)
-    letter = sub.add_parser("letter", help="preview a template or LLM cover letter")
+    letter = sub.add_parser("letter", help="предпросмотр шаблонного или LLM-письма")
     letter_sub = letter.add_subparsers(dest="letter_action", required=True)
     letter_preview = letter_sub.add_parser("preview")
     letter_preview.add_argument("--input", required=True, type=Path)
     letter_preview.add_argument("--id", required=True)
-    rerank = llm_sub.add_parser("rerank", help="explicitly run bounded optional LLM reranking")
+    rerank = llm_sub.add_parser("rerank", help="явно запустить ограниченный необязательный LLM-rerank")
     rerank.add_argument("--input", required=True, type=Path)
     rerank.add_argument("--model", required=True)
     rerank.add_argument("--limit", type=int, default=20)
-    rerank.add_argument("--enable", action="store_true", help="confirm the external LLM request")
+    rerank.add_argument("--enable", action="store_true", help="подтвердить внешний LLM-запрос")
 
-    history = sub.add_parser("history", help="legacy history utilities")
+    history = sub.add_parser("history", help="инструменты совместимости со старой историей")
     history_sub = history.add_subparsers(dest="history_action", required=True)
     imp = history_sub.add_parser("import")
     imp.add_argument("--source", required=True, type=Path)
     history_sub.add_parser("reconcile").add_argument("--input", required=True, type=Path)
-    sync_cmd = sub.add_parser("sync", help="read negotiation statuses without messages")
+    sync_cmd = sub.add_parser("sync", help="прочитать статусы откликов без сообщений")
     sync_cmd.add_argument("--pages", type=int,
-                          help="maximum negotiation pages; omitted means fetch until HH returns an empty page")
-    sync_cmd.add_argument("--output", type=Path, help="private JSON sync report")
-    analytics_cmd = sub.add_parser("analytics", help="show local application counts")
-    analytics_cmd.add_argument("--output", type=Path, help="private analytics report")
-    benchmark = sub.add_parser("benchmark", help="run offline scanner quality benchmark")
+                          help="максимум страниц откликов; без значения читаются страницы до пустого ответа HH")
+    sync_cmd.add_argument("--output", type=Path, help="приватный JSON-отчёт синхронизации")
+    analytics_cmd = sub.add_parser("analytics", help="показать локальную статистику откликов")
+    analytics_cmd.add_argument("--output", type=Path, help="приватный аналитический отчёт")
+    benchmark = sub.add_parser("benchmark", help="запустить офлайн benchmark качества сканера")
     benchmark.add_argument("--suite", default="tech-roles")
     benchmark.add_argument("--control-only", action="store_true")
-    review = sub.add_parser("review", help="write a local HTML vacancy review")
+    review = sub.add_parser("review", help="создать локальный HTML-обзор вакансий")
     review.add_argument("--input", required=True, type=Path)
     review.add_argument("--top", type=int, default=20)
     review.add_argument("--output", type=Path)
     review.add_argument("--preset", choices=PRESET_CHOICES)
 
-    screen = sub.add_parser("screen", help="LLM fit-screening of filtered vacancies (opt-in)")
+    screen = sub.add_parser("screen", help="LLM-скрининг отфильтрованных вакансий (opt-in)")
     screen.add_argument("--input", required=True, type=Path)
     screen.add_argument("--preset", choices=PRESET_CHOICES)
     screen.add_argument("--limit", type=int, default=200)
     screen.add_argument("--min-score", type=int, default=None)
     screen.add_argument("--track", choices=["ai", "infra", "general"], default="general")
     screen.add_argument("--accept", choices=["fit", "fit+maybe"], default="fit+maybe",
-                        help="which verdicts are written to the emitted snapshot")
+                        help="какие вердикты записывать в выходной snapshot")
     screen.add_argument("--model", default=None)
     screen.add_argument("--base-url", default=None,
-                        help="OpenAI-compatible chat-completions endpoint")
+                        help="OpenAI-compatible endpoint chat-completions")
     screen.add_argument("--concurrency", type=int, default=None)
-    screen.add_argument("--criteria", default=None, help="override the screening rubric (prompt)")
-    screen.add_argument("--constraints", default=None, help="override candidate constraints")
-    screen.add_argument("--salary-expectation", default=None, help="override salary expectation line")
-    screen.add_argument("--output", type=Path, help="private JSON verdict report")
+    screen.add_argument("--criteria", default=None, help="переопределить критерии скрининга в prompt")
+    screen.add_argument("--constraints", default=None, help="переопределить ограничения кандидата")
+    screen.add_argument("--salary-expectation", default=None, help="переопределить зарплатное ожидание")
+    screen.add_argument("--output", type=Path, help="приватный JSON-отчёт вердиктов")
     screen.add_argument("--emit-snapshot", type=Path,
-                        help="write a snapshot of accepted vacancies for `apply`")
+                        help="записать snapshot принятых вакансий для `apply`")
     screen.add_argument("--retry-errors", action="store_true",
-                        help="retry only ERROR rows and merge results into the existing report")
-    config_cmd = sub.add_parser("config", help="inspect effective configuration")
+                        help="повторить только ERROR-строки и объединить результат с существующим отчётом")
+    config_cmd = sub.add_parser("config", help="показать эффективную конфигурацию")
     config_sub = config_cmd.add_subparsers(dest="config_action", required=True)
-    config_show = config_sub.add_parser("show", help="show effective search settings")
+    config_show = config_sub.add_parser("show", help="показать эффективные настройки поиска")
     config_show.add_argument("--preset", choices=PRESET_CHOICES)
-    templates = sub.add_parser("templates", help="show or create public search templates")
+    templates = sub.add_parser("templates", help="показать или создать публичные поисковые шаблоны")
     templates_sub = templates.add_subparsers(dest="templates_action", required=True)
-    templates_sub.add_parser("list", help="list available templates")
-    template_init = templates_sub.add_parser("init", help="create a new template without overwriting")
+    templates_sub.add_parser("list", help="показать доступные шаблоны")
+    template_init = templates_sub.add_parser("init", help="создать новый шаблон без перезаписи")
     template_init.add_argument("--name", required=True, choices=list_templates())
     template_init.add_argument("--output", required=True, type=Path)
 
-    admin = sub.add_parser("admin", help="serve the local admin web UI")
+    admin = sub.add_parser("admin", help="запустить локальную веб-панель")
     admin.add_argument("--host", default="127.0.0.1")
     admin.add_argument("--port", type=int, default=8765)
-    admin.add_argument("--open", action="store_true", help="open the admin page in a browser")
+    admin.add_argument("--open", action="store_true", help="открыть веб-панель в браузере")
     return parser
 
 
 def _config(args: argparse.Namespace) -> AppConfig:
     config = AppConfig.discover(data_dir=args.data_dir, profile=args.profile, search=args.search)
     ensure_data_dirs(config)
-    # Keep Playwright downloads private by default and use an existing private browser install.
+    # По умолчанию держим браузеры Playwright в private/ и используем уже установленную локальную копию.
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(config.root / "private" / "browsers"))
     return config
 
@@ -224,12 +225,12 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
 
 
 def _account(profile: dict) -> str:
-    """Use an explicit private account key, retaining legacy compatibility."""
+    """Использует явный приватный ключ аккаунта с сохранением обратной совместимости."""
     return str(profile.get("account") or "default").strip() or "default"
 
 
 def _operator_excluded_ids(data_dir: Path) -> set[str]:
-    """Return IDs manually handled in the admin UI that must not reach apply."""
+    """Возвращает ID, вручную обработанные в UI и не допускаемые до apply."""
     ids: set[str] = set()
     for filename in ("viewed.json", "bad.json", "manual-applied.json"):
         try:
@@ -278,7 +279,7 @@ def _print_candidates(items: list[dict], profile: dict, limit: int, min_score: i
     candidates = filter_candidates(items, profile, limit, min_score, skip_security, blocked_ids, rescore)
     for index, candidate in enumerate(candidates, 1):
         print(f"{index:>2}. [{candidate.score:>3}] {candidate.name} — {candidate.company}")
-        print(f"    id={candidate.id} resume={candidate.resume or '(profile not configured)'}")
+        print(f"    id={candidate.id} resume={candidate.resume or '(профиль не настроен)'}")
         if candidate.reasons:
             print(f"    reasons={', '.join(candidate.reasons)}")
     return [candidate.to_dict() for candidate in candidates]
@@ -303,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "admin":
-        # Keep the CLI/headless path independent from the optional web UI.
+        # Сохраняем CLI/headless-путь независимым от необязательной веб-панели.
         from .admin import serve as admin_serve
 
         try:
@@ -394,9 +395,9 @@ def main(argv: list[str] | None = None) -> int:
         if not group_queries:
             print("search query is required (or configure private/config/search.toml)", file=sys.stderr)
             return 2
-        # Preserve the historical CLI behavior unless the user explicitly
-        # requests freshness or the two-pass strategy. UI/watch callers can opt
-        # into those modes without silently halving legacy relevance budgets.
+        # Сохраняем историческое поведение CLI, пока пользователь явно
+        # не запросит свежесть или двухпроходную стратегию. UI/watch могут выбрать
+        # эти режимы, не уменьшая скрытно старый relevance-бюджет CLI.
         sort_mode = str(search.get("sort_mode", "relevance"))
         if sort_mode == "relevance":
             sort_budgets = (("relevance", request_budget),)
@@ -453,9 +454,9 @@ def main(argv: list[str] | None = None) -> int:
             if str(item.get("id", "")) not in candidate_ids:
                 item["description_status"] = "provisional"
         enriched, detail_errors = enrich_items(enrichment_items, details_limit, pause_seconds=1.0)
-        # Keep the full search result set in the snapshot, even if a detail request
-        # failed or a candidate was only provisional. Enrichment annotates rows;
-        # it does not determine whether a vacancy remains discoverable.
+        # Сохраняем полный результат поиска в snapshot, даже если detail-запрос
+        # завершился ошибкой или кандидат provisional. Enrichment только дополняет строки;
+        # он не решает, останется ли вакансия доступной для дальнейшего отбора.
         enriched_by_id = {str(item.get("id", "")): item for item in enriched}
         for item in all_items:
             enriched_item = enriched_by_id.get(str(item.get("id", "")))
@@ -478,8 +479,8 @@ def main(argv: list[str] | None = None) -> int:
             status = "truncated"
         else:
             status = "ok" if all_items else "empty"
-        # Record when each vacancy was first discovered so the UI can tell a
-        # brand-new vacancy from one carried over from an earlier scan.
+        # Фиксируем первое обнаружение вакансии, чтобы UI отличал
+        # новую вакансию от уже найденной в предыдущем scan.
         stamp_first_seen(all_items, config.data_dir / "seen.json")
         path = save_snapshot(all_items, config.snapshots_dir, " | ".join(queries), status,
                              "\n".join(errors), segments, args.preset or search.get("preset"))
@@ -571,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                     blocked_ids=Store(config.db_path).blocked_ids(_account(profile)),
                 )]
             results = inspect_items(session_path, items, args.limit, round(args.page_timeout * 1000))
-        except Exception as exc:  # noqa: BLE001 - a read-only browser failure is reported, never retried
+        except Exception as exc:  # noqa: BLE001 — read-only ошибка браузера отображается, но не повторяется автоматически
             print(f"inspect: error ({str(exc)[:240]})", file=sys.stderr)
             return 3
         for result in results:
@@ -714,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"invalid search configuration: {exc}", file=sys.stderr)
             return 2
         profile = _profile(config, search)
-        # Admin-supplied prompt overrides (candidate/criteria/salary) patch the screen config.
+        # Переопределения prompt из админки дополняют screen-конфиг кандидата/критериев/зарплаты.
         screen_over = dict(profile.get("screen", {}) or {})
         if args.criteria:
             screen_over["criteria"] = args.criteria
@@ -756,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def _on_result(row: dict, done: int, total: int) -> None:
             streamed.append(row)
-            # Live progress line (streamed to the admin log) + incremental report.
+            # Строка live-прогресса для admin log и инкрементальная запись отчёта.
             print(f"[{done}/{total}] {row.get('verdict', '?'):5} "
                   f"fit={row.get('fit_score', 0):>3} {row.get('name', '')[:70]}", flush=True)
             report_rows = _merge_retry_rows(streamed)
@@ -768,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
             results = screen_vacancies(
                 to_screen, profile, config.data_dir / "screen-cache",
                 model=model, base_url=base_url, track=args.track, concurrency=concurrency,
+                api_key=aitunnel_api_key(config.root),
                 on_result=_on_result, ledger_path=config.data_dir / "spend.jsonl",
             )
         except ScreenError as exc:
@@ -815,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
              input_path: Path, requested_limit: int) -> int:
-    """Record an offline, immutable candidate list without creating attempts."""
+    """Фиксирует офлайн неизменяемый список кандидатов без создания попыток отправки."""
     with store.run_lock():
         store.start_run(run_id, account, "dry-run", input_path, requested_limit, selected)
         for item in selected:
@@ -830,7 +832,7 @@ def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
                account: str, input_path: Path, requested_limit: int,
                target_success: int | None = None) -> int:
-    """Execute explicitly requested browser submissions with auditable stop conditions."""
+    """Выполняет явно запрошенные браузерные отклики с аудируемыми условиями остановки."""
     try:
         profile = _profile(config, effective_search(config.load_search(), None))
         letter_enabled = letter_mode(profile) != "off"
@@ -866,7 +868,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     timing = profile.get("apply", {}) or {}
     delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
     delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
-    # Humanised pacing: occasional longer pauses to avoid tripping bot heuristics.
+    # Плавный темп: иногда добавляем длинные паузы, чтобы не создавать чрезмерную частоту действий.
     long_pause_every = int(timing.get("long_pause_every", 0))
     long_pause_min = max(0.0, float(timing.get("long_pause_min_seconds", 0)))
     long_pause_max = max(long_pause_min, float(timing.get("long_pause_max_seconds", long_pause_min)))
@@ -963,7 +965,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
             run_status = "interrupted"
             stop_reason = "run interrupted"
             exit_code = 130
-        except Exception as exc:  # noqa: BLE001 - journal the run even if browser setup fails
+        except Exception as exc:  # noqa: BLE001 — журнал запуска должен закрыться даже при ошибке настройки браузера
             run_status = "failed"
             stop_reason = f"runner error: {str(exc)[:160]}"
             exit_code = 3
@@ -972,7 +974,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
             try:
                 if context is not None:
                     save_state(state_path, context.storage_state())
-            except Exception as exc:  # noqa: BLE001 - session persistence must not leave a run unfinished
+            except Exception as exc:  # noqa: BLE001 — сохранение сессии не должно оставлять run незавершённым
                 if run_status == "completed":
                     run_status = "failed"
                     stop_reason = f"session persistence error: {str(exc)[:160]}"
@@ -1007,7 +1009,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
 
 
 def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple[str, str]:
-    """Prepare the same letter for preview and apply without silently enabling a fallback."""
+    """Готовит одно и то же письмо для preview и apply без скрытого включения fallback."""
     mode = letter_mode(profile)
     if mode == "off":
         return "", "disabled"
@@ -1024,14 +1026,20 @@ def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple
         raise ConfigError("cover_letter.provider must be openrouter or aitunnel")
     try:
         if provider == "aitunnel":
-            # Same per-vacancy generator and prompt the admin UI uses (letters.py),
-            # so the letter that is sent is the one that was previewed.
+            # Используем тот же генератор и prompt для вакансии, что и web-admin (letters.py),
+            # поэтому отправляется именно тот тип письма, который пользователь предварительно проверял.
             screen = prepared.get("screen", {}) if isinstance(prepared.get("screen"), dict) else {}
             model = str(settings.get("model") or screen.get("model") or letters.DEFAULT_MODEL).strip()
             base_url = str(settings.get("base_url") or screen.get("base_url")
                            or letters.DEFAULT_BASE_URL).strip()
-            result = letters.generate_letter(vacancy, prepared, config.data_dir / "letter-cache",
-                                             model=model, base_url=base_url)
+            result = letters.generate_letter(
+                vacancy,
+                prepared,
+                config.data_dir / "letter-cache",
+                model=model,
+                base_url=base_url,
+                api_key=aitunnel_api_key(config.root),
+            )
             text, source = str(result.get("text", "")), str(result.get("source", "generated"))
         else:
             llm = prepared.get("llm", {})
@@ -1049,7 +1057,7 @@ def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple
 
 
 def _submission_preflight(item: dict, letter_enabled: bool) -> str:
-    """Return a manual-review reason before consuming an apply reservation."""
+    """Возвращает причину ручной проверки до создания apply-reservation."""
     from .autoapply import allowed_hh_url
 
     if not str(item.get("resume", "")).strip():

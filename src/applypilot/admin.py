@@ -1,13 +1,11 @@
-"""Local admin web UI for ApplyPilot.
+"""Локальная веб-панель ApplyPilot.
 
-A dependency-free control panel served on localhost with the standard library.
-It reads local artifacts (screen reports, the SQLite journal, emitted snapshots)
-and launches ``applypilot`` subcommands as subprocesses so the operator can scan,
-screen, sync, dry-run and — behind an explicit confirmation — send applications,
-watching live logs in the browser.
+Панель без внешних веб-зависимостей работает на localhost через стандартную библиотеку.
+Она читает локальные артефакты и запускает подкоманды ``applypilot`` как subprocess:
+scan, screen, sync, dry-run и, после явного подтверждения, реальные отклики.
 
-Nothing is exposed beyond a loopback address and real sending stays gated on both an
-explicit confirm and ``reviewed = true`` in the profile.
+Сервер доступен только на loopback, а реальная отправка дополнительно требует
+явного подтверждения и ``reviewed = true`` в профиле.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 from .balance import fetch_balance
-from .config import AppConfig, ConfigError, effective_search, search_groups
+from .config import AppConfig, ConfigError, aitunnel_api_key, effective_search, search_groups
 from .letters import LettersError, generate_letter
 from .storage import Store
 from .tracks import (
@@ -46,7 +44,7 @@ from .tracks import (
     load_tracks,
 )
 
-# Human-readable HH experience tiers.
+# Человекочитаемые уровни опыта HH.
 EXPERIENCE_LABELS = {
     "noExperience": "без опыта",
     "between1And3": "1–3 года",
@@ -56,7 +54,7 @@ EXPERIENCE_LABELS = {
 WATCH_TIMER = "applypilot-watch.timer"
 
 
-# Model choices offered in the admin (the first is the stock default).
+# Модели, доступные в админке; первая используется как стандартная.
 MODEL_CHOICES = [
     "gpt-5-mini",
     "gpt-5-nano",
@@ -69,7 +67,7 @@ DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
 
 
 def _validate_provider_url(value: str) -> str:
-    """Allow HTTPS providers and plain HTTP only on loopback addresses."""
+    """Разрешает HTTPS-провайдеры и обычный HTTP только для loopback-адресов."""
     text = str(value or "").strip()
     try:
         parsed = urlsplit(text)
@@ -82,7 +80,7 @@ def _validate_provider_url(value: str) -> str:
     if parsed.scheme == "https":
         return text
     if parsed.scheme == "http" and _is_loopback_host_name(host):
-        _ = port  # validated by urlsplit; explicit for readability
+        _ = port  # порт уже проверен urlsplit; оставлено явно для читаемости
         return text
     raise ConfigError("provider base_url must use HTTPS (HTTP is allowed only on loopback)")
 
@@ -91,7 +89,7 @@ def _validate_provider_url(value: str) -> str:
 
 @dataclass
 class Job:
-    """A single background subprocess whose output is streamed to the browser."""
+    """Один фоновый subprocess, чей вывод потоково передаётся в браузер."""
 
     argv: list[str] = field(default_factory=list)
     label: str = ""
@@ -115,22 +113,22 @@ class Job:
         }
 
 
-# How many finished runs are kept in the on-disk journal (and in memory).
+# Сколько завершённых запусков хранить в журнале на диске и в памяти.
 JOURNAL_KEEP = 60
-# Output lines stored per finished run in the journal (live view keeps more).
+# Сколько строк вывода хранить на завершённый запуск; live-view может держать больше.
 JOURNAL_LINES = 500
 
 
 class JobRunner:
-    """Runs at most one job at a time and keeps a journal of finished runs."""
+    """Запускает не более одной задачи одновременно и хранит журнал завершённых запусков."""
 
     def __init__(self, root: Path, journal_path: Path | None = None) -> None:
         self.root = root
         self.lock = threading.Lock()
         self.current: Job | None = None
         self.journal_path = journal_path
-        # Finished runs, oldest first; seeded from disk so the journal survives
-        # restarts and each new job appends rather than overwriting.
+        # Завершённые запуски от старых к новым загружаются с диска, чтобы журнал
+        # переживал перезапуск, а новые задачи дописывались без перезаписи истории.
         self.runs: list[dict[str, Any]] = self._load_journal()
 
     def _load_journal(self) -> list[dict[str, Any]]:
@@ -203,7 +201,7 @@ class JobRunner:
         return self.current.snapshot() if self.current else None
 
     def history(self) -> list[dict[str, Any]]:
-        """Compact list of finished runs, newest first (no output lines)."""
+        """Краткий список завершённых запусков от новых к старым, без строк вывода."""
         with self.lock:
             runs = list(self.runs)
         out = []
@@ -217,7 +215,7 @@ class JobRunner:
         return out
 
     def run_output(self, run_id: str) -> dict[str, Any] | None:
-        """Full captured output for one run (finished journal entry or the live job)."""
+        """Полный сохранённый вывод одного завершённого или текущего запуска."""
         if self.current and self.current.id == run_id:
             return self.current.snapshot()
         with self.lock:
@@ -235,9 +233,9 @@ class JobRunner:
             return False
         try:
             if os.name == "posix":
-                # scan_screen/fresh use a bash pipeline. Killing only the shell
-                # can leave its Python children alive, so terminate the process
-                # group created in start().
+                # scan_screen/fresh используют bash pipeline. Завершение только shell
+                # может оставить дочерние Python-процессы, поэтому завершаем
+                # всю process group, созданную в start().
                 os.killpg(process.pid, signal.SIGTERM)
             else:
                 process.terminate()
@@ -276,7 +274,7 @@ _RESUME_SKIP_PREFIX = ("уровень дохода", "постоянная ра
 
 
 def _clean_resume_titles(raw: list[str]) -> list[str]:
-    """Reduce HH's noisy resume labels (card blocks, headings) to clean titles."""
+    """Очищает шумные подписи резюме HH от заголовков и служебных блоков."""
     out: list[str] = []
     for entry in raw:
         for line in str(entry).split("\n"):
@@ -285,7 +283,7 @@ def _clean_resume_titles(raw: list[str]) -> list[str]:
             if not s or low in _RESUME_STOP or low.startswith(_RESUME_SKIP_PREFIX):
                 continue
             out.append(s)
-            break  # first meaningful line of a block is the resume title
+            break  # первая содержательная строка блока считается названием резюме
     seen: set[str] = set()
     result: list[str] = []
     for title in out:
@@ -297,7 +295,7 @@ def _clean_resume_titles(raw: list[str]) -> list[str]:
 
 
 def _disp(value: Any) -> str:
-    """Decode HTML entities in scanned text so the UI doesn't double-escape them."""
+    """Декодирует HTML-сущности, чтобы UI не экранировал их повторно."""
     return html.unescape(str(value or ""))
 
 
@@ -306,7 +304,7 @@ def _exp_label(value: str) -> str:
 
 
 def _over_experience(profile: dict[str, Any], experience: str) -> bool:
-    """Compare HH's minimum experience tier only when the private profile sets it."""
+    """Сравнивает минимальный опыт HH только если он задан в приватном профиле."""
     screen = profile.get("screen", {})
     if not isinstance(screen, dict):
         return False
@@ -321,7 +319,7 @@ def _over_experience(profile: dict[str, Any], experience: str) -> bool:
 
 
 def _salary_label(salary: Any) -> str:
-    """Format an HH salary dict into a compact human string, '—' when absent."""
+    """Форматирует зарплату HH в короткую строку; при отсутствии возвращает «—»."""
     if not isinstance(salary, dict):
         return "—"
     lo, hi = salary.get("from"), salary.get("to")
@@ -339,7 +337,7 @@ def _salary_label(salary: Any) -> str:
 
 
 def _is_fresh(published: str, *, days: int = 3) -> bool:
-    """True when the vacancy was published within the last ``days`` days."""
+    """Возвращает True, если вакансия опубликована за последние ``days`` дней."""
     if not published:
         return False
     try:
@@ -359,7 +357,7 @@ def _today() -> str:
 
 
 def _found_label(first_seen: str) -> str:
-    """Compact 'found on' date (e.g. '22.09'), '—' when unknown."""
+    """Возвращает короткую дату обнаружения, например «22.09», или «—»."""
     text = str(first_seen or "").strip()[:10]
     if not text:
         return "—"
@@ -371,13 +369,13 @@ def _found_label(first_seen: str) -> str:
 
 
 def _is_new(first_seen: str, today: str | None = None) -> bool:
-    """True when the vacancy was first discovered today (this scan cycle)."""
+    """Возвращает True, если вакансия впервые обнаружена сегодня."""
     text = str(first_seen or "").strip()[:10]
     return bool(text) and text == (today or _today())
 
 
 def _norm_title(name: str) -> str:
-    """Normalise a vacancy title for near-duplicate collapsing."""
+    """Нормализует название вакансии для схлопывания близких дублей."""
     text = str(name or "").lower().strip()
     return re.sub(r"[\s\W]+", " ", text).strip()
 
@@ -386,12 +384,11 @@ _VERDICT_ORDER = {"FIT": 0, "MAYBE": 1, "SKIP": 2, "ERROR": 3}
 
 
 def _dedup_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse HH reposts (same company + title) into their strongest row.
+    """Схлопывает репосты HH одной компании и роли в одну наиболее сильную строку.
 
-    HH lets employers repost the same vacancy under fresh sequential ids to stay
-    on top of search; those arrive as distinct ids the mechanical id-dedup cannot
-    catch.  We keep the best verdict / highest fit_score and record how many
-    duplicates were folded in so the operator sees one line, not three.
+    Работодатель может переопубликовать ту же вакансию под новым ID, поэтому
+    обычный dedup по ID этого не замечает. Сохраняем лучший verdict/fit_score
+    и число схлопнутых дублей, чтобы пользователь видел одну строку.
     """
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     order: list[tuple[str, str]] = []
@@ -411,8 +408,8 @@ def _dedup_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         best = dict(members[0])
         best["dupes"] = len(members) - 1
         best["dupe_ids"] = [str(m.get("id", "")) for m in members[1:]]
-        # Reposts represent the same job to the user: if any variant was handled,
-        # the collapsed row must not reappear as active under another verdict.
+        # Репосты представляют одну работу: если обработан любой вариант,
+        # схлопнутая строка не должна снова стать активной с другим вердиктом.
         for flag in ("viewed", "bad", "applied", "blocked", "letter_sent"):
             best[flag] = any(bool(m.get(flag)) for m in members)
         if not best.get("application_resume"):
@@ -424,8 +421,8 @@ def _dedup_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not best.get("db_status"):
             best["db_status"] = next((str(m.get("db_status") or "") for m in members
                                        if m.get("db_status")), "")
-        # A repost gets a fresh id, so the earliest first_seen across the group
-        # is the vacancy's true discovery date.
+        # Репост получает новый ID, поэтому минимальный first_seen в группе
+        # считается реальной датой первого обнаружения вакансии.
         seens = [str(m.get("first_seen") or "") for m in members if str(m.get("first_seen") or "")]
         if seens:
             best["first_seen"] = min(seens)
@@ -439,9 +436,9 @@ class AdminApp:
         self.root = config.root
         self.runner = JobRunner(self.root, config.data_dir / "jobs.jsonl")
         self.settings_path = config.data_dir / "admin-settings.json"
-        self._balance_cache: tuple[float, float | None] = (0.0, None)  # (fetched_at, rub)
-        self._resume_cache: dict[str, Any] = {}  # last-known HH resume titles
-        # Fresh for each admin process; embedded only in its same-origin UI.
+        self._balance_cache: tuple[float, float | None] = (0.0, None)  # (время получения, рубли)
+        self._resume_cache: dict[str, Any] = {}  # последние известные названия резюме HH
+        # Новый для каждого процесса админки; передаётся только в same-origin UI.
         self._csrf_token = secrets.token_urlsafe(32)
         load_tracks(self.root)
 
@@ -452,23 +449,23 @@ class AdminApp:
     def _account_for_track(self, track: str) -> str:
         return self._account_for_profile(_profile_flag(self.root, track))
 
-    # ---- settings (model + per-user API key) ---------------------------
+    # ---- настройки модели и API-ключа -----------------------------------
     def load_settings(self) -> dict[str, Any]:
         data = _read_json(self.settings_path) or {}
         return data if isinstance(data, dict) else {}
 
     def settings_public(self) -> dict[str, Any]:
-        """Settings for the browser — the API key is NEVER returned, only whether it is set."""
+        """Настройки браузера: API-ключ не возвращается, только признак его наличия."""
         s = self.load_settings()
         criteria = {key: s.get(f"criteria_{key}") or "" for key in TRACKS}
         return {
             "model": s.get("model") or DEFAULT_MODEL,
             "base_url": s.get("base_url") or DEFAULT_BASE_URL,
-            "key_set": bool(s.get("api_key") or os.getenv("AITUNNEL_API_KEY")),
+            "key_set": bool(aitunnel_api_key(self.root, str(s.get("api_key") or ""))),
             "models": MODEL_CHOICES,
             "constraints": s.get("constraints") or "",
             "salary_expectation": s.get("salary_expectation") or "",
-            # Per-track screening overrides, plus a list of tracks for the UI.
+            # Отдельные правила скрининга по трекам и список треков для UI.
             "criteria": criteria,
             "tracks": [{"key": k, "label": v["label"], "type": v["type"], "resume": v["resume"]}
                        for k, v in TRACKS.items()],
@@ -480,12 +477,12 @@ class AdminApp:
             s["model"] = str(patch["model"]).strip()
         if "base_url" in patch and str(patch.get("base_url") or "").strip():
             s["base_url"] = _validate_provider_url(str(patch["base_url"]))
-        # Free-text prompt/candidate overrides ("" clears them).
+        # Текстовые переопределения кандидата/prompt; пустая строка очищает значение.
         fields = ["constraints", "salary_expectation"] + [f"criteria_{key}" for key in TRACKS]
         for fld in fields:
             if fld in patch and isinstance(patch[fld], str):
                 s[fld] = patch[fld].strip()
-        # Only overwrite the key when a non-empty value is supplied; "" leaves it as is.
+        # Ключ меняется только при непустом значении; пустая строка сохраняет старый.
         api_key = patch.get("api_key")
         if isinstance(api_key, str) and api_key.strip():
             s["api_key"] = api_key.strip()
@@ -498,14 +495,18 @@ class AdminApp:
         return self.settings_public()
 
     def _screen_env(self) -> dict[str, str]:
+        # Runtime env имеет наивысший приоритет и не должен перезаписываться UI-настройкой.
+        if os.getenv("AITUNNEL_API_KEY", "").strip():
+            return {}
         key = str(self.load_settings().get("api_key") or "").strip()
         return {"AITUNNEL_API_KEY": key} if key else {}
 
     def _api_key(self) -> str:
-        return str(self.load_settings().get("api_key") or "").strip() or os.getenv("AITUNNEL_API_KEY", "")
+        settings_key = str(self.load_settings().get("api_key") or "").strip()
+        return aitunnel_api_key(self.root, settings_key)
 
     def live_balance(self, *, max_age: float = 60.0) -> float | None:
-        """Balance in rubles from aitunnel, cached briefly to avoid per-request calls."""
+        """Баланс aitunnel в рублях с коротким кэшем, чтобы не запрашивать его каждый раз."""
         now = time.time()
         fetched_at, cached = self._balance_cache
         if cached is not None and now - fetched_at < max_age:
@@ -519,14 +520,14 @@ class AdminApp:
             )
         except ConfigError:
             return cached
-        # fetch_balance wants the API origin, not the chat-completions path.
+        # fetch_balance нужен origin API, а не путь chat-completions.
         origin = base.split("/v1/")[0] if "/v1/" in base else base
         value = fetch_balance(key, origin)
         if value is not None:
             self._balance_cache = (now, value)
         return value if value is not None else cached
 
-    # ---- data endpoints -------------------------------------------------
+    # ---- данные ----------------------------------------------------------
     def overview(self) -> dict[str, Any]:
         store = Store(self.config.db_path)
         account = (self._account_for_track(next(iter(TRACKS))) if TRACKS else "default")
@@ -548,8 +549,8 @@ class AdminApp:
             "sync": store.latest_sync(account) if self.config.db_path.exists() else None,
             "negotiation_count": len(store.negotiation_ids(account)) if self.config.db_path.exists() else 0,
         }
-        # The operator's per-vacancy state, so the dashboard reflects exactly the
-        # same "active" pool as the vacancies tab (handled ones drop off).
+        # Ручное состояние вакансий: обзор должен показывать тот же активный пул,
+        # что и вкладка вакансий; обработанные строки исключаются.
         viewed = self._viewed()
         bad = self._bad()
         applied = self._manual_applied()
@@ -560,7 +561,7 @@ class AdminApp:
             profile = _profile_flag(self.root, track)
             report = _read_json(self.root / cfg["screen_report"]) or {}
             results = report.get("results", []) if isinstance(report, dict) else []
-            # Annotate before dedup (mirrors vacancies()), so buckets agree.
+            # Аннотируем до dedup, как в vacancies(), чтобы счётчики совпадали.
             enriched = [{**r, "fresh": _is_fresh(r.get("published", "")),
                          "is_new": _is_new(r.get("first_seen", ""), today),
                          "viewed": str(r.get("id", "")) in viewed,
@@ -571,12 +572,12 @@ class AdminApp:
             top = sorted(_dedup_rows(enriched),
                          key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
                                         -int(r.get("fit_score", 0) or 0)))
-            # "Active" = not handled (not viewed, not marked bad) — same as the
-            # vacancies tab's active bucket.
+            # «Активные» = ещё не обработанные; логика совпадает с
+            # активным сегментом вкладки вакансий.
             active = [r for r in top if not (r.get("viewed") or r.get("bad")
                                               or r.get("applied") or r.get("blocked")
                                               or r.get("letter_sent"))]
-            # Suggestions worth acting on now: active FIT not yet applied/blocked.
+            # Кандидаты для действия сейчас: активные FIT без отклика и блокировки.
             top_fit = [{"id": r.get("id"), "name": r.get("name"), "company": r.get("company"),
                         "url": r.get("url"), "fit_score": r.get("fit_score"),
                         "verdict": r.get("verdict"), "exp_label": r.get("exp_label"),
@@ -588,8 +589,8 @@ class AdminApp:
                               and r.get("verdict") in ("FIT", "MAYBE"))
             new_count = sum(1 for r in active if r.get("is_new")
                             and r.get("verdict") in ("FIT", "MAYBE"))
-            # Unique (deduplicated) counts over the active pool so the overview
-            # matches the vacancies view's active segment.
+            # Счётчики считаются по dedup-активному пулу, чтобы обзор
+            # совпадал с активным сегментом вкладки вакансий.
             uniq: dict[str, int] = {"FIT": 0, "MAYBE": 0, "SKIP": 0, "ERROR": 0}
             for r in active:
                 uniq[r.get("verdict", "")] = uniq.get(r.get("verdict", ""), 0) + 1
@@ -610,7 +611,7 @@ class AdminApp:
         return result
 
     def spend(self) -> dict[str, Any]:
-        """Aggregate the LLM spend ledger for the stats panel."""
+        """Агрегирует журнал расходов LLM для панели статистики."""
         path = self.config.data_dir / "spend.jsonl"
         today = time.strftime("%Y-%m-%d")
         by_day: dict[str, float] = {}
@@ -702,7 +703,7 @@ class AdminApp:
         return {"track": track, "model": report.get("model"), "count": len(rows),
                 "folded_duplicates": folded, "rows": rows}
 
-    # ---- job endpoints --------------------------------------------------
+    # ---- фоновые задачи --------------------------------------------------
     def start_job(self, body: dict[str, Any]) -> tuple[bool, str]:
         action = str(body.get("action", ""))
         track = str(body.get("track") or (next(iter(TRACKS)) if TRACKS else ""))
@@ -710,11 +711,11 @@ class AdminApp:
             return False, "unknown track"
         cfg = TRACKS[track]
         base = [sys.executable, "-m", "applypilot"]
-        # Global flags (profile/search) go before the subcommand.
+        # Глобальные флаги profile/search должны стоять перед подкомандой.
         gflags = ["--profile", cfg["profile"], "--search", cfg["search"]]
         if action == "scan":
-            # The UI opts into the broader two-pass search. Plain CLI scans keep
-            # the historical relevance-only default unless the user asks otherwise.
+            # UI явно использует двухпроходный поиск. Обычный CLI сохраняет
+            # исторический relevance-only режим, пока пользователь не выберет другой.
             argv = base + gflags + ["scan", "--sort-mode", "balanced"]
         elif action == "sync":
             argv = base + gflags + ["sync"]
@@ -735,7 +736,7 @@ class AdminApp:
                 argv += ["--salary-expectation", str(s["salary_expectation"])]
             if s.get(f"criteria_{track}"):
                 argv += ["--criteria", str(s[f"criteria_{track}"])]
-            if not self._screen_env() and not os.getenv("AITUNNEL_API_KEY"):
+            if not self._api_key():
                 return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
         elif action == "retry_errors":
             if not self._api_key():
@@ -759,8 +760,8 @@ class AdminApp:
                 argv += ["--criteria", str(s[f"criteria_{track}"])]
             return self.runner.start(argv, f"retry_errors:{track}", env=self._screen_env())
         elif action == "fresh":
-            # Manual version of the watch timer: scan the freshest vacancies for
-            # this track, then screen them, in one streamed job.  Never applies.
+            # Ручной аналог watcher: ищем самые свежие вакансии трека,
+            # затем скриним в одной потоковой задаче. Отклики не отправляются.
             if not self._api_key():
                 return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
             import shlex
@@ -794,8 +795,8 @@ class AdminApp:
             argv = ["bash", "-lc", pipeline]
             return self.runner.start(argv, f"fresh:{track}", env=self._screen_env())
         elif action == "scan_screen":
-            # One click = full scan of this track, then LLM screening of the
-            # result, streamed as a single job.  Never applies.
+            # Один клик запускает полный scan трека, затем LLM-скрининг
+            # результата в одной потоковой задаче. Отклики не отправляются.
             if not self._api_key():
                 return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
             import shlex
@@ -885,7 +886,7 @@ class AdminApp:
         return path, ""
 
     def letter(self, track: str, vid: str) -> dict[str, Any]:
-        """Generate an individual cover letter for one vacancy (in-process)."""
+        """Генерирует индивидуальное сопроводительное письмо для одной вакансии в текущем процессе."""
         if track not in TRACKS:
             return {"error": "unknown track"}
         item = None
@@ -898,7 +899,7 @@ class AdminApp:
         if item is None:
             return {"error": "vacancy not found"}
         s = self.load_settings()
-        key = str(s.get("api_key") or "").strip() or os.getenv("AITUNNEL_API_KEY", "")
+        key = aitunnel_api_key(self.root, str(s.get("api_key") or ""))
         if not key:
             return {"error": "no AITUNNEL_API_KEY: задайте ключ в «Настройки»"}
         try:
@@ -915,12 +916,12 @@ class AdminApp:
         return {"text": res.get("text", ""), "source": res.get("source", ""),
                 "url": item.get("url", ""), "name": item.get("name", "")}
 
-    # ---- resumes & tracks ----------------------------------------------
+    # ---- резюме и треки -------------------------------------------------
     def fetch_resumes(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Read active HH resume titles.
+        """Читает названия активных резюме HH.
 
-        The live HH read (Playwright, ~10s) runs only on ``refresh``; otherwise
-        the last-known result is returned so the tab opens instantly.
+        Реальное чтение HH через Playwright выполняется только при refresh; иначе
+        возвращается последний известный результат, чтобы вкладка открывалась сразу.
         """
         if not refresh:
             return self._resume_cache or {"auth_status": "unknown", "resume_titles": [], "error": ""}
@@ -934,16 +935,16 @@ class AdminApp:
             data = inspect_resumes(session_path)
             result["auth_status"] = data.get("auth_status", "unknown")
             result["resume_titles"] = _clean_resume_titles(list(data.get("resume_titles", [])))
-        except RuntimeError as exc:  # playwright missing / read-only failure
+        except RuntimeError as exc:  # Playwright отсутствует или произошла ошибка read-only чтения
             result["error"] = str(exc)[:200]
-        except Exception as exc:  # noqa: BLE001 - a browser read failure is reported, not fatal
+        except Exception as exc:  # noqa: BLE001 — ошибка чтения браузера отображается пользователю и не фатальна
             result["error"] = f"не удалось прочитать резюме: {str(exc)[:160]}"
         if result["resume_titles"] or not self._resume_cache:
             self._resume_cache = result
         return result
 
     def tracks_overview(self, *, refresh: bool = False) -> dict[str, Any]:
-        """Tracks joined with active HH resumes, flagging mismatches both ways."""
+        """Сопоставляет треки с активными резюме HH и отмечает расхождения в обе стороны."""
         resumes = self.fetch_resumes(refresh=refresh)
         titles = [str(t).strip() for t in resumes.get("resume_titles", [])]
         title_set = {t.lower() for t in titles}
@@ -966,7 +967,7 @@ class AdminApp:
                 "rubric_types": list(RUBRIC_TYPES)}
 
     def add_track(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Create a track, optionally copying a source track's profile and search rules."""
+        """Создаёт трек, при необходимости копируя профиль и правила поиска исходного трека."""
         key = re.sub(r"[^a-z0-9_-]", "", str(body.get("key", "")).strip().lower())
         if not key:
             return {"error": "ключ трека обязателен (латиница, цифры, _-)"}
@@ -995,7 +996,7 @@ class AdminApp:
                 (self.root / entry["profile"]).write_text(profile_text, encoding="utf-8")
                 (self.root / entry["search"]).parent.mkdir(parents=True, exist_ok=True)
                 (self.root / entry["search"]).write_text(search_text, encoding="utf-8")
-                # Keep the selected resume consistent with the copied profile.
+                # Сохраняем выбранное резюме согласованным со скопированным профилем.
                 entry["resume"] = source.get("resume", "")
             else:
                 self._scaffold_profile(self.root / entry["profile"], resume)
@@ -1004,8 +1005,8 @@ class AdminApp:
             _write_tracks_config(self.root / TRACKS_CONFIG, entries)
         except (OSError, ValueError) as exc:
             return {"error": f"не удалось создать файлы трека: {str(exc)[:160]}"}
-        # Reload first so the new key is a recognised settings field, then save
-        # any per-track screening criteria supplied with the form.
+        # Сначала перезагружаем треки, чтобы новый ключ стал известным полем,
+        # затем сохраняем критерии скрининга из формы.
         load_tracks(self.root)
         criteria = str(body.get("criteria") or "").strip()
         if not criteria and source:
@@ -1017,7 +1018,7 @@ class AdminApp:
                          if source else "Заполни [professional] в профиле данными из резюме (PDF) и проверь запросы.")}
 
     def update_track(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Edit a track's label, rubric, assigned resume and search queries."""
+        """Редактирует название, рубрику, назначенное резюме и поисковые запросы трека."""
         key = str(body.get("key") or "").strip()
         if key not in TRACKS:
             return {"error": "трек не найден"}
@@ -1067,7 +1068,7 @@ class AdminApp:
         return replacement + "\n\n" + search_text
 
     def delete_track(self, key: str) -> dict[str, Any]:
-        """Remove a track from active configuration, retaining its files and history."""
+        """Удаляет трек из активной конфигурации, сохраняя его файлы и историю."""
         if key not in TRACKS:
             return {"error": "трек не найден"}
         if len(TRACKS) <= 1:
@@ -1097,7 +1098,7 @@ class AdminApp:
             'long_pause_every = 8\nlong_pause_min_seconds = 60\nlong_pause_max_seconds = 150\n\n'
             '[screen]\nmodel = "gpt-5-mini"\n'
             'base_url = "https://api.aitunnel.ru/v1/chat/completions"\nconcurrency = 2\n'
-            '# Optional, private candidate-specific preferences:\n'
+            '# Необязательные приватные предпочтения кандидата:\n'
             '# constraints = ""\n# salary_expectation = ""\n# criteria = ""\n'
             '# experience_years = 0\n\n'
             '[cover_letter]\nmode = "off"\n\n'
@@ -1123,7 +1124,7 @@ class AdminApp:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
-    # ---- manual "applied" set (assisted-loop closure) ------------------
+    # ---- ручные отметки об отклике --------------------------------------
     def _applied_path(self) -> Path:
         return self.config.data_dir / "manual-applied.json"
 
@@ -1178,7 +1179,7 @@ class AdminApp:
         path.write_text(json.dumps(letters, ensure_ascii=False), encoding="utf-8")
         return {"ok": True, "letter_sent": str(vid) in letters}
 
-    # ---- viewed set (opened on HH → hidden from the pool) --------------
+    # ---- просмотренные вакансии: открытые на HH скрываются из пула ------
     def _viewed_path(self) -> Path:
         return self.config.data_dir / "viewed.json"
 
@@ -1211,11 +1212,11 @@ class AdminApp:
         return {"ok": True, "bad": len(s), "on": on}
 
     def export_bad(self) -> str:
-        """Dump all vacancies marked 'bad' as Markdown for manual prompt tuning."""
+        """Выгружает вакансии с отметкой «плохая» в Markdown для ручной настройки prompt."""
         bad = self._bad()
         if not bad:
             return "# Плохие вакансии\n\nПока пусто — помечай неподходящие кнопкой «👎 плохая».\n"
-        # id -> full item (from every scan/accepted snapshot)
+        # id -> полная вакансия из всех scan/accepted snapshots
         items: dict[str, dict[str, Any]] = {}
         snap_dir = self.root / "private/data/snapshots"
         for path in snap_dir.glob("*.json"):
@@ -1229,7 +1230,7 @@ class AdminApp:
                     for it in lst:
                         if isinstance(it, dict) and str(it.get("id", "")):
                             items.setdefault(str(it["id"]), it)
-        # id -> screener verdict/reason/track
+        # id -> вердикт, причина и трек скринера
         verdicts: dict[str, dict[str, Any]] = {}
         for track, cfg in TRACKS.items():
             report = _read_json(self.root / cfg["screen_report"]) or {}
@@ -1257,15 +1258,15 @@ class AdminApp:
             lines.append("")
         return "\n".join(lines)
 
-    # ---- apply queue (what a run will actually send to) ----------------
+    # ---- очередь отклика: что реально попадёт в запуск ------------------
     def apply_queue(self, track: str, mode: str = "all", limit: int = 10,
                     marked: list[str] | None = None) -> dict[str, Any]:
         if track not in TRACKS:
             return {"error": "unknown track"}
         rows = self.vacancies(track).get("rows", [])
         marks = {str(m) for m in (marked or [])}
-        # User-reviewed rows stay out of the action queue even though their scan
-        # and screening history remain visible in the vacancy view.
+        # Просмотренные пользователем строки не входят в action-очередь,
+        # хотя история scan/screen остаётся видимой.
         accepted = [r for r in rows if r.get("verdict") in ("FIT", "MAYBE")
                     and not r.get("bad") and not r.get("viewed")]
         if mode == "fit":
@@ -1284,7 +1285,7 @@ class AdminApp:
                 "will_send": min(int(limit), len(sendable)), "rows": queue}
 
     def _build_apply_input(self, track: str, mode: str, marked: list[str] | None) -> Path | None:
-        """Write a filtered snapshot (by mode) for `apply --input`; None on empty."""
+        """Записывает отфильтрованный snapshot для apply-входа; при пустом наборе возвращает None."""
         cfg = TRACKS[track]
         accepted = _read_json(self.root / cfg["accepted"]) or {}
         items = accepted.get("items", []) if isinstance(accepted, dict) else []
@@ -1315,7 +1316,7 @@ class AdminApp:
                                    ensure_ascii=False), encoding="utf-8")
         return path
 
-    # ---- watch timer (systemd user unit) -------------------------------
+    # ---- watcher: пользовательский systemd timer ------------------------
     def watch_status(self) -> dict[str, Any]:
         def sc(*args: str) -> str:
             try:
@@ -1369,7 +1370,7 @@ class AdminApp:
         try:
             if action in ("install", "interval"):
                 dst_dir.mkdir(parents=True, exist_ok=True)
-                # Point both the environment and executable at this checkout.
+                # Подставляем текущий checkout и в Environment, и в ExecStart.
                 svc = (src_dir / "applypilot-watch.service").read_text(encoding="utf-8")
                 root_value = str(self.root).replace(chr(92), chr(92) * 2).replace(
                     chr(34), chr(92) + chr(34)
@@ -1424,13 +1425,13 @@ def _track_queries(root: Path, track: str) -> set[str]:
 
 
 def _track_snapshot(root: Path, track: str) -> str:
-    """Newest scan snapshot for this track, or its own accepted snapshot path."""
+    """Возвращает новейший scan snapshot трека или путь к его accepted snapshot."""
     paths = _track_snapshot_paths(root, track)
     return str(paths[0]) if paths else str(root / TRACKS[track]["accepted"])
 
 
 def _track_snapshot_paths(root: Path, track: str) -> list[Path]:
-    """Scan snapshots whose recorded search terms belong to one configured track."""
+    """Возвращает scan snapshots, чьи запросы относятся к указанному треку."""
     directory = root / "private/data/snapshots"
     files = sorted(directory.glob("hh_vacancies_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     queries = _track_queries(root, track)
@@ -1447,7 +1448,7 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         MAX_POST_BYTES = 1_048_576
 
-        def log_message(self, *_args: Any) -> None:  # keep the console quiet
+        def log_message(self, *_args: Any) -> None:  # не засоряем консоль
             return
 
         def _send(self, code: int, payload: Any, content_type: str = "application/json") -> None:
@@ -1691,8 +1692,8 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
     else:
         bind_host = ipaddress.ip_address(host_value.strip("[]")).compressed
     app = AdminApp(config)
-    # A larger accept backlog: the live-polling UI opens several short-lived
-    # connections, and the stdlib default of 5 can refuse bursts.
+    # Увеличенный backlog: live-polling UI открывает несколько коротких
+    # соединений, а стандартный лимит stdlib в 5 может отбрасывать всплески.
     ThreadingHTTPServer.request_queue_size = 128
     server_class = _IPv6ThreadingHTTPServer if ":" in bind_host else ThreadingHTTPServer
     server = server_class((bind_host, port), _handler(app))
@@ -1702,7 +1703,7 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
     if open_browser:
         try:
             webbrowser.open(url)
-        except Exception:  # noqa: BLE001,S110 - opening a browser is best-effort
+        except Exception:  # noqa: BLE001,S110 — открытие браузера выполняется по принципу best-effort
             pass
     try:
         server.serve_forever()
@@ -1975,7 +1976,7 @@ function fillTrackSelects(tracks){TRACKS=tracks||[];
     if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
   const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
 
-/* ---- overview ---- */
+/* ---- обзор ---- */
 async function loadOverview(){const d=await api("/api/overview");
   fillTrackSelects(Object.keys(d.tracks||{}).map(k=>({key:k,label:d.tracks[k].label})));
   let h='<div class="grid kpis">';
@@ -2013,12 +2014,12 @@ function gotoVacBucket(track,kind){if(track)$("#vtrack").value=track;VSTATUS="ac
   $("#vnew").checked=kind==="new";$("#vfresh").checked=kind==="fresh";show("vac");}
 function gotoApply(track){pendingApplyTrack=track;show("apply");}
 
-/* ---- jobs ---- */
+/* ---- задачи ---- */
 async function job(action,track){const body={action,track:track||(TRACKS[0]&&TRACKS[0].key)||""};
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
 
-/* ---- vacancies ---- */
+/* ---- вакансии ---- */
 let VSTATUS="active";
 function bucket(r){return r.bad?"bad":((r.viewed||r.applied||r.blocked||r.letter_sent)?"viewed":"active");}
 async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
@@ -2071,7 +2072,7 @@ async function exportBad(){const r=await fetch("/api/bad-export");const text=awa
   a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);}
 ["vtrack","vfresh","vnew","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
 
-/* ---- apply queue ---- */
+/* ---- очередь откликов ---- */
 let pendingApplyTrack=null,applyMode="all";
 async function loadApply(){const sec=$("#apply");
   const track=pendingApplyTrack||($("#atrack")&&$("#atrack").value)||(TRACKS[0]&&TRACKS[0].key)||"";pendingApplyTrack=null;
@@ -2123,7 +2124,7 @@ async function runApply(action){const track=$("#atrack").value;
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
 
-/* ---- stats ---- */
+/* ---- статистика ---- */
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
   $("#spendcards").innerHTML=card("Баланс, ₽",rub(sp.balance),sp.balance_live?"aitunnel (live)":"из леджера")
     +card("Сегодня, ₽",sp.today_rub??0)+card("Всего потрачено, ₽",sp.total_rub??0)+card("Запросов к LLM",sp.calls??0);
@@ -2137,7 +2138,7 @@ async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
 function bar(label,val,mx,color,unit){val=Number(val)||0;mx=Math.max(1,Number(mx)||1);const w=Math.max(0,Math.min(100,Math.round(100*val/mx)));return `<div class="row" style="gap:8px"><span class="muted" style="width:110px">${esc(label)}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:80px;text-align:right">${esc(val)}${esc(unit||'')}</span></div>`;}
 function seg(label,val,tot,color){val=Number(val)||0;tot=Math.max(1,Number(tot)||1);const w=Math.max(0,Math.min(100,Math.round(100*val/tot)));return `<div class="row" style="gap:8px"><span class="muted" style="width:72px">${esc(label)}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:44px;text-align:right">${esc(val)}</span></div>`;}
 
-/* ---- job log (journal) ---- */
+/* ---- журнал задач ---- */
 let logSel=null,logFollow=true;const logCache={};
 const JOB_LABELS={scan:"Скан",scan_screen:"Разобрать вакансии",fresh:"Свежие",screen:"Скрининг",
   retry_errors:"Повторный AI-скрининг ошибок",sync:"Синхронизация с HH",analytics:"Аналитика",apply_dry:"Пробный отклик",apply_run:"Реальные отклики"};
@@ -2148,18 +2149,18 @@ function runStatus(r){if(r.running)return['<span class="spin"></span>','rc-run',
   return r.returncode===0?['✓','rc-ok','код 0']:['✕','rc-err','код '+r.returncode];}
 async function refreshJob(){const d=await api("/api/jobs");const cur=d.current;const hist=d.history||[];
   const running=!!(cur&&cur.running);
-  // Live entry sits on top of the journal; a finished current is already in history.
+  // Текущая задача показывается над журналом; завершённая уже находится в истории.
   const entries=running?[{...cur,running:true},...hist]:hist;
   if(running)logSel=cur.id;
   else if(logFollow)logSel=(entries[0]&&entries[0].id)||null;
   if(!entries.some(e=>e.id===logSel))logSel=(entries[0]&&entries[0].id)||null;
-  // render list
+  // рисуем список
   $("#logruns").innerHTML=entries.length?entries.map(r=>{const[ic,cl,txt]=runStatus(r);
     return `<div class="logrun ${r.id===logSel?'sel':''}" onclick="selectRun(${jsArg(r.id)})">`
       +`<span class="${cl}">${ic}</span><span class="rl">${esc(jobLabel(r.label))}</span>`
       +`<span class="rt">${ts(r.started_at)}${r.finished_at?' · '+dur(r.started_at,r.finished_at):''} · ${txt}</span></div>`;}).join("")
     :'<div class="muted" style="padding:8px">Задач ещё не запускалось. Журнал появится после «Разобрать вакансии», скрининга, пробного запуска или отклика.</div>';
-  // output for selected run
+  // вывод выбранного запуска
   await showRunOutput(logSel,running&&logSel===cur.id?cur:null);
   const sel=entries.find(e=>e.id===logSel);
   $("#logmeta").innerHTML=sel?(`<b>${esc(jobLabel(sel.label))}</b> — `+(sel.running?'<span class="spin"></span> идёт':('завершено ('+runStatus(sel)[2]+')'))):'<span class="muted">нет задач</span>';
@@ -2175,7 +2176,7 @@ async function showRunOutput(id,liveJob){const box=$("#logbox");
 function selectRun(id){logSel=id;logFollow=false;refreshJob();}
 async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
 
-/* ---- tracks + watch ---- */
+/* ---- треки и watcher ---- */
 async function loadTracks(refresh){if(refresh)$("#tracksmeta").innerHTML='<span class="spin"></span> читаю резюме с HH…';
   const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
   fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label})));
@@ -2231,7 +2232,7 @@ async function watchCtl(action){const mins=+($("#winterval")&&$("#winterval").va
   const r=await api("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,minutes:mins})});
   if(r.error)alert("Ошибка: "+r.error);loadWatch();}
 
-/* ---- settings ---- */
+/* ---- настройки ---- */
 async function loadSettings(){const s=await api("/api/settings");fillTrackSelects(s.tracks);
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
   $("#sbase").value=s.base_url||"";
@@ -2248,7 +2249,7 @@ async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#
   if(s.error){$("#skeystate").textContent="Ошибка: "+s.error;return;}
   $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено ✓";loadSettings();}
 
-/* ---- add track ---- */
+/* ---- добавление трека ---- */
 async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").value,type:$("#ttype").value,
   resume:$("#tresume").value,queries:$("#tqueries").value,criteria:$("#tcriteria").value,copy_from:$("#tcopy").value};
   $("#tmsg").innerHTML='<span class="spin"></span> создаю…';
@@ -2268,7 +2269,7 @@ async function saveTrack(){const body={key:$("#etrackkey").value,label:$("#etlab
   if(r.error){$("#etmsg").textContent="Ошибка: "+r.error;return;}
   closeTrackEditor();await loadTracks(false);await loadSettings();$("#trackmsg").textContent="Изменения сохранены.";}
 
-/* ---- letter modal ---- */
+/* ---- окно письма ---- */
 let modalCtx={track:"",id:""};
 function closeModal(){$("#modal").classList.add("hide");}
 function openHH(){const u=safeHHUrl($("#modal").dataset.url||"");if(u)window.open(u,"_blank","noopener,noreferrer");
@@ -2297,7 +2298,7 @@ async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("h
   $("#letterhint").textContent="готово — проверь и нажми «Копировать и открыть на HH»";}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});
 
-/* ---- boot ---- */
+/* ---- запуск UI ---- */
 let prevRunning=false;
 setInterval(async()=>{const running=await refreshJob();
   if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();if(tab==="apply")refreshQueue();}

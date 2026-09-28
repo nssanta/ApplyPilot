@@ -52,7 +52,7 @@ def test_generate_letter_and_caches(tmp_path):
     assert first["text"] == letter
     assert calls["n"] == 1
 
-    # Second run must hit the cache and not call the model again.
+    # Второй запуск должен попасть в кэш и не вызывать модель повторно.
     second = generate_letter(_item(), _profile(), tmp_path,
                              api_key="test-key", post=fake_post)
     assert second["source"] == "cache"

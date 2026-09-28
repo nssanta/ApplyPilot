@@ -1,4 +1,4 @@
-"""Deterministic tests for :mod:`applypilot.pacing` (no real sleeping)."""
+"""Детерминированные тесты :mod:`applypilot.pacing` без реального sleep."""
 
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ def test_negative_bounds_clamped_to_zero() -> None:
 
 
 def test_long_pause_disabled_by_default() -> None:
-    # With long_pause_every=0 the result must stay a plain uniform draw,
-    # even at indices that would otherwise trigger a pause.
+    # При long_pause_every=0 остаётся обычная равномерная задержка,
+    # даже на индексах, где иначе добавилась бы длинная пауза.
     for index in (0, 5, 10, 20):
         rng = random.Random(42)
         expected = random.Random(42).uniform(1.0, 2.0)
@@ -54,10 +54,10 @@ def test_long_pause_added_only_on_multiples() -> None:
             long_pause_max=60.0,
         )
         if index > 0 and index % every == 0:
-            # index 10, 20, 30, 40 -> long pause added on top of the base.
+            # Индексы 10, 20, 30, 40: длинная пауза добавляется к базовой.
             assert delay >= long_min + 1.0
         else:
-            # index 5 (and others) -> no long pause.
+            # Индекс 5 и остальные: без длинной паузы.
             assert 1.0 <= delay <= base_max
 
 

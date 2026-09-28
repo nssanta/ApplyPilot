@@ -189,10 +189,10 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
               pause_seconds: float = 1.0,
               request_budget: int | None = None,
               order_by: str = "relevance") -> tuple[list[dict[str, Any]], list[ScanSegment]]:
-    """Scan a bounded query/area/page matrix and retain segment-level diagnostics.
+    """Сканирует ограниченную матрицу запросов, регионов и страниц с диагностикой сегментов.
 
-    ``request_budget`` limits actual search HTTP requests, rather than merely
-    the number of query strings.  This keeps a multi-region scan predictable.
+    ``request_budget`` ограничивает реальные поисковые HTTP-запросы, а не число
+    строк запросов, поэтому многорегиональный scan остаётся предсказуемым.
     """
     if order_by not in {"relevance", "publication_time"}:
         raise ValueError("order_by must be relevance or publication_time")
@@ -275,7 +275,7 @@ def _is_hh_url(url: str) -> bool:
 def _get_hh(client: requests.Session, url: str, *, params: dict[str, Any] | None = None,
             timeout: float = 20.0, max_redirects: int = 3,
             budget: _RequestBudget | None = None) -> tuple[Any, str]:
-    """Request an HH page while refusing to contact an external redirect target."""
+    """Запрашивает страницу HH, запрещая переход на внешний redirect-target."""
     current_url = url
     current_params = params
     if not _is_hh_url(current_url):
@@ -301,7 +301,7 @@ def _get_hh(client: requests.Session, url: str, *, params: dict[str, Any] | None
 def enrich_items(items: list[dict[str, Any]], limit: int = 0,
                  session: requests.Session | None = None,
                  pause_seconds: float = 0.0) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fetch full descriptions for a bounded number of normalized HH vacancies."""
+    """Загружает полные описания для ограниченного числа нормализованных вакансий HH."""
     client = session or requests.Session()
     errors: list[str] = []
     selected = items[:max(0, limit)]
@@ -393,13 +393,11 @@ def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
 
 def stamp_first_seen(items: list[dict[str, Any]], registry_path: Path,
                      today: str | None = None) -> list[dict[str, Any]]:
-    """Attach and persist the date each vacancy id was first seen by a scan.
+    """Добавляет и сохраняет дату первого обнаружения каждого vacancy ID.
 
-    A small ``id -> YYYY-MM-DD`` registry is kept next to the data so a vacancy
-    keeps its original discovery date across scans, while genuinely new ids get
-    today's date.  Each item gains ``first_seen`` (the recorded date) and
-    ``is_new`` (True when that date is today), which lets the UI tell an
-    unseen-before vacancy from one that was already in a previous scan.
+    Рядом с данными хранится реестр ``id -> YYYY-MM-DD``: вакансия сохраняет
+    исходную дату обнаружения между scan, а новый ID получает сегодняшнюю.
+    Поля ``first_seen`` и ``is_new`` позволяют UI отличать новую вакансию.
     """
     today = today or datetime.now(UTC).date().isoformat()
     try:
@@ -437,7 +435,7 @@ def stamp_first_seen(items: list[dict[str, Any]], registry_path: Path,
 
 def journaled_vacancy_ids(data_dir: Path, *, exclude_paths: Iterable[Path] = (),
                           include_registry: bool = True) -> set[str]:
-    """Return vacancy IDs already present in scan history or screening journals."""
+    """Возвращает vacancy ID, уже присутствующие в истории scan или журналах screening."""
     excluded = {path.resolve() for path in exclude_paths}
     paths: set[Path] = set()
     snapshots = data_dir / "snapshots"
