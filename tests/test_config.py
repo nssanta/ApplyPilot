@@ -67,3 +67,16 @@ def test_request_budget_is_configurable_without_a_hidden_cap():
     assert result["request_budget"] == 900
     assert result["details_limit"] == 1200
     assert result["max_pages"] == 30
+
+
+def test_scan_sort_mode_defaults_to_legacy_relevance():
+    assert effective_search({})["sort_mode"] == "relevance"
+
+
+def test_scan_sort_mode_is_explicit_and_validated():
+    assert effective_search({"sort_mode": "balanced"})["sort_mode"] == "balanced"
+    args = build_parser().parse_args(["scan", "--sort-mode", "newest"])
+    assert args.sort_mode == "newest"
+
+    with pytest.raises(ConfigError, match="sort_mode"):
+        validate_search({"sort_mode": "random", "salary": {}})

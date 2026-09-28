@@ -11,9 +11,10 @@ from .presets import ROLE_PRESETS, resolve_search
 
 VALID_MISSING_SALARY = {"include", "exclude", "only"}
 VALID_SALARY_POLICY = {"possible", "guaranteed"}
+VALID_SORT_MODES = {"relevance", "newest", "balanced"}
 DEFAULT_SEARCH: dict[str, Any] = {
     "areas": [113], "max_pages": 20, "request_budget": 500, "details_limit": 500,
-    "days": 7, "only_remote": False, "min_score": 0,
+    "days": 7, "only_remote": False, "min_score": 0, "sort_mode": "relevance",
     "salary": {"currency": "RUR", "from": 0, "missing": "include", "policy": "possible"},
 }
 
@@ -160,6 +161,8 @@ def validate_search(search: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("request_budget must be positive")
     if "max_queries" in values and int(values["max_queries"]) == 0:
         raise ConfigError("max_queries must be positive")
+    if str(values.get("sort_mode", "relevance")) not in VALID_SORT_MODES:
+        raise ConfigError("sort_mode must be relevance, newest or balanced")
     salary = values.get("salary", {}) or {}
     if str(salary.get("missing", "include")) not in VALID_MISSING_SALARY:
         raise ConfigError("salary.missing must be include, exclude or only")

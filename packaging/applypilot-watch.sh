@@ -73,7 +73,7 @@ run_track() {
     # ведёт себя неочевидно).
     set +e
     scan_out="$("$PY" -m applypilot --profile "$profile" --search "$search" \
-        scan --days 1 2>&1)"
+        scan --days 1 --sort-mode newest 2>&1)"
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
@@ -118,7 +118,7 @@ if ! "$PY" - "$APPLYPILOT_HOME" >"$tracks_file" <<'PYEOF'
 import sys
 from pathlib import Path
 
-from applypilot.admin import load_tracks
+from applypilot.tracks import load_tracks
 
 for key, cfg in load_tracks(Path(sys.argv[1])).items():
     fields = (key, cfg["type"], cfg["profile"], cfg["search"],

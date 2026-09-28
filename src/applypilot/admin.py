@@ -20,10 +20,10 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tomllib
@@ -38,6 +38,13 @@ from .balance import fetch_balance
 from .config import AppConfig, ConfigError, effective_search, search_groups
 from .letters import LettersError, generate_letter
 from .storage import Store
+from .tracks import (
+    RUBRIC_TYPES,
+    TRACKS,
+    TRACKS_CONFIG,
+    _write_tracks_config,
+    load_tracks,
+)
 
 # Human-readable HH experience tiers.
 EXPERIENCE_LABELS = {
@@ -46,98 +53,7 @@ EXPERIENCE_LABELS = {
     "between3And6": "3–6 лет",
     "moreThan6": "6+ лет",
 }
-TRACKS_CONFIG = "private/config/tracks.toml"
-RUBRIC_TYPES = ("ai", "infra", "general")
 WATCH_TIMER = "applypilot-watch.timer"
-
-# Fallback used only when private/config/tracks.toml is absent. It points at the
-# standard private profile and search paths without assuming a role or resume.
-DEFAULT_TRACKS = [
-    {"key": "default", "label": "Основной трек", "type": "general",
-     "profile": "private/config/profile.toml", "search": "private/config/search.toml",
-     "resume": ""},
-]
-
-# track key -> normalised track config; populated by load_tracks() so the number
-# of tracks (and their resumes) is driven by config, not hard-coded.
-TRACKS: dict[str, dict[str, Any]] = {}
-
-
-def _normalise_track(entry: dict[str, Any]) -> dict[str, Any] | None:
-    key = re.sub(r"[^a-z0-9_-]", "", str(entry.get("key", "")).strip().lower())
-    if not key:
-        return None
-    rubric = str(entry.get("type", "general")).strip().lower()
-    if rubric not in RUBRIC_TYPES:
-        rubric = "general"
-    return {
-        "key": key,
-        "label": str(entry.get("label") or key),
-        "type": rubric,
-        "profile": str(entry.get("profile") or f"private/config/profile-{key}.toml"),
-        "search": str(entry.get("search") or f"private/config/search-{key}.toml"),
-        "resume": str(entry.get("resume") or ""),
-        "screen_report": str(entry.get("screen_report") or f"private/reports/screen-{key}.json"),
-        "accepted": str(entry.get("accepted") or f"private/data/snapshots/accepted-{key}.json"),
-    }
-
-
-def load_tracks(root: Path) -> dict[str, dict[str, Any]]:
-    """Load track definitions from tracks.toml into the module TRACKS mapping.
-
-    Missing config falls back to one neutral track and is written out so
-    the file becomes the single, editable source of truth.
-    """
-    path = root / TRACKS_CONFIG
-    entries: list[dict[str, Any]] = []
-    if path.exists():
-        try:
-            with path.open("rb") as fh:
-                data = tomllib.load(fh)
-            raw = data.get("track", [])
-            if isinstance(raw, list):
-                entries = [e for e in raw if isinstance(e, dict)]
-        except (OSError, tomllib.TOMLDecodeError):
-            entries = []
-    if not entries:
-        entries = [dict(e) for e in DEFAULT_TRACKS]
-        try:
-            _write_tracks_config(path, entries)
-        except OSError:
-            pass
-    TRACKS.clear()
-    for entry in entries:
-        norm = _normalise_track(entry)
-        if norm is not None:
-            TRACKS[norm["key"]] = norm
-    return TRACKS
-
-
-def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
-    """Persist track definitions to tracks.toml with an atomic replacement."""
-    lines = ["# Треки поиска для админки. Число треков динамическое.",
-             "# key/type(ai|infra|general)/profile/search/resume — см. админку «Резюме и треки».", ""]
-    for e in entries:
-        n = _normalise_track(e)
-        if n is None:
-            continue
-        lines.append("[[track]]")
-        for field_name in ("key", "label", "type", "profile", "search", "resume",
-                           "screen_report", "accepted"):
-            lines.append(f'{field_name} = {json.dumps(n[field_name], ensure_ascii=False)}')
-        lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Keep the old configuration intact if the write is interrupted.
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.name}.", delete=False) as fh:
-            tmp_path = Path(fh.name)
-            fh.write("\n".join(lines))
-        tmp_path.replace(path)
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
 
 
 # Model choices offered in the admin (the first is the stock default).
@@ -150,6 +66,27 @@ MODEL_CHOICES = [
 ]
 DEFAULT_MODEL = "gpt-5-mini"
 DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
+
+
+def _validate_provider_url(value: str) -> str:
+    """Allow HTTPS providers and plain HTTP only on loopback addresses."""
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError("invalid provider base_url") from exc
+    if not host or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigError("provider base_url must be a plain HTTP(S) URL without credentials/query")
+    if parsed.scheme == "https":
+        return text
+    if parsed.scheme == "http" and _is_loopback_host_name(host):
+        _ = port  # validated by urlsplit; explicit for readability
+        return text
+    raise ConfigError("provider base_url must use HTTPS (HTTP is allowed only on loopback)")
+
+
 
 
 @dataclass
@@ -237,6 +174,7 @@ class JobRunner:
                 job.process = subprocess.Popen(
                     argv, cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, env=run_env,
+                    start_new_session=(os.name == "posix"),
                 )
             except OSError as exc:
                 return False, f"failed to start: {exc}"
@@ -289,11 +227,23 @@ class JobRunner:
         return None
 
     def stop(self) -> bool:
+        process: subprocess.Popen | None = None
         with self.lock:
             if self.current and self.current.process and self.current.returncode is None:
-                self.current.process.terminate()
-                return True
-        return False
+                process = self.current.process
+        if process is None:
+            return False
+        try:
+            if os.name == "posix":
+                # scan_screen/fresh use a bash pipeline. Killing only the shell
+                # can leave its Python children alive, so terminate the process
+                # group created in start().
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
 
 def _read_json(path: Path) -> Any:
@@ -528,8 +478,8 @@ class AdminApp:
         s = self.load_settings()
         if patch.get("model"):
             s["model"] = str(patch["model"]).strip()
-        if patch.get("base_url"):
-            s["base_url"] = str(patch["base_url"]).strip()
+        if "base_url" in patch and str(patch.get("base_url") or "").strip():
+            s["base_url"] = _validate_provider_url(str(patch["base_url"]))
         # Free-text prompt/candidate overrides ("" clears them).
         fields = ["constraints", "salary_expectation"] + [f"criteria_{key}" for key in TRACKS]
         for fld in fields:
@@ -563,7 +513,12 @@ class AdminApp:
         key = self._api_key()
         if not key:
             return cached
-        base = str(self.load_settings().get("base_url") or DEFAULT_BASE_URL)
+        try:
+            base = _validate_provider_url(
+                str(self.load_settings().get("base_url") or DEFAULT_BASE_URL)
+            )
+        except ConfigError:
+            return cached
         # fetch_balance wants the API origin, not the chat-completions path.
         origin = base.split("/v1/")[0] if "/v1/" in base else base
         value = fetch_balance(key, origin)
@@ -758,7 +713,9 @@ class AdminApp:
         # Global flags (profile/search) go before the subcommand.
         gflags = ["--profile", cfg["profile"], "--search", cfg["search"]]
         if action == "scan":
-            argv = base + gflags + ["scan"]
+            # The UI opts into the broader two-pass search. Plain CLI scans keep
+            # the historical relevance-only default unless the user asks otherwise.
+            argv = base + gflags + ["scan", "--sort-mode", "balanced"]
         elif action == "sync":
             argv = base + gflags + ["sync"]
         elif action == "screen":
@@ -770,6 +727,8 @@ class AdminApp:
             s = self.load_settings()
             if str(s.get("model") or "").strip():
                 argv += ["--model", str(s["model"]).strip()]
+            if str(s.get("base_url") or "").strip():
+                argv += ["--base-url", _validate_provider_url(str(s["base_url"]))]
             if s.get("constraints"):
                 argv += ["--constraints", str(s["constraints"])]
             if s.get("salary_expectation"):
@@ -790,6 +749,8 @@ class AdminApp:
                                     "--retry-errors"]
             if str(s.get("model") or "").strip():
                 argv += ["--model", str(s["model"]).strip()]
+            if str(s.get("base_url") or "").strip():
+                argv += ["--base-url", _validate_provider_url(str(s["base_url"]))]
             if s.get("constraints"):
                 argv += ["--constraints", str(s["constraints"])]
             if s.get("salary_expectation"):
@@ -809,6 +770,8 @@ class AdminApp:
                             "--emit-snapshot", cfg["accepted"]]
             if str(s.get("model") or "").strip():
                 screen_extra += ["--model", str(s["model"]).strip()]
+            if str(s.get("base_url") or "").strip():
+                screen_extra += ["--base-url", _validate_provider_url(str(s["base_url"]))]
             if s.get("constraints"):
                 screen_extra += ["--constraints", str(s["constraints"])]
             if s.get("salary_expectation"):
@@ -817,7 +780,7 @@ class AdminApp:
                 screen_extra += ["--criteria", str(s[f"criteria_{track}"])]
             py = shlex.quote(sys.executable)
             g = " ".join(shlex.quote(x) for x in gflags)
-            scan_cmd = f"{py} -m applypilot {g} scan --days {days}"
+            scan_cmd = f"{py} -m applypilot {g} scan --days {days} --sort-mode newest"
             screen_args = " ".join(shlex.quote(x) for x in screen_extra)
             pipeline = (
                 "set -euo pipefail; scan_log=\"$(mktemp)\"; "
@@ -841,6 +804,8 @@ class AdminApp:
                             "--emit-snapshot", cfg["accepted"]]
             if str(s.get("model") or "").strip():
                 screen_extra += ["--model", str(s["model"]).strip()]
+            if str(s.get("base_url") or "").strip():
+                screen_extra += ["--base-url", _validate_provider_url(str(s["base_url"]))]
             if s.get("constraints"):
                 screen_extra += ["--constraints", str(s["constraints"])]
             if s.get("salary_expectation"):
@@ -849,7 +814,7 @@ class AdminApp:
                 screen_extra += ["--criteria", str(s[f"criteria_{track}"])]
             py = shlex.quote(sys.executable)
             g = " ".join(shlex.quote(x) for x in gflags)
-            scan_cmd = f"{py} -m applypilot {g} scan"
+            scan_cmd = f"{py} -m applypilot {g} scan --sort-mode balanced"
             screen_args = " ".join(shlex.quote(x) for x in screen_extra)
             pipeline = (
                 "set -euo pipefail; scan_log=\"$(mktemp)\"; "
@@ -940,9 +905,12 @@ class AdminApp:
             res = generate_letter(
                 item, _profile_flag(self.root, track), self.config.data_dir / "letter-cache",
                 model=str(s.get("model") or DEFAULT_MODEL).strip(),
-                base_url=str(s.get("base_url") or DEFAULT_BASE_URL).strip(), api_key=key,
+                base_url=_validate_provider_url(
+                    str(s.get("base_url") or DEFAULT_BASE_URL)
+                ),
+                api_key=key,
             )
-        except LettersError as exc:
+        except (ConfigError, LettersError) as exc:
             return {"error": str(exc)[:200]}
         return {"text": res.get("text", ""), "source": res.get("source", ""),
                 "url": item.get("url", ""), "name": item.get("name", "")}
@@ -1401,11 +1369,27 @@ class AdminApp:
         try:
             if action in ("install", "interval"):
                 dst_dir.mkdir(parents=True, exist_ok=True)
-                # service: point APPLYPILOT_HOME at this repo
+                # Point both the environment and executable at this checkout.
                 svc = (src_dir / "applypilot-watch.service").read_text(encoding="utf-8")
-                svc = re.sub(r"APPLYPILOT_HOME=\S+", f"APPLYPILOT_HOME={self.root}", svc)
-                if f"APPLYPILOT_HOME={self.root}" not in svc:
-                    svc = svc.replace("[Service]", f"[Service]\nEnvironment=APPLYPILOT_HOME={self.root}", 1)
+                root_value = str(self.root).replace(chr(92), chr(92) * 2).replace(
+                    chr(34), chr(92) + chr(34)
+                )
+                env_line = f'Environment="APPLYPILOT_HOME={root_value}"'
+                if re.search(r"(?m)^Environment=.*APPLYPILOT_HOME=.*$", svc):
+                    svc = re.sub(
+                        r"(?m)^Environment=.*APPLYPILOT_HOME=.*$",
+                        env_line,
+                        svc,
+                        count=1,
+                    )
+                else:
+                    svc = svc.replace("[Service]", f"[Service]\n{env_line}", 1)
+                watcher = self.root / "packaging" / "applypilot-watch.sh"
+                watcher_value = str(watcher).replace(chr(92), chr(92) * 2).replace(
+                    chr(34), chr(92) + chr(34)
+                )
+                exec_line = f'ExecStart="{watcher_value}"'
+                svc = re.sub(r"(?m)^ExecStart=.*$", exec_line, svc, count=1)
                 (dst_dir / "applypilot-watch.service").write_text(svc, encoding="utf-8")
                 tmr = (src_dir / WATCH_TIMER).read_text(encoding="utf-8")
                 mins = max(5, int(minutes or self._watch_interval(False)))
@@ -1627,7 +1611,12 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/api/stop":
                 self._send(200, {"ok": app.runner.stop()})
             elif parsed.path == "/api/settings":
-                self._send(200, app.save_settings(body))
+                try:
+                    settings = app.save_settings(body)
+                except ConfigError as exc:
+                    self._send(400, {"error": str(exc)})
+                else:
+                    self._send(200, settings)
             elif parsed.path == "/api/letter":
                 b = body
                 self._send(200, app.letter(str(b.get("track") or next(iter(TRACKS), "")), str(b.get("id", ""))))
@@ -2256,6 +2245,7 @@ async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#
   document.querySelectorAll("#scrit textarea[data-crit]").forEach(t=>{body["criteria_"+t.dataset.crit]=t.value;});
   const k=$("#skey").value.trim();if(k)body.api_key=k;
   const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(s.error){$("#skeystate").textContent="Ошибка: "+s.error;return;}
   $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено ✓";loadSettings();}
 
 /* ---- add track ---- */

@@ -91,7 +91,7 @@ sudo dpkg -r applypilot
 активным трекам из `private/config/tracks.toml` и сразу их скринит, чтобы можно
 было ответить среди первых. Для каждого трека скрипт запускает:
 
-1. `scan --days 1` — короткое окно свежести, с конфигом поиска направления;
+1. `scan --days 1 --sort-mode newest` — короткое окно свежести, с конфигом поиска направления;
 2. `screen` полученного снапшота — в отчёт и снапшот принятых вакансий.
 
 **Отклик остаётся ручным.** Watcher только ищет, скринит и пишет лог — он
@@ -133,8 +133,9 @@ systemctl --user list-timers applypilot-watch.timer
 systemctl --user start applypilot-watch.service   # прогнать прямо сейчас
 ```
 
-Перед установкой поправьте `APPLYPILOT_HOME` в `applypilot-watch.service` под
-свой путь к репозиторию (по умолчанию `%h/Загрузки/ApplyPilot`). Ключ aitunnel
+Перед ручной установкой поправьте `APPLYPILOT_HOME` в `applypilot-watch.service` под
+свой путь к репозиторию (по умолчанию `%h/ApplyPilot`). При установке через веб-админку
+текущий checkout подставляется автоматически. Ключ aitunnel
 можно задать там же строкой `Environment=AITUNNEL_API_KEY=sk-aitunnel-...`.
 
 ### Альтернатива: cron
