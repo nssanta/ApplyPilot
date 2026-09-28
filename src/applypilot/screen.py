@@ -1,14 +1,12 @@
-"""LLM vacancy screener.
+"""LLM-скринер вакансий.
 
-An optional, opt-in pass that reads each vacancy description with a cheap
-OpenAI-compatible model and returns a structured fit verdict for the candidate,
-on top of the deterministic scorer.  It never sends applications and never
-mutates the session; it only writes a private verdict report and, optionally,
-a filtered snapshot of accepted vacancies that ``apply`` can consume.
+Необязательный opt-in этап читает описание каждой вакансии через
+OpenAI-compatible модель и добавляет структурированный fit-вердикт поверх
+детерминированного scorer. Он никогда не отправляет отклики и не меняет HH-сессию:
+записывает только приватный verdict report и, при необходимости, accepted snapshot.
 
-Configuration lives in the private profile under ``[screen]`` and the API key
-is read from the ``AITUNNEL_API_KEY`` environment variable; nothing secret is
-ever written to disk or the repository.
+Конфигурация хранится в приватном профиле в ``[screen]``, а API-ключ читается
+из ``AITUNNEL_API_KEY`` или передаётся локальной админкой.
 """
 
 from __future__ import annotations
@@ -30,11 +28,11 @@ from .config import professional_context
 SCREEN_PROMPT_VERSION = "6"
 DEFAULT_MODEL = "gpt-5-mini"
 DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
-DEFAULT_CONCURRENCY = 2  # aitunnel throttles hard; keep concurrency low
+DEFAULT_CONCURRENCY = 2  # aitunnel жёстко ограничивает параллелизм, поэтому держим concurrency низким
 VERDICTS = ("FIT", "MAYBE", "SKIP")
 
-# Broad track descriptions only. Candidate qualifications and preferences must
-# come from the private profile, never from assumptions attached to a track.
+# В треке храним только широкое описание направления. Квалификация и предпочтения кандидата
+# берутся только из приватного профиля, а не из предположений, привязанных к треку.
 TRACK_NOTES = {
     "ai": (
         "Трек: прикладной AI и LLM. Рассматривай разработку AI-функций, LLM-интеграции, "
@@ -54,11 +52,11 @@ TRACK_NOTES = {
 
 
 class ScreenError(RuntimeError):
-    """The LLM screening pass could not run (configuration or transport)."""
+    """LLM-скрининг не может выполниться из-за конфигурации или транспорта."""
 
 
 def candidate_context(profile: dict[str, Any]) -> dict[str, Any]:
-    """Assemble a compact, allowlisted candidate description for the model."""
+    """Собирает компактное описание кандидата для модели только из разрешённых полей."""
     answers = profile.get("answers", {}) or {}
     ctx: dict[str, Any] = {
         key: profile[key] for key in ("name", "location", "english_level") if profile.get(key)
@@ -84,9 +82,9 @@ def candidate_context(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rubric(profile: dict[str, Any], track: str) -> str:
-    """Built-in track rubric, augmented (not replaced) by any user override.
+    """Возвращает базовую рубрику трека, дополненную пользовательскими правилами.
 
-    A private ``[screen].criteria`` string adds user-defined screening rules.
+    Приватное поле ``[screen].criteria`` добавляет собственные правила скрининга.
     """
     base = TRACK_NOTES.get(track, TRACK_NOTES["general"])
     override = str((profile.get("screen", {}) or {}).get("criteria") or "").strip()
@@ -126,7 +124,7 @@ def screen_messages(item: dict[str, Any], candidate: dict[str, Any], rubric: str
 
 
 def parse_verdict(content: str) -> dict[str, Any]:
-    """Parse the model output into a normalised verdict, tolerating stray text."""
+    """Разбирает ответ модели в нормализованный вердикт, допуская лишний текст."""
     if not isinstance(content, str) or not content.strip():
         raise ValueError("empty screening response")
     text = content.strip()
@@ -161,8 +159,8 @@ def screen_cache_key(item: dict[str, Any], candidate: dict[str, Any], model: str
         "candidate": candidate,
         "model": model,
         "track": track,
-        # The rubric (built-in + user criteria) is part of the verdict input, so
-        # editing criteria must invalidate cached verdicts.
+        # Рубрика вместе с пользовательскими критериями входит во вход вердикта, поэтому
+        # изменение критериев должно инвалидировать закэшированный результат.
         "rubric": rubric,
         "prompt_version": SCREEN_PROMPT_VERSION,
     }
@@ -173,7 +171,7 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 def _append_ledger(path: Path, lock: threading.Lock, usage: dict[str, Any], model: str) -> None:
-    """Append one spend record (cost + last known balance) for the admin panel."""
+    """Добавляет одну запись расхода и последнего известного баланса для админки."""
     cost = usage.get("cost_rub")
     if cost is None:
         return
@@ -192,16 +190,16 @@ def _append_ledger(path: Path, lock: threading.Lock, usage: dict[str, Any], mode
 
 def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
                   messages: list[dict[str, str]], deadline: float, max_retries: int = 5) -> dict[str, Any]:
-    """POST one screening request with exponential backoff.
+    """Отправляет один запрос скрининга с exponential backoff.
 
-    aitunnel throttles concurrency aggressively, so 429/5xx responses are
-    retried with jittered backoff rather than treated as hard failures.
+    aitunnel агрессивно ограничивает параллелизм, поэтому ответы 429/5xx
+    повторяются с jittered backoff и не считаются окончательной ошибкой сразу.
     """
     import httpx
 
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    # Reasoning models spend tokens on hidden reasoning before the JSON, so give
-    # generous headroom; too small a budget returns an empty message.
+    # Reasoning-модели тратят токены на скрытое рассуждение до JSON, поэтому даём
+    # достаточный запас: слишком маленький budget может вернуть пустое сообщение.
     payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": 1600}
     last_error: Exception | None = None
     for attempt in range(max_retries):
@@ -220,7 +218,7 @@ def _post_verdict(post: Callable[..., Any], url: str, model: str, key: str,
                 return parse_verdict(content), (body.get("usage") or {})
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             last_error = exc
-        # Jittered exponential backoff before the next attempt.
+        # Jittered exponential backoff перед следующей попыткой.
         sleep = min(15.0, (2.0 ** attempt) + random.uniform(0.0, 0.75))
         remaining = deadline - time.monotonic()
         if remaining <= 0.5:
@@ -237,12 +235,11 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
                      on_result: Callable[[dict[str, Any], int, int], None] | None = None,
                      ledger_path: Path | None = None,
                      ) -> list[dict[str, Any]]:
-    """Screen vacancies with the configured model; results merge item basics + verdict.
+    """Скринит вакансии выбранной моделью и объединяет базовые данные с вердиктом.
 
-    ``post`` is injectable for testing; by default a shared httpx client is used.
-    Cached verdicts (per vacancy + candidate + model + prompt version) are reused.
-    ``on_result(row, done, total)`` is called as each vacancy completes, so callers
-    can stream live progress.
+    ``post`` можно подменить в тестах; по умолчанию используется общий httpx-клиент.
+    Кэш вердиктов переиспользуется по вакансии, кандидату, модели и версии prompt.
+    ``on_result(row, done, total)`` вызывается после каждой вакансии для live-прогресса.
     """
     if not items:
         return []
@@ -263,8 +260,8 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
     ledger_lock = threading.Lock()
 
     def run(item: dict[str, Any]) -> dict[str, Any]:
-        # Carry the human-facing vacancy facts into the row so the admin can show
-        # required experience / salary next to the verdict (and dedup reposts).
+        # Переносим пользовательские поля вакансии в результат, чтобы админка показывала
+        # требуемый опыт и зарплату рядом с вердиктом и могла схлопывать репосты.
         base = {"id": str(item.get("id", "")), "name": item.get("name", ""),
                 "company": item.get("company", ""), "url": item.get("url", ""),
                 "score": int(item.get("score", 0) or 0),
@@ -284,8 +281,8 @@ def screen_vacancies(items: list[dict[str, Any]], profile: dict[str, Any], cache
             verdict, usage = _post_verdict(do_post, base_url, model, key, messages,
                                            time.monotonic() + per_item_deadline)
         except ScreenError as exc:
-            # A transport/parse failure is NOT a real verdict: mark ERROR so it is
-            # never accepted for applying and gets retried on the next run.
+            # Ошибка транспорта/парсинга не является реальным вердиктом: помечаем ERROR, чтобы
+            # строка не попадала в отклики и могла быть повторена в следующем запуске.
             return {**base, "verdict": "ERROR", "fit_score": 0,
                     "reason": f"скрининг недоступен: {str(exc)[:120]}", "source": "error"}
         path.write_text(json.dumps(verdict, ensure_ascii=False), encoding="utf-8")

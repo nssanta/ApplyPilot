@@ -1,10 +1,11 @@
-# Add only candidate details that you want ApplyPilot to use.
+# Укажите только те данные кандидата, которые ApplyPilot действительно должен использовать.
 name = ""
 location = ""
 english_level = ""
 profile_version = "example-1"
 reviewed = false
-# Optional: use an account label to keep separate HH profiles' history isolated.
+
+# Необязательно: отдельный ключ аккаунта изолирует историю разных профилей HH.
 # account = "my-hh-account"
 
 [limits]
@@ -21,8 +22,11 @@ enabled = false
 model = "openrouter/free"
 
 [cover_letter]
-# Explicit mode takes priority over llm.enabled. Use "template" or "llm" to enable.
+# Явный mode имеет приоритет над llm.enabled.
+# Для включения используйте "template" или "llm".
 mode = "off"
+# Для mode = "llm" можно выбрать "aitunnel" или "openrouter".
+# provider = "aitunnel"
 fallback_to_template = false
 template = """
 Здравствуйте!
@@ -30,17 +34,23 @@ template = """
 Буду рад обсудить задачи и подробнее рассказать о своём опыте.
 С уважением, {name}
 """
-# Alternatively, remove template and set template_file = "cover-letter.md".
+# Вместо inline-шаблона можно удалить template и задать:
+# template_file = "cover-letter.md"
 
 [professional]
-# Fill only with your actual experience. Empty optional fields are omitted.
+# Заполняйте только подтверждёнными фактами о своём опыте.
+# Пустые необязательные поля не передаются модели.
 summary = ""
 skills = []
-# UTF-8 .txt/.md path relative to this profile; PDF/DOCX are not supported.
-# resume_file = "resume.md"
-# Or use inline resume_text instead of resume_file.
 
-# Repeat these tables for each role/project; uncomment and fill with real facts.
+# Путь к UTF-8 .txt/.md относительно каталога профиля.
+# PDF/DOCX автоматически не разбираются.
+# resume_file = "resume.md"
+
+# Вместо resume_file можно задать полный текст прямо здесь:
+# resume_text = ""
+
+# Повторяйте таблицу для каждого места работы.
 # [[professional.experience]]
 # company = ""
 # role = ""
@@ -48,14 +58,7 @@ skills = []
 # description = ""
 # achievements = []
 
-[screen]
-model = "gpt-5-mini"
-# Candidate-specific screening preferences are optional and have no hidden defaults.
-# constraints = ""
-# salary_expectation = ""
-# criteria = ""
-# experience_years = 0
-
+# Повторяйте таблицу для каждого проекта.
 # [[professional.projects]]
 # name = ""
 # role = ""
@@ -63,8 +66,18 @@ model = "gpt-5-mini"
 # technologies = []
 # achievements = []
 
+[screen]
+model = "gpt-5-mini"
+# Необязательные персональные правила скрининга.
+# Если поле пустое, скрытые предпочтения не подставляются.
+# constraints = ""
+# salary_expectation = ""
+# criteria = ""
+# experience_years = 0
+
 [resumes]
+# Точное название резюме на HH.
 default = "REPLACE_WITH_EXACT_HH_RESUME_TITLE"
 
 [answers]
-motivation = "Describe your motivation here."
+motivation = "Опишите здесь свою мотивацию."

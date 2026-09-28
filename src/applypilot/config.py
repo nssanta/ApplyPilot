@@ -23,8 +23,26 @@ class ConfigError(ValueError):
     pass
 
 
+def aitunnel_api_key(root: Path, explicit: str | None = None) -> str:
+    """Возвращает локальный API-ключ aitunnel без вывода секрета в логи.
+
+    Приоритет: переменная окружения AITUNNEL_API_KEY, явно переданное
+    локальное значение, затем private/config/aitunnel.key.
+    """
+    env_key = os.getenv("AITUNNEL_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    path = root / "private/config/aitunnel.key"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def professional_context(profile: dict[str, Any]) -> dict[str, Any]:
-    """Return the validated, allowlisted professional profile context."""
+    """Возвращает проверенный профессиональный контекст профиля из разрешённого списка полей."""
     if not isinstance(profile, dict):
         raise ConfigError("profile must be a table")
     raw = profile.get("professional")
@@ -180,7 +198,7 @@ def validate_search(search: dict[str, Any]) -> dict[str, Any]:
 
 
 def search_groups(search: dict[str, Any]) -> list[dict[str, Any]]:
-    """Expand optional per-region search groups without mutating the input."""
+    """Разворачивает необязательные региональные группы поиска без изменения входного объекта."""
     groups = search.get("groups")
     if not groups:
         return [deepcopy(search)]
@@ -214,8 +232,8 @@ def effective_search(raw: dict[str, Any], preset_name: str | None = None,
         if value is not None:
             values[key] = value
     values["areas"] = [int(area) for area in values.get("areas", [113])]
-    # ``max_queries`` was the old name for the total HTTP request budget.
-    # Keep it as a TOML compatibility alias, but never silently clamp either value.
+    # ``max_queries`` — старое имя общего бюджета HTTP-запросов.
+    # Сохраняем его как совместимый TOML-алиас и не ограничиваем значения скрыто.
     values["max_pages"] = int(values["max_pages"])
     values["request_budget"] = int(values["request_budget"])
     values["details_limit"] = int(values["details_limit"])

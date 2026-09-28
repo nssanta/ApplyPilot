@@ -35,13 +35,13 @@ def _same_vacancy(url: str, vacancy_id: str) -> bool:
 
 def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed",
                  timeout_ms: int = 10_000) -> dict[str, Any]:
-    """Read one vacancy page. This adapter deliberately has no click/fill/eval calls."""
+    """Читает одну страницу вакансии. Адаптер намеренно не вызывает click/fill/eval."""
     vacancy_id = str(item.get("id") or item.get("vacancyId") or "")
     url = str(item.get("url") or f"https://hh.ru/vacancy/{vacancy_id}")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         page_status, body = _page_state(page)
-    except Exception as exc:  # noqa: BLE001 - a read-only timeout must not abort the whole review
+    except Exception as exc:  # noqa: BLE001 — read-only timeout не должен прерывать весь обзор
         kind = "timeout" if "timeout" in str(exc).lower() else "unavailable"
         return {
             "id": vacancy_id,
@@ -64,11 +64,11 @@ def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed"
     ).first
     try:
         button_visible = bool(apply_button.is_visible(timeout=1500))
-    except Exception:  # noqa: BLE001 - missing controls are an inspectable result
+    except Exception:  # noqa: BLE001 — отсутствие элементов управления является допустимым результатом inspect
         button_visible = False
     try:
         known_status = status_text.inner_text(timeout=1000).strip()
-    except Exception:  # noqa: BLE001 - missing status is not a browser failure
+    except Exception:  # noqa: BLE001 — отсутствие статуса не считается ошибкой браузера
         known_status = ""
     if not known_status:
         if "вы уже откликались" in low_body or "уже откликались" in low_body:
@@ -94,7 +94,7 @@ def inspect_page(page: Any, item: dict[str, Any], auth_status: str = "confirmed"
 
 
 def _resume_titles(page: Any) -> list[str]:
-    """Read visible resume labels without interacting with the account page."""
+    """Читает видимые названия резюме без действий на странице аккаунта."""
     selectors = (
         "[data-qa='resume-title']",
         "[data-qa*='resume-title']",
@@ -104,18 +104,18 @@ def _resume_titles(page: Any) -> list[str]:
     for selector in selectors:
         try:
             values = page.locator(selector).all_inner_texts()
-        except Exception:  # noqa: BLE001 - HH markup differs by account/page version
+        except Exception:  # noqa: BLE001 — разметка HH различается между аккаунтами и версиями страниц
             values = []
         titles.extend(value.strip() for value in values if value.strip())
     return list(dict.fromkeys(titles))
 
 
 def inspect_resumes(state_path: Path, timeout_ms: int = 10_000) -> dict[str, Any]:
-    """Inspect session and available HH resume titles in an isolated read-only context."""
+    """Проверяет сессию и доступные названия резюме HH в изолированном read-only контексте."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        raise RuntimeError("Install browser support with: pip install -e '.[browser]'") from exc
+        raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
     browser = None
     context = None
     try:
@@ -146,11 +146,11 @@ def inspect_resumes(state_path: Path, timeout_ms: int = 10_000) -> dict[str, Any
 
 def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3,
                   timeout_ms: int = 10_000) -> list[str]:
-    """Inspect a resume page and requested vacancies in a private read-only context."""
+    """Проверяет страницу резюме и заданные вакансии в приватном read-only контексте."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        raise RuntimeError("Install browser support with: pip install -e '.[browser]'") from exc
+        raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
     results: list[dict[str, Any]] = []
     browser = None
     context = None

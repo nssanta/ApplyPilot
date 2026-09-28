@@ -127,11 +127,10 @@ def _rerank_prompt(items: list[dict[str, Any]], profile: dict[str, Any]) -> str:
 
 def rerank(items: list[dict[str, Any]], profile: dict[str, Any], cache_dir: Path,
            model: str, enabled: bool = False, limit: int = 20) -> tuple[list[dict[str, Any]], str]:
-    """Optionally rerank at most 20 already-selected candidates.
+    """Опционально меняет порядок максимум 20 уже выбранных кандидатов.
 
-    The deterministic scorer remains the source of truth when this mode is
-    disabled or unavailable.  The provider sees only the minimum candidate
-    fields needed for ranking.
+    Когда режим выключен или недоступен, источником истины остаётся
+    детерминированный scorer. Провайдер получает только минимальный набор полей.
     """
     if not enabled:
         return items[:limit], "disabled"

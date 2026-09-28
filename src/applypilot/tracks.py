@@ -1,7 +1,7 @@
-"""Configuration for independent job-search tracks.
+"""Конфигурация независимых поисковых треков.
 
-This module is deliberately UI-agnostic: CLI/watch workflows can load the same
-track roster without importing the web admin implementation.
+Модуль намеренно не зависит от UI: CLI и watcher загружают тот же набор треков,
+не импортируя реализацию web-admin.
 """
 
 from __future__ import annotations
@@ -92,15 +92,15 @@ def _normalise_entries(
 
 
 def load_tracks(root: Path) -> dict[str, dict[str, Any]]:
-    """Load the track roster without ever overwriting a broken existing file.
+    """Загружает список треков, никогда не перезаписывая повреждённый существующий файл.
 
-    A missing config gets one neutral default track. Once the file exists,
-    parse/shape/path errors fail closed so user configuration is preserved for
-    repair instead of being silently replaced.
+    При отсутствии конфига создаётся один нейтральный трек. После появления файла
+    ошибки TOML, структуры или путей обрабатываются fail-closed: пользовательский
+    конфиг сохраняется для исправления вместо тихой замены.
     """
 
     path = root / TRACKS_CONFIG
-    # Never keep a stale roster alive if the current file cannot be loaded.
+    # Не оставляем устаревший roster в памяти, если текущий файл не удалось загрузить.
     TRACKS.clear()
     if path.exists():
         try:
@@ -125,7 +125,7 @@ def load_tracks(root: Path) -> dict[str, dict[str, Any]]:
 
 
 def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
-    """Persist validated track definitions using an atomic replacement."""
+    """Атомарно сохраняет проверенные определения треков."""
 
     normalised = _normalise_entries(entries)
     lines = [

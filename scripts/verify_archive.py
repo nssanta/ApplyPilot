@@ -32,7 +32,7 @@ def manifest(root: Path) -> dict[str, tuple[str, int, str]]:
                 result[str(relative)] = ("symlink", stat_info.st_size, os.readlink(path))
                 continue
             if not stat_module.S_ISREG(stat_info.st_mode):
-                # Sockets, fifos and device nodes are deliberately not read or followed.
+                # Сокеты, FIFO и device nodes намеренно не читаются и не обходятся.
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             result[str(relative)] = ("file", stat_info.st_size, digest)

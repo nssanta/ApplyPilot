@@ -62,7 +62,7 @@ class Candidate:
 
 @dataclass(frozen=True)
 class FilterDecision:
-    """Explain one pure search-filter evaluation."""
+    """Описывает результат одного чистого прохода search-фильтра."""
 
     status: Literal["pass", "reject", "unknown"]
     reasons: tuple[str, ...] = ()
@@ -139,9 +139,9 @@ def choose_resume(title: str, profile: dict[str, Any]) -> str:
 def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
     candidate = normalize_vacancy(raw)
     historical_score = int(raw.get("score") or 0) if "score" in raw else None
-    # Snapshots from the old parser already contain a score.  Treat it as an
-    # authoritative historical value; adding new keyword points would change
-    # old results on every read.
+    # Старые snapshots уже содержат score. Считаем его
+    # авторитетным историческим значением: добавление новых keyword-баллов изменило бы
+    # старые результаты при каждом чтении.
     if "score" in raw and not profile.get("rescore", False):
         resume = choose_resume(candidate.name, profile)
         return Candidate(**{**candidate.__dict__, "resume": resume, "score": historical_score,
@@ -288,11 +288,10 @@ def filter_candidates(raw_items: Iterable[dict[str, Any]], profile: dict[str, An
 
 def prioritize_for_enrichment(raw_items: Iterable[dict[str, Any]], profile: dict[str, Any],
                               limit: int = 100) -> list[Candidate]:
-    """Choose plausible and borderline rows for description loading.
+    """Выбирает подходящие и пограничные строки для загрузки описаний.
 
-    This intentionally keeps ``unknown`` rows that have no full description
-    yet.  Final planning still uses :func:`filter_candidates` and therefore
-    accepts only confirmed ``pass`` candidates.
+    Намеренно сохраняет ``unknown`` без полного описания. Финальный plan всё равно
+    использует :func:`filter_candidates` и принимает только подтверждённые ``pass``.
     """
     result: list[Candidate] = []
     seen: set[str] = set()
@@ -310,16 +309,16 @@ def prioritize_for_enrichment(raw_items: Iterable[dict[str, Any]], profile: dict
 
 
 def matches_search_filters(raw: dict[str, Any], search: dict[str, Any]) -> bool:
-    """Backward-compatible boolean view of :func:`evaluate_search_filter`."""
+    """Совместимое булево представление :func:`evaluate_search_filter`."""
     return evaluate_search_filter(raw, search).status == "pass"
 
 
 def evaluate_search_filter(raw: dict[str, Any], search: dict[str, Any]) -> FilterDecision:
-    """Apply non-ranking constraints without mutating a vacancy.
+    """Применяет неранговые ограничения без изменения вакансии.
 
-    ``unknown`` is returned when a strict constraint needs a field that the
-    snapshot does not contain.  Callers may keep such rows for manual review,
-    but must not present them as confirmed matches.
+    ``unknown`` возвращается, когда строгому условию нужно поле, отсутствующее
+    в snapshot. Такие строки можно оставить для ручной проверки, но нельзя
+    показывать как подтверждённое совпадение.
     """
     candidate = normalize_vacancy(raw)
     reasons: list[str] = []

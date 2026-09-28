@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "applypilot"
 version = "0.1.0"
-description = "Local, explainable HH.ru job-search and application workflow"
+description = "Локальный объяснимый процесс поиска вакансий и откликов на HH.ru"
 requires-python = ">=3.12"
 dependencies = [
   "beautifulsoup4>=4.12,<5",

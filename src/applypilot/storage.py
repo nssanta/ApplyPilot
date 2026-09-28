@@ -130,7 +130,7 @@ class Store:
             conn.execute("ALTER TABLE negotiation_statuses ADD COLUMN resume TEXT NOT NULL DEFAULT ''")
 
     def read_statuses(self, account: str = "default") -> dict[str, str]:
-        """Read an existing journal without creating a database or schema."""
+        """Читает существующий журнал без создания базы или схемы."""
         if not self.path.exists():
             return {}
         uri = f"file:{self.path.resolve()}?mode=ro"
@@ -148,7 +148,7 @@ class Store:
             conn.close()
 
     def journaled_vacancy_ids(self) -> set[str]:
-        """Read every vacancy ID ever written to the application journal."""
+        """Читает все vacancy ID, когда-либо записанные в журнал откликов."""
         if not self.path.exists():
             return set()
         uri = f"file:{self.path.resolve()}?mode=ro"
@@ -169,7 +169,7 @@ class Store:
             conn.close()
 
     def import_csv(self, path: Path, account: str = "default") -> ImportReport:
-        """Import one legacy CSV exactly once per account and source digest."""
+        """Импортирует один legacy CSV ровно один раз на account и digest источника."""
         with path.open("rb") as fh:
             digest = hashlib.file_digest(fh, "sha256").hexdigest()
         physical_data_lines = max(0, path.read_bytes().count(b"\n") - 1)
@@ -228,10 +228,10 @@ class Store:
         return self.read_statuses(account) if self.path.exists() else {}
 
     def negotiation_ids(self, account: str = "default") -> set[str]:
-        """Read vacancy IDs present in HH negotiations (synced applications), read-only.
+        """Читает vacancy ID из HH negotiations в read-only режиме.
 
-        Any vacancy in the negotiation ledger is one the account already applied to,
-        regardless of the HH-side status, so it must never be re-applied to.
+        Любая вакансия в negotiation ledger уже имеет отклик от этого account,
+        независимо от HH-статуса, поэтому автоматически повторять её нельзя.
         """
         if not self.path.exists():
             return set()
@@ -250,7 +250,7 @@ class Store:
             conn.close()
 
     def negotiation_details(self, account: str = "default") -> dict[str, dict[str, str]]:
-        """Read the latest synced HH status and resume label for each vacancy."""
+        """Читает последний синхронизированный HH-статус и резюме каждой вакансии."""
         if not self.path.exists():
             return {}
         with self.connect() as conn:
@@ -262,7 +262,7 @@ class Store:
                                         "updated_at": row["updated_at"]} for row in rows}
 
     def attempt_details(self, account: str = "default") -> dict[str, dict[str, str]]:
-        """Read saved application outcomes including the resume selected at submit time."""
+        """Читает сохранённые результаты откликов, включая резюме, выбранное при отправке."""
         if not self.path.exists():
             return {}
         with self.connect() as conn:
@@ -279,7 +279,7 @@ class Store:
             vacancy_id for vacancy_id, status in self.read_statuses(account).items()
             if status in BLOCKED_STATUSES
         }
-        # Anything already in HH negotiations (applied to manually or by a prior run) is blocked.
+        # Всё, что уже есть в HH negotiations после ручного или прошлого отклика, блокируется.
         blocked |= self.negotiation_ids(account)
         return blocked
 
@@ -365,7 +365,7 @@ class Store:
 
     def reserve(self, item: dict[str, Any], run_id: str, per_run: int, per_day: int,
                 account: str = "default") -> tuple[bool, str]:
-        """Atomically deduplicate and reserve exactly one potential submission."""
+        """Атомарно выполняет dedupe и резервирует одну потенциальную отправку."""
         vacancy_id = str(item.get("id", ""))
         if not vacancy_id:
             return False, "missing vacancy id"
@@ -376,8 +376,8 @@ class Store:
                 "SELECT status FROM attempts WHERE account=? AND vacancy_id=?", (account, vacancy_id)
             ).fetchone()
             if existing and existing["status"] != "submitting":
-                # A completed outcome is protected by ``attempts`` where required;
-                # its transient in-flight lock must never block a future manual retry.
+                # Завершённый результат при необходимости защищён таблицей ``attempts``;
+                # временная in-flight блокировка не должна мешать будущей ручной попытке.
                 conn.execute(
                     "DELETE FROM reservations WHERE account=? AND vacancy_id=?",
                     (account, vacancy_id),
@@ -453,7 +453,7 @@ class Store:
     def replace_negotiation_statuses(self, rows: list[dict[str, Any]], account: str = "default",
                                      *, complete: bool = True, snapshot_status: str | None = None,
                                      snapshot_source: str = "hh.ru", snapshot_error: str = "") -> None:
-        """Store a negotiation page set and optionally its sync snapshot atomically."""
+        """Атомарно сохраняет набор страниц negotiations и при необходимости sync snapshot."""
         fetched_at = now()
         normalized: list[tuple[str, dict[str, Any]]] = []
         for row in rows:
@@ -484,7 +484,7 @@ class Store:
                 )
 
     def reconcile_unknowns_from_negotiations(self, account: str = "default") -> list[str]:
-        """Promote ambiguous submissions proven by HH's negotiation ledger."""
+        """Переводит неоднозначные отправки в подтверждённые по журналу HH negotiations."""
         timestamp = now()
         reconciled: list[str] = []
         with self.connect() as conn:
@@ -531,7 +531,7 @@ class Store:
         return reconciled
 
     def recover_interrupted_runs(self, account: str = "default") -> list[str]:
-        """Recover submitting attempts after the caller acquires the run lock."""
+        """Восстанавливает попытки submitting после получения вызывающим кодом run lock."""
         if self._run_lock_depth <= 0 or self._run_lock_owner != threading.get_ident():
             raise RuntimeError("run lock required")
         timestamp = now()
@@ -590,7 +590,7 @@ class Store:
             return dict(row) if row else None
 
     def reconcile(self, path: Path, account: str = "default") -> int:
-        """Apply only explicit confirmed statuses; never retries an unknown attempt."""
+        """Применяет только явно подтверждённые статусы и никогда не повторяет unknown-попытку."""
         if path.suffix.lower() == ".json":
             rows = json.loads(path.read_text(encoding="utf-8"))
             rows = rows if isinstance(rows, list) else rows.get("items", [])

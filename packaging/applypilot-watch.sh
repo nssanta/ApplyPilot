@@ -9,7 +9,8 @@
 #
 # Каталог репозитория настраивается через переменную окружения APPLYPILOT_HOME
 # (по умолчанию — родитель родителя каталога самого скрипта).
-# Ключ aitunnel берётся из AITUNNEL_API_KEY, иначе из private/data/admin-settings.json.
+# Ключ aitunnel берётся из AITUNNEL_API_KEY, затем private/data/admin-settings.json,
+# затем из private/config/aitunnel.key.
 #
 # Лог: private/data/watch.log
 
@@ -43,7 +44,7 @@ fi
 source "$VENV/bin/activate"
 
 # --- Ключ aitunnel ----------------------------------------------------------
-# Приоритет у переменной окружения; иначе читаем api_key из настроек админки.
+# Приоритет: окружение, api_key из настроек админки, затем приватный key-файл.
 if [[ -z "${AITUNNEL_API_KEY:-}" ]]; then
     AITUNNEL_API_KEY="$("$PY" - "$APPLYPILOT_HOME/private/data/admin-settings.json" <<'PYEOF' || true
 import json, sys
@@ -54,6 +55,10 @@ except Exception:
     print("")
 PYEOF
 )"
+    export AITUNNEL_API_KEY
+fi
+if [[ -z "${AITUNNEL_API_KEY:-}" && -f "$APPLYPILOT_HOME/private/config/aitunnel.key" ]]; then
+    AITUNNEL_API_KEY="$(tr -d ' \t\r\n' < "$APPLYPILOT_HOME/private/config/aitunnel.key")"
     export AITUNNEL_API_KEY
 fi
 if [[ -z "${AITUNNEL_API_KEY:-}" ]]; then
@@ -110,8 +115,8 @@ log "watch старт (APPLYPILOT_HOME=$APPLYPILOT_HOME)"
 
 overall=0
 
-# Read the same track roster as the admin. NUL delimiters preserve spaces and
-# newlines in paths; no configuration text is executed as shell code.
+# Читаем тот же набор треков, что и админка. NUL-разделители сохраняют пробелы
+# и переводы строк в путях; текст конфигурации никогда не исполняется как shell-код.
 tracks_file="$(mktemp)"
 trap 'rm -f -- "$tracks_file"' EXIT
 if ! "$PY" - "$APPLYPILOT_HOME" >"$tracks_file" <<'PYEOF'

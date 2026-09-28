@@ -35,7 +35,7 @@ def allowed_hh_url(url: str) -> bool:
 
 
 def _response_dialog(page, submit):
-    """Return the visible response popup containing the final submit control."""
+    """Возвращает видимый popup отклика с финальным элементом отправки."""
     for selector in (
         "xpath=ancestor::*[@role='dialog'][1]",
         "xpath=ancestor::*[contains(@class,'vacancy-response-popup')][1]",
@@ -58,7 +58,7 @@ def _response_dialog(page, submit):
 
 
 def has_screening_form(page_or_dialog) -> bool:
-    """Detect the response-dialog form, not the public vacancy FAQ."""
+    """Определяет форму диалога отклика, не путая её с публичным FAQ вакансии."""
     for selector in ("[data-qa='task-body']", ".vacancy-response-popup__screening"):
         try:
             if page_or_dialog.locator(selector).first.is_visible(timeout=2000):
@@ -70,7 +70,7 @@ def has_screening_form(page_or_dialog) -> bool:
 
 
 def _select_resume(page, dialog, resume: str) -> str:
-    """Accept HH's sole visible resume, otherwise require one exact title match."""
+    """Принимает единственное видимое резюме HH; иначе требует одно точное совпадение названия."""
     root = dialog or page
     options = root.locator(RESUME_SELECTOR)
     visible = []
@@ -90,7 +90,7 @@ def _select_resume(page, dialog, resume: str) -> str:
         exact[0].click(timeout=8000)
         return ""
     if len(visible) == 1:
-        return ""  # HH already selected the only resume offered by this response popup.
+        return ""  # HH уже выбрал единственное резюме, доступное в этом popup отклика.
     return "resume selection is missing or ambiguous"
 
 
@@ -134,7 +134,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("needs_manual", "application button not found")
         try:
             href = str(links.first.get_attribute("href") or "")
-        except Exception:  # noqa: BLE001 - an unavailable attribute is not a submission outcome
+        except Exception:  # noqa: BLE001 — недоступный атрибут не является результатом отправки
             href = ""
         if href and not allowed_hh_url(urljoin(str(page.url), href)):
             return ApplyResult("needs_manual", "application action points to an external ATS")
@@ -180,13 +180,13 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("needs_manual", "screening questions require manual review")
         if not submit.is_visible(timeout=8000):
             return ApplyResult("needs_manual", "confirmation button not found")
-        # HH may keep the popup button briefly non-actionable while its form state settles.
-        # Waiting here is still a single click attempt; never force-click or replay it.
+        # HH может ненадолго оставлять кнопку popup неактивной, пока стабилизируется состояние формы.
+        # Ожидание здесь остаётся одной попыткой клика: не используем force-click и не повторяем действие.
         submit.click(timeout=15000)
         page.wait_for_timeout(1500)
         if not allowed_hh_url(str(page.url)):
             return ApplyResult("needs_manual", "submission navigated to external ATS")
         confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
         return confirmed or ApplyResult("unknown", "submission not confirmed by HH page")
-    except Exception as exc:  # noqa: BLE001 - an unclear browser outcome is always unknown
+    except Exception as exc:  # noqa: BLE001 — неоднозначный браузерный исход всегда классифицируется как unknown
         return ApplyResult("unknown", f"browser operation ended ambiguously: {str(exc)[:160]}")

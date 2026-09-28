@@ -1,7 +1,13 @@
 import pytest
 
 from applypilot.cli import build_parser
-from applypilot.config import ConfigError, effective_search, search_groups, validate_search
+from applypilot.config import (
+    ConfigError,
+    aitunnel_api_key,
+    effective_search,
+    search_groups,
+    validate_search,
+)
 
 
 def test_effective_search_has_portable_defaults_and_cli_preset():
@@ -80,3 +86,18 @@ def test_scan_sort_mode_is_explicit_and_validated():
 
     with pytest.raises(ConfigError, match="sort_mode"):
         validate_search({"sort_mode": "random", "salary": {}})
+
+
+def test_aitunnel_api_key_uses_explicit_env_then_private_file(tmp_path, monkeypatch):
+    key_file = tmp_path / "private/config/aitunnel.key"
+    key_file.parent.mkdir(parents=True)
+    key_file.write_text("file-key\n", encoding="utf-8")
+
+    monkeypatch.delenv("AITUNNEL_API_KEY", raising=False)
+    assert aitunnel_api_key(tmp_path) == "file-key"
+
+    assert aitunnel_api_key(tmp_path, "explicit-key") == "explicit-key"
+
+    monkeypatch.setenv("AITUNNEL_API_KEY", "env-key")
+    assert aitunnel_api_key(tmp_path) == "env-key"
+    assert aitunnel_api_key(tmp_path, "explicit-key") == "env-key"

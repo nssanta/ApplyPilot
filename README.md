@@ -1,340 +1,498 @@
 # ApplyPilot
 
-Локальный инструмент для HH.ru: публичный поиск вакансий, объяснимый офлайн-отбор, чтение состояния авторизации, ручная проверка страниц и защищённый журнал откликов. Репозиторий не содержит личного профиля, резюме, cookies, журналов или ключей.
+ApplyPilot — локальный инструмент для поиска вакансий на HH.ru, отбора кандидатов, LLM-скрининга и контролируемых откликов. Проект рассчитан на работу из терминала и через локальную веб-панель. Личные профили, сессии HH, ключи, снимки вакансий и журналы хранятся только в `private/` и не входят в Git.
 
-## 🚀 Быстрый старт из терминала
+## Что умеет
 
-Окружение уже установлено (см. [«Установка»](#установка))? Веб-интерфейс можно запустить одной командой из корня проекта:
+- публичный поиск вакансий без авторизации HH;
+- несколько поисковых направлений через треки;
+- объяснимый офлайн-скоринг и HTML-review;
+- LLM-скрининг `FIT / MAYBE / SKIP / ERROR`;
+- локальная веб-панель для поиска, просмотра, скрининга, треков, статистики и очереди откликов;
+- сопроводительные письма: выключено / шаблон / LLM;
+- безопасный `dry-run` и явный `apply --run`;
+- защита от повторных откликов через SQLite-журнал и синхронизацию HH negotiations;
+- периодический поиск свежих вакансий через systemd timer или cron;
+- сборка wheel/sdist и экспериментального Debian-пакета.
+
+CLI остаётся самостоятельным интерфейсом. Веб-панель — опциональная оболочка над теми же командами и приватными артефактами.
+
+## Быстрый старт
+
+### Веб-панель
+
+Из корня репозитория:
 
 ```bash
 ./run.sh
 ```
 
-Откроется веб-админка на <http://127.0.0.1:8765>. Это **опциональная оболочка** над теми же командами ApplyPilot: полноценный CLI/Bash workflow остаётся поддерживаемым и не требует запуска веб-сервера.
+По умолчанию откроется <http://127.0.0.1:8765>. Другой порт:
 
-- Другой порт: `./run.sh 9000`.
-- Ключ LLM (aitunnel) задаётся один раз во вкладке **«Настройки»** (хранится локально в `private/data/admin-settings.json`, права `600`). Как альтернатива — положите его в `private/config/aitunnel.key` или экспортируйте `AITUNNEL_API_KEY`.
-- Эквивалент без скрипта: `.venv/bin/python -m applypilot admin --open`.
+```bash
+./run.sh 9000
+```
 
-Реальная отправка откликов остаётся под защитой: `reviewed = true` в профиле трека **плюс** подтверждение в интерфейсе. Всё остальное (скан, скрининг, письма, dry-run) — безопасно.
+Эквивалентная команда:
 
-## Границы безопасности
+```bash
+.venv/bin/python -m applypilot admin --open
+```
 
-`plan` читает входной JSON и существующий SQLite-журнал и сохраняет приватный JSON-план. `apply --dry-run` не открывает браузер, не меняет сессию и не вызывает LLM, но записывает локальный `run_id` и точный список кандидатов для аудита. `inspect` только читает DOM в отдельном Playwright-контексте, без `click`, `fill`, `submit` и изменяющего JavaScript. Реальная отправка возможна только через явно указанный `apply --run`.
+Панель привязана только к loopback-интерфейсу. Для изменяющих запросов используются CSRF-токен, проверки `Host`/`Origin` и JSON-only POST. API-ключ не возвращается браузеру обратно: UI получает только признак, задан ли ключ.
 
-Неопределённый результат после потенциальной отправки получает `unknown`. Такой статус блокирует автоматический повтор и требует явного подтверждения через `history reconcile`.
+### Терминал
 
-## Установка
+```bash
+.venv/bin/python -m applypilot --help
+.venv/bin/python -m applypilot doctor
+.venv/bin/python -m applypilot scan --preset ai-agents-llmops --area 113 --remote --days 7
+```
+
+Глобальные параметры `--data-dir`, `--profile`, `--search` указываются **до** подкоманды:
+
+```bash
+.venv/bin/python -m applypilot \
+  --profile private/config/profile.toml \
+  --search private/config/search.toml \
+  scan --preset ai-agents-llmops
+```
+
+## Установка из исходников
+
+Требуется Python 3.12+.
 
 ```bash
 export PIP_CACHE_DIR="$PWD/private/pip-cache"
 export PLAYWRIGHT_BROWSERS_PATH="$PWD/private/browsers"
+
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.lock
-# браузерные команды — отдельно:
 .venv/bin/pip install -r requirements-browser.lock
 .venv/bin/pip install -e ".[dev,browser]"
 .venv/bin/python -m playwright install chromium
 ```
 
-Для воспроизводимой установки используйте зафиксированные файлы `requirements.lock`, `requirements-dev.lock` и `requirements-browser.lock` как вход для `pip install -r`. На медленном внешнем диске создание окружения может быть заметно дольше; это не считается доказанной причиной зависания.
+Для воспроизводимой установки зависимости зафиксированы в:
 
-Скопируйте `examples/profile.example.toml` в `private/config/profile.toml` и `examples/search.example.toml` в `private/config/search.toml`. Личный профиль уже хранится локально, но игнорируется Git. Перед реальными отправками профиль должен быть проверен вручную: `reviewed = true`.
+- `requirements.lock`;
+- `requirements-dev.lock`;
+- `requirements-browser.lock`.
 
-Глобальные параметры (`--data-dir`, `--profile`, `--search`) указываются до команды: `applypilot --data-dir private/data scan ...`.
-
-Пути задаются флагами, затем переменными `APPLYPILOT_DATA_DIR` и `APPLYPILOT_PROFILE`, затем локальными `private/data` и `private/config/profile.toml`. Поисковая конфигурация берётся из `--search` или `private/config/search.toml`.
-
-## Рабочий цикл без отправки
+Создайте приватные конфиги:
 
 ```bash
-.venv/bin/python -m applypilot --help
-.venv/bin/python -m applypilot doctor
-.venv/bin/python -m applypilot scan --query "Software Engineer"
-.venv/bin/python -m applypilot plan --input private/data/snapshots/example.json --limit 5
-.venv/bin/python -m applypilot apply --input private/data/snapshots/example.json --dry-run --limit 5
-.venv/bin/python -m applypilot session check
-.venv/bin/python -m applypilot inspect --input private/data/snapshots/example.json --limit 3
-.venv/bin/python -m applypilot analytics
-.venv/bin/python -m applypilot review --input private/data/snapshots/example.json \
-  --preset python-backend --top 20
-.venv/bin/python -m applypilot benchmark --suite tech-roles --control-only
-.venv/bin/python -m applypilot templates list
-.venv/bin/python -m applypilot config show --preset python-backend
+mkdir -p private/config
+cp examples/profile.example.toml private/config/profile.toml
+cp examples/search.example.toml private/config/search.toml
 ```
 
-Для универсального поиска используйте готовые пресеты `ai-llm`, узкий
-`ai-agents-llmops`, `ml-engineering`, `python-backend`, `go-backend` и
-`software-general`. `ai-agents-llmops` рассчитан на engineering-вакансии в
-AI Agents, LLM, RAG и LLMOps: QA, security, продажи и обучение в него не входят.
-Пример read-only запуска:
+Перед реальными откликами профиль должен быть проверен вручную и содержать `reviewed = true`.
+
+## Приватная структура данных
+
+Типовая локальная структура:
+
+```text
+private/
+├── config/
+│   ├── profile.toml
+│   ├── search.toml
+│   ├── tracks.toml
+│   └── aitunnel.key              # необязательно
+├── data/
+│   ├── applypilot.sqlite3
+│   ├── hh_session.json
+│   ├── admin-settings.json
+│   ├── viewed.json
+│   ├── bad.json
+│   ├── manual-applied.json
+│   ├── spend.jsonl
+│   └── snapshots/
+├── reports/
+├── browsers/
+└── archive/
+```
+
+`private/config/tracks.toml` создаётся автоматически при первом запуске веб-панели, если файла ещё нет. Если файл существует, но повреждён, ApplyPilot **не перезаписывает его дефолтом**: загрузка завершается ошибкой, а исходный файл остаётся на месте.
+
+Пути треков разрешены только внутри `private/`.
+
+## Поиск вакансий
+
+`scan` читает публичную выдачу HH.ru и `HH-Lux-InitialState`; OAuth для поиска не требуется.
+
+Пример:
 
 ```bash
-.venv/bin/python -m applypilot scan --preset python-backend --area 113 \
-  --remote --days 14 --pages 1 --details-limit 50
-.venv/bin/python -m applypilot plan --preset python-backend \
-  --input private/data/snapshots/FILE.json --limit 10 --min-score 30 --rescore
+.venv/bin/python -m applypilot scan \
+  --preset ai-agents-llmops \
+  --area 113 \
+  --remote \
+  --days 7 \
+  --pages 1 \
+  --request-budget 100 \
+  --details-limit 100 \
+  --sort-mode balanced
 ```
 
-Для профильного поиска AI-агентов используйте отдельный пресет. `--query`
-намеренно заменяет весь набор его запросов; чтобы добавить формулировку и не
-потерять базовые запросы, используйте повторяемый `--add-query`:
+Встроенные пресеты:
+
+- `ai-llm`;
+- `ai-agents-llmops`;
+- `ml-engineering`;
+- `python-backend`;
+- `go-backend`;
+- `software-general`.
+
+`ai-agents-llmops` ориентирован на engineering-роли вокруг AI Agents, LLM, RAG, LLMOps и AI Platform и отсеивает очевидные QA/security/sales/training роли.
+
+### Режим сортировки
+
+`--sort-mode`:
+
+- `relevance` — историческое поведение CLI и значение по умолчанию;
+- `newest` — поиск по дате публикации;
+- `balanced` — делит общий HTTP-бюджет между свежестью и релевантностью.
+
+Обычный UI-скан использует `balanced`, а watcher свежих вакансий — `newest`.
+
+### Бюджет и снимки
+
+`--request-budget` учитывает реальные поисковые HTTP-вызовы, включая повторы и редиректы HH. `--details-limit` отдельно ограничивает загрузку полных описаний.
+
+Снимок сохраняет найденные вакансии даже при частичном enrichment. Для каждой вакансии хранится `first_seen`, поэтому UI отличает новую вакансию от уже виденной в прошлых сканах.
+
+Статусы снимка:
+
+- `ok` — проход завершён;
+- `empty` — корректная пустая выдача;
+- `truncated` — закончился лимит страниц/HTTP-бюджет;
+- `partial` — часть сегментов завершилась ошибкой.
+
+Неуспешный пустой проход не заменяет `last_successful.json`.
+
+## Офлайн-отбор
+
+`plan` не открывает браузер и не отправляет отклики:
 
 ```bash
-.venv/bin/python -m applypilot scan --preset ai-agents-llmops \
-  --area 113 --add-query "LLM Platform Engineer" --pages 1 --days 7 \
-  --request-budget 100 --details-limit 100
+.venv/bin/python -m applypilot plan \
+  --preset ai-agents-llmops \
+  --input private/data/snapshots/FILE.json \
+  --limit 30 \
+  --min-score 30 \
+  --rescore \
+  --output private/reports/plan.json
 ```
 
-Поиск проходит по всем явно заданным регионам, запросам и страницам, сохраняет источники
-дубликатов и диагностику каждого сегмента. Полные описания загружаются ограниченно после
-первичного сбора. Порог зарплаты, валюту, неизвестную зарплату и допустимый опыт можно задать
-в TOML; значения CLI имеют приоритет. `benchmark` проверяет базовый уровень шума на
-обезличенных AI/LLM, ML, Python и Go примерах.
+Скоринг остаётся детерминированным и объяснимым: результат содержит итоговый score и причины начисления баллов.
 
-`scan` использует HTML и `HH-Lux-InitialState`, а не OAuth API. Бюджет поисковых HTTP-запросов и число загружаемых описаний задаются через TOML или `--request-budget`/`--details-limit`; в коде нет скрытого потолка для этих значений. Статусы итогового
-снимка — `ok`, `empty`, `truncated` и `partial`; ошибки отдельных сегментов (например,
-403/429, CAPTCHA, сеть или отсутствующая структура HTML) сохраняются отдельно. Ошибочная
-пустая выдача не заменяет последний успешный снимок.
-
-`--request-budget` учитывает каждый поисковый HTTP-вызов, включая повторы после ошибок
-и переходы по редиректам HH, суммарно для всех групп поиска. В диагностике сегмента
-`pages` — обработанные страницы, `requests` — фактическое число HTTP-вызовов.
-Загрузка описаний ограничивается отдельно через `--details-limit` и не входит в этот бюджет.
-Неизвестная структура выдачи считается ошибкой, а не пустым успешным результатом.
-По умолчанию `scan` сохраняет историческое поведение и сортирует по релевантности. Стратегия
-задаётся через `sort_mode = "relevance" | "newest" | "balanced"` или `--sort-mode`.
-`newest` ищет сначала свежие публикации; `balanced` делит общий request budget между
-`publication_time` и `relevance`, после чего объединяет совпавшие вакансии до enrichment.
-
-Для сценария «город + удалёнка по стране» используйте группы в TOML:
-
-```toml
-[[groups]]
-name = "local"
-queries = ["Go Backend"]
-areas = [1, 54]
-only_remote = false
-
-[[groups]]
-name = "remote-country"
-queries = ["Go Backend remote"]
-areas = [113]
-only_remote = true
-```
-
-Доступны `salary.missing = "include" | "exclude" | "only"` и `salary.policy = "possible" | "guaranteed"`; валюта не конвертируется. `config show` показывает эффективные значения и источник (`default`, `preset`, `toml`, `cli preset`) без профиля.
-
-Уровень опыта ограничивается только настройкой `experience.allowed`: без неё отдельного
-запрета на вакансии с опытом более 6 лет нет. Для таких вакансий можно указать
-`allowed = ["moreThan6"]` в секции `[experience]`. В примерном поисковом профиле
-по-прежнему перечислены уровни до 6 лет — измените список под свой опыт.
-
-Шаблоны можно посмотреть и создать без перезаписи существующего файла:
+Для локального HTML-обзора:
 
 ```bash
-.venv/bin/python -m applypilot templates list
-.venv/bin/python -m applypilot templates init --name ai-agents-llmops \
-  --output private/config/ai-agents-search.toml
+.venv/bin/python -m applypilot review \
+  --input private/data/snapshots/FILE.json \
+  --preset ai-agents-llmops \
+  --top 30
 ```
 
-Сканер перебирает запросы, группы, регионы и страницы с общим бюджетом, дедуплицирует ID и сохраняет причины фильтрации. `truncated` означает, что лимит страниц достигнут; `partial` — что часть сбора завершилась ошибкой. Без полного описания вакансия остаётся `unknown`/`provisional` и не попадает в план подтверждённых откликов.
+## LLM-скрининг
 
-HTML-review разделяет top, остальные подтверждённые совпадения, provisional и
-отклонённые вакансии. Пустая карточка не означает ошибку: если полный текст не
-загружался из-за лимита enrichment, отчёт показывает это явным сообщением.
+`screen` — отдельный opt-in этап после механического поиска/скоринга. Модель получает только allowlist профессионального контекста и данные вакансии. Текст профиля и вакансии явно трактуется как данные, а не инструкции.
 
-`session check` классифицирует формат файла, подтверждённый вход, истёкшую сессию, сетевую ошибку и неизвестную разметку. `login` запускает только собственный Playwright-браузер и сохраняет storage state атомарно с ограничением прав, если это поддерживает файловая система.
+```bash
+export AITUNNEL_API_KEY="..."
+.venv/bin/python -m applypilot screen \
+  --input private/data/snapshots/FILE.json \
+  --track ai \
+  --model gpt-5-mini \
+  --accept fit+maybe \
+  --output private/reports/screen-ai.json \
+  --emit-snapshot private/data/snapshots/accepted-ai.json
+```
 
-## Веб-админка и LLM-скрининг
+Вердикты:
 
-`applypilot admin` (или `./run.sh`) поднимает локальную панель на <http://127.0.0.1:8765> — только `127.0.0.1`, без внешнего доступа. Через неё удобно вести весь процесс, не запоминая команды.
+- `FIT` — убедительное совпадение;
+- `MAYBE` — возможно подходит или данных недостаточно;
+- `SKIP` — явное существенное несоответствие;
+- `ERROR` — транспортная/парсерная ошибка; такой результат никогда не считается принятым.
 
-- **Обзор** — показывает последнюю синхронизацию HH; новые и свежие счётчики открывают соответствующие вакансии. Просмотры исключают вакансию из рекомендаций, а ошибки AI-скрининга можно перезапустить по каждому треку.
-- **Вакансии** — разделы **Активные / Просмотренные и обработанные / Плохие**. Открытие ссылки помечает вакансию просмотренной во всех фильтрах; кнопка «👎 плохая» убирает её из очереди откликов. Видны статусы HH и сохранённое резюме отклика. Отправленное вручную сопроводительное письмо можно отметить отдельно. Кнопка «Выгрузить в текст» в разделе «Плохие» даёт `.md` для ручной донастройки правил.
-- **Отклики** — очередь: видно, какие именно вакансии и в каком порядке уйдут, режимы «все / только FIT / только ★». Пробный запуск безопасен; реальная отправка — только при `reviewed = true` и подтверждении.
-- **Статистика** — баланс, расход по дням, вердикты по трекам.
-- **Резюме и треки** — читает активные резюме с HH и сверяет с треками; трек можно редактировать, а новый — создать как с чистым шаблоном, так и скопировав профиль и поисковые правила существующего трека. Панель **«Автопоиск (таймер)»** ставит/включает systemd-таймер регулярного скана+скрининга (подробности — [`packaging/README.md`](packaging/README.md)).
-- **Настройки** — модель, свой API-ключ (multi-user), ограничения кандидата, зарплатный ориентир и правила скрининга по каждому треку.
+Кэш учитывает вакансию, кандидата, модель, трек, рубрику и версию промпта. Изменение критериев инвалидирует старый кэш. Ошибки можно повторять через `--retry-errors`.
 
-**LLM-скрининг** (`applypilot screen`, опционально) — сначала механический фильтр (`scan` → score), затем модель читает описание и ставит вердикт FIT/MAYBE/SKIP с причиной и `fit_score`. Модель по умолчанию `gpt-5-mini` через OpenAI-совместимый API (aitunnel); ключ — из `AITUNNEL_API_KEY`, `private/config/aitunnel.key` или из «Настроек». Треки задаются в `private/config/tracks.toml` (число не захардкожено: трек = резюме + запросы + рубрика). Личные ограничения и ожидания скрининга задаются в `[screen]` приватного профиля; пустые значения не подменяются встроенными предпочтениями. Сопроводительные письма (`letters.py`) генерируются под конкретную вакансию по фактам профиля.
+По умолчанию внешний endpoint — aitunnel. Веб-настройка `base_url` реально передаётся subprocess-команде `screen`; удалённый endpoint должен использовать HTTPS. HTTP разрешён только для loopback.
 
-## Сессия HH и контролируемый запуск
+## Веб-панель
 
-Cookies никогда не копируются в репозиторий, `.env`, отчёт или командную строку. Один раз
-установите браузер в приватный каталог и войдите в открывшемся изолированном окне:
+Веб-панель находится в `src/applypilot/admin.py` и не импортируется обычными CLI-командами.
+
+Разделы:
+
+### Обзор
+
+Показывает:
+
+- наличие HH-сессии;
+- последний sync;
+- число обработанных/заблокированных вакансий;
+- статистику FIT/MAYBE/SKIP/ERROR по трекам;
+- новые и свежие вакансии;
+- текущую фоновую задачу;
+- последние строки watcher;
+- баланс провайдера при доступном ключе.
+
+### Вакансии
+
+Для каждого трека отображаются:
+
+- FIT/MAYBE/SKIP/ERROR;
+- score и причина;
+- зарплата и опыт;
+- дата первого обнаружения;
+- статус HH/локального журнала;
+- выбранное резюме;
+- дубликаты/repost;
+- состояния «просмотрено», «плохая», «отклик отправлен», «письмо отправлено».
+
+Открытие вакансии из UI помечает её просмотренной; просмотренные/плохие/уже обработанные вакансии не попадают в очередь отклика.
+
+### Отклики
+
+Панель строит точную очередь перед запуском. Доступны режимы:
+
+- все принятые;
+- только `FIT`;
+- только вручную отмеченные.
+
+Реальная отправка требует одновременно:
+
+1. `reviewed = true` в профиле трека;
+2. явного подтверждения в UI;
+3. отдельного запуска apply-процесса.
+
+### Резюме и треки
+
+Трек объединяет:
+
+- ключ и название;
+- тип рубрики `ai / infra / general`;
+- приватный профиль;
+- поисковый конфиг;
+- HH-резюме;
+- путь к screen-report;
+- путь к accepted snapshot.
+
+Треки можно создавать, редактировать и удалять. UI умеет читать доступные названия резюме из HH в read-only режиме.
+
+### Статистика
+
+Показывает вердикты по трекам, расходы LLM, последний известный баланс и дневную историю из `spend.jsonl`.
+
+### Лог
+
+Фоновые команды запускаются как subprocess и стримят вывод в UI. Одновременно выполняется не более одной admin-задачи. На POSIX каждая задача запускается в отдельной process group, поэтому «Стоп» завершает весь pipeline, а не только shell-родителя.
+
+### Настройки
+
+Можно задать:
+
+- модель;
+- OpenAI-compatible `base_url`;
+- API-ключ;
+- общие ограничения кандидата;
+- зарплатное ожидание;
+- отдельные критерии скрининга по каждому треку.
+
+Ключ из веб-панели хранится локально в `private/data/admin-settings.json` с попыткой выставить права `0600`. Приоритет для web-admin: runtime `AITUNNEL_API_KEY` → сохранённый ключ панели → `private/config/aitunnel.key`. Для прямого CLI: `AITUNNEL_API_KEY` → `private/config/aitunnel.key`.
+
+## Сессия HH и read-only inspect
+
+Публичному `scan` cookies не нужны.
+
+Для `inspect`, `sync` и реального `apply` используется приватный Playwright state:
 
 ```bash
 export PLAYWRIGHT_BROWSERS_PATH="$PWD/private/browsers"
-.venv/bin/python -m playwright install chromium
 .venv/bin/python -m applypilot login
 .venv/bin/python -m applypilot session check
 ```
 
-После ручного входа Playwright сохраняет state только в `private/data/hh_session.json`.
-Не подменяйте этот файл cookies из браузерных расширений и не добавляйте его в Git. Перед
-любым запуском проверьте реальные доступные резюме и страницы кандидатов отдельным
-read-only контекстом:
+Сессия сохраняется в:
+
+```text
+private/data/hh_session.json
+```
+
+Проверить доступные резюме без действий:
 
 ```bash
 .venv/bin/python -m applypilot inspect --resumes
-.venv/bin/python -m applypilot inspect --input private/data/snapshots/FILE.json \
-  --selected --limit 15 --preset ai-agents-llmops
 ```
 
-Полный безопасный цикл создаёт приватные артефакты и не отправляет отклики до последней
-команды:
+Проверить ограниченный список вакансий:
 
 ```bash
-.venv/bin/python -m applypilot history import \
-  --source private/archive/operation_exit/TOOLS/results/apply_log.csv
-.venv/bin/python -m applypilot plan --input private/data/snapshots/FILE.json \
-  --preset ai-agents-llmops --limit 15
-.venv/bin/python -m applypilot apply --input private/data/snapshots/FILE.json \
-  --preset ai-agents-llmops --dry-run --limit 10
-# Review the generated private plan, run ID, resumes and inspection results first.
-# Set reviewed = true in private/config/profile.toml only after that review.
-.venv/bin/python -m applypilot apply --input private/data/snapshots/FILE.json \
-  --preset ai-agents-llmops --run --limit 30 --target-success 10
-.venv/bin/python -m applypilot sync  # all negotiation pages; use --pages N to set a ceiling
-.venv/bin/python -m applypilot analytics
+.venv/bin/python -m applypilot inspect \
+  --input private/data/snapshots/FILE.json \
+  --selected \
+  --limit 10 \
+  --preset ai-agents-llmops
 ```
 
-During `apply --run`, each candidate is logged before and after a potential submission. An
-external ATS, CAPTCHA, screening question or ambiguous resume becomes `needs_manual`. After
-the final action ApplyPilot waits for the configured confirmation deadline and, if the page is
-still ambiguous, checks the read-only HH negotiations ledger. A matching vacancy reconciles to
-`success`; only an unconfirmed `unknown` stops the run without a retry. The run record reports
-its exact `run_id` and per-status counts.
-`--limit` задаёт потолок кандидатов, а `--target-success` — число подтверждённых откликов:
-`needs_manual` и `already_applied` не засчитываются, вместо них берутся следующие кандидаты.
+`inspect` использует отдельный browser context и не вызывает `click`, `fill`, `submit` или page-evaluated JavaScript.
 
-Если popup HH предлагает ровно одно видимое резюме, используется этот уже выбранный вариант.
-При нескольких вариантах требуется единственное совпадение с настроенным названием
-(регистр и лишние пробелы не учитываются). Несколько вариантов без точного совпадения,
-дубликаты совпадения или отсутствие названия переводят вакансию в `needs_manual` без submit.
-Если первый клик HH сам отправляет отклик без формы, выбора резюме в этом сценарии нет;
-заранее проверьте выбранное резюме в HH. CAPTCHA после потенциально отправляющего
-действия считается `unknown` и блокирует повтор.
+## Синхронизация откликов HH
 
-## История и LLM
+`sync` читает статусы negotiations без открытия чатов и без чтения сообщений:
 
 ```bash
-.venv/bin/python -m applypilot history import --source private/archive/operation_exit/TOOLS/results
-.venv/bin/python -m applypilot history reconcile --input private/reports/confirmed.json
-.venv/bin/python -m applypilot llm preview --input private/data/snapshots/example.json --id 123
+.venv/bin/python -m applypilot sync
 ```
 
-SQLite хранит запуски, точные списки кандидатов, попытки, события и атомарные резервы бюджета. Дедупликация идёт по приватному ключу аккаунта и ID вакансии: блокируются только `success`, `already_applied`, неподтверждённый `unknown` и незавершённый `submitting`; старые `skipped` не исключают свежую вакансию. `sync` автоматически переводит `unknown` в `success`, когда тот же vacancy ID присутствует в HH negotiations. Лимиты берутся из приватного профиля, без скрытого hard cap. Старый `timeout` импортируется как `unknown`; CSV остаётся форматом импорта/экспорта.
+Без `--pages` проход идёт до пустой страницы. При ограниченном числе страниц snapshot помечается `truncated` и не удаляет неизвестные записи из неполученных страниц.
 
-После прерванного запуска следующий `apply --run` или `sync` под блокировкой журнала
-переводит оставшиеся `submitting` в `unknown`, сохраняя запрет повторной отправки.
-Сбой генерации письма до отправки получает `failed_before_submit` и не блокирует
-следующую попытку. Автоматическая сверка требует известного статуса HH и данных,
-полученных не раньше текущего неопределённого результата.
+Если локальный результат был `unknown`, а свежий HH negotiations подтверждает тот же vacancy ID, `sync` автоматически переводит его в `success`.
 
-При ограничении `sync --pages N` неполный обход явно помечается `truncated` в журнале,
-консоли и JSON-отчёте. Полный обход заменяет текущие статусы только выбранного аккаунта;
-неполный обновляет только найденные записи. Ошибка разметки или сети сохраняет прежние
-данные. Удаление записи из текущей выдачи HH не удаляет локальную историю отправки.
+`history reconcile` остаётся ручным совместимым механизмом для явно подтверждённых статусов из JSON/CSV; это не обязательный шаг после каждого `unknown`.
 
-### Сопроводительные письма
+## Контролируемый отклик
 
-В `[cover_letter]` задайте `mode = "off"`, `"template"` или `"llm"`.
-Явный `mode` имеет приоритет над `[llm].enabled`; старые профили без `mode`
-сохраняют прежнее поведение через `llm.enabled`. В примере режим выключен.
+### Dry-run
 
-Для письма без LLM уже есть готовый текст в
-[`examples/profile.example.toml`](examples/profile.example.toml): выберите
-`mode = "template"` и укажите своё имя. Шаблон берётся из `template` либо
-из `template_file = "cover-letter.md"`, одновременно задавать оба нельзя.
-Поддерживаются `{name}`, `{vacancy}`, `{company}`, `{resume}`, `{motivation}`,
-`{summary}`, `{resume_text}`, `{skills}`, `{experience}`, `{projects}`.
-Неизвестная переменная или пустое значение используемого поля останавливают
-подготовку письма с ошибкой. Для буквальных фигурных скобок используйте `{{` и `}}`.
+```bash
+.venv/bin/python -m applypilot apply \
+  --input private/data/snapshots/accepted-ai.json \
+  --preset ai-agents-llmops \
+  --dry-run \
+  --limit 10
+```
 
-Чтобы LLM опиралась на резюме, добавьте в приватный профиль:
+Dry-run не открывает браузер и не отправляет отклики, но создаёт auditable run и фиксирует выбранный список кандидатов.
+
+### Реальный запуск
+
+```bash
+.venv/bin/python -m applypilot apply \
+  --input private/data/snapshots/accepted-ai.json \
+  --preset ai-agents-llmops \
+  --run \
+  --limit 20 \
+  --target-success 10
+```
+
+Перед отправкой проверяются HH URL, выбранное резюме и обязательность письма. SQLite резервирует вакансию атомарно до потенциальной отправки.
+
+Основные состояния:
+
+- `prepared` — подготовлено;
+- `submitting` — начата потенциальная отправка;
+- `success` — отправка подтверждена;
+- `already_applied` — HH сообщает, что отклик уже существует;
+- `needs_manual` — требуется ручное действие;
+- `failed_before_submit` — ошибка произошла до потенциальной отправки;
+- `unknown` — после потенциальной отправки результат нельзя доказать.
+
+`unknown` и найденные HH negotiations блокируют автоматический повтор. После прерванного запуска оставшиеся `submitting` восстанавливаются как `unknown`.
+
+## Сопроводительные письма
+
+Контур реального `apply` управляется секцией `[cover_letter]`:
 
 ```toml
-[professional]
-resume_file = "resume.md"
-summary = "" # ваше профессиональное описание
-skills = []  # ваши навыки
+[cover_letter]
+mode = "off"                  # off | template | llm
+provider = "aitunnel"         # aitunnel | openrouter
+fallback_to_template = false
 ```
 
-Файл резюме должен содержать полный текст в UTF-8 (`.txt` или `.md`);
-путь считается от директории профиля. Вместо файла можно задать `resume_text`.
-PDF/DOCX автоматически не разбираются. Опыт и проекты добавляются таблицами
-`[[professional.experience]]` и `[[professional.projects]]`; доступные поля есть
-в примере профиля. Заполняйте их своими фактами: приложение не извлекает
-профессиональную историю из HH автоматически.
+Режимы:
 
-Для генерации выберите `mode = "llm"`, укажите `[llm].model` и переменную окружения
-`OPENROUTER_API_KEY`. В OpenRouter передаются имя, местоположение, английский,
-мотивация, заполненные профессиональные поля и текст резюме, название выбранного
-резюме и данные вакансии. Контакты, написанные внутри текста резюме, автоматически
-не удаляются. Модель получает инструкцию использовать только подтверждённые факты,
-но достоверность результата нужно проверять самостоятельно.
+- `off` — письмо не готовится;
+- `template` — строгий локальный шаблон без внешнего API;
+- `llm` — письмо генерирует выбранный провайдер.
 
-Модель проверяется по каталогу, автоматического перехода на другую модель нет.
-Кэш учитывает вакансию, выбранное резюме, профиль с загруженным текстом, модель
-и версию промпта. Пустой ответ считается ошибкой. При
-`fallback_to_template = true` сбой LLM заменяется заранее проверенным шаблоном;
-по умолчанию такой переход выключен. Некорректный профиль требует исправления.
+Для `provider = "aitunnel"` реальный apply использует тот же `letters.py`, что и web-preview, поэтому предпросмотр и отправка идут через один генератор. `provider = "openrouter"` сохранён как совместимый путь через старый `llm.py`.
 
-Проверка письма без отправки отклика (в режиме LLM может вызвать OpenRouter):
+Профессиональный контекст берётся только из allowlist-полей `[professional]`. Для полного текста резюме поддерживаются UTF-8 `.txt`/`.md`; PDF/DOCX автоматически не разбираются.
+
+Проверка письма без отправки:
 
 ```bash
 .venv/bin/python -m applypilot letter preview \
-  --input private/data/snapshots/example.json --id 123
+  --input private/data/snapshots/FILE.json \
+  --id VACANCY_ID
 ```
 
-`llm preview` сохранён как совместимый вариант команды. Предпросмотр и реальный
-отклик используют одну подготовку письма; источник выводится как `template`,
-`generated`, `cache` или `template_fallback`. `apply --dry-run` писем не генерирует.
+## История и дедупликация
 
-Rerank — отдельный необязательный режим и не часть базового score:
+SQLite `private/data/applypilot.sqlite3` — источник истины для:
+
+- runs;
+- run items;
+- attempts;
+- events;
+- reservations;
+- HH negotiation statuses;
+- sync snapshots;
+- импорта старой истории.
+
+Дедупликация ведётся по `account + vacancy_id`. Кроме локальных завершённых/неопределённых попыток, блокируются vacancy ID, уже найденные в HH negotiations.
+
+Дополнительные operator-state файлы веб-панели:
+
+- `viewed.json`;
+- `bad.json`;
+- `manual-applied.json`;
+- `letters-sent.json`.
+
+Они также исключаются из action-очереди.
+
+## Автопоиск свежих вакансий
+
+Watcher находится в `packaging/applypilot-watch.sh`.
+
+Для каждого трека он:
+
+1. запускает `scan --days 1 --sort-mode newest`;
+2. берёт созданный snapshot;
+3. запускает `screen`;
+4. сохраняет report и accepted snapshot;
+5. пишет лог в `private/data/watch.log`.
+
+Watcher **никогда не запускает apply**.
+
+Подробности: [packaging/README.md](packaging/README.md).
+
+## Debian-пакет
+
+Экспериментальная сборка:
 
 ```bash
-.venv/bin/python -m applypilot llm rerank \
-  --input private/data/snapshots/FILE.json --model provider/model --limit 20 --enable
+bash packaging/build-deb.sh
 ```
 
-Без `--enable` внешнего запроса нет. Модель обязательна, максимум — 20 кандидатов, общий deadline — 30 секунд.
+Подробности и ограничения описаны в [packaging/README.md](packaging/README.md).
 
-## Приватные данные и публикация
+## Архитектура
 
-Исходный проект не изменяется. Приватная копия — `private/archive/operation_exit`; профиль,
-резюме, старые результаты, журнал и отчёты — в `private/`. Полный старый рабочий каталог в
-репозиторий не копируется. Перед публикацией запускайте:
+Техническая схема модулей, потоков данных, циклов `scan/screen/apply/watch`, SQLite-состояний и границ безопасности находится в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-```bash
-SOURCE_DIR=/absolute/path/to/OPERATION_EXIT
-.venv/bin/python scripts/verify_archive.py \
-  --source "$SOURCE_DIR" \
-  --archive private/archive/operation_exit \
-  --report private/reports/archive_manifest.txt
-.venv/bin/python scripts/check_public.py
-.venv/bin/python -m build
-.venv/bin/python scripts/check_public.py
-```
-
-Проверяются текущие tracked-файлы, все доступные Git-коммиты и wheel/sdist. Значения секретов в отчёты не выводятся. GitHub и реальные отклики в этот этап не входят.
-
-## Проверки
+## Проверки перед публикацией
 
 ```bash
 .venv/bin/python -m pytest -q
-.venv/bin/ruff check .
+.venv/bin/python -m ruff check .
+.venv/bin/python scripts/check_public.py
+.venv/bin/python -m build
+git diff --check
 ```
 
-Устройство модулей и границы данных описаны в
-[архитектуре](docs/ARCHITECTURE.md). Локальные профили, отчёты и рабочие
-журналы остаются в `private/` и не входят в публичный репозиторий.
+`scripts/check_public.py` проверяет публичные tracked-файлы и доступную Git-историю на утечки приватных данных/секретов.
 
 ## Участники
 
 Спасибо участникам, чьи изменения вошли в основной код проекта:
 
-- [@Vova4o](https://github.com/Vova4o) — grounded cover-letter workflow и улучшения надёжности откликов ([PR #1](https://github.com/nssanta/ApplyPilot/pull/1)).
+- [@Vova4o](https://github.com/Vova4o) — контур сопроводительных писем на подтверждённых фактах и улучшения надёжности откликов ([PR #1](https://github.com/nssanta/ApplyPilot/pull/1)).
 - [@artemius125](https://github.com/artemius125) — LLM-скрининг вакансий, локальная веб-админка, треки, watcher/packaging и основа hardening-прохода ([PR #3](https://github.com/nssanta/ApplyPilot/pull/3); заменил PR #2).

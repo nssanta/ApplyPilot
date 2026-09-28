@@ -9,7 +9,7 @@ from .config import ConfigError, professional_context
 
 
 def letter_mode(profile: dict[str, Any]) -> str:
-    """Resolve the letter source, preserving profiles that use only llm.enabled."""
+    """Определяет источник письма, сохраняя совместимость с профилями только с llm.enabled."""
     settings = profile.get("cover_letter", {})
     if not isinstance(settings, dict):
         raise ConfigError("cover_letter must be a table")
@@ -27,7 +27,7 @@ def letter_mode(profile: dict[str, Any]) -> str:
 
 
 def load_letter_profile(profile: dict[str, Any], profile_path: Path) -> dict[str, Any]:
-    """Load explicitly configured UTF-8 resume and template files beside the profile."""
+    """Загружает явно указанные UTF-8 файлы резюме и шаблона относительно профиля."""
     result = deepcopy(profile)
     letter_mode(result)
     for section, text_key, file_key in (
@@ -75,7 +75,7 @@ def _records_text(records: list[dict[str, Any]]) -> str:
 
 
 def render_template(item: dict[str, Any], profile: dict[str, Any]) -> str:
-    """Render an offline letter with allowlisted scalar fields and no expressions."""
+    """Рендерит офлайн-письмо только из разрешённых скалярных полей без выражений."""
     letter_mode(profile)
     template = profile.get("cover_letter", {}).get("template", "")
     if not isinstance(template, str) or not template.strip():
