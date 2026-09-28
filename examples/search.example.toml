@@ -1,11 +1,10 @@
-preset = "ai-llm"
-queries = ["AI Agent Engineer", "LLM Engineer", "Python Backend"]
+queries = ["Software Engineer", "Developer"]
 areas = [113]
 max_pages = 1
 request_budget = 50
-only_remote = true
+only_remote = false
 days = 7
-min_score = 50
+min_score = 0
 skip_high_security = false
 details_limit = 50
 
@@ -13,6 +12,3 @@ details_limit = 50
 currency = "RUR"
 from = 0
 missing = "include"
-
-[experience]
-allowed = ["noExperience", "between1And3", "between3And6"]

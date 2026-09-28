@@ -58,12 +58,21 @@ def _parse_topics(state: dict[str, Any]) -> list[dict[str, Any]]:
         status = STATUS_MAP.get(last_state)
         if not status and last_state == "RESPONSE":
             status = "viewed" if topic.get("viewedByOpponent") else "not_viewed"
+        resume = ""
+        for key in ("resumeTitle", "resumeName", "selectedResume", "resume"):
+            value = topic.get(key)
+            if isinstance(value, Mapping):
+                value = value.get("title") or value.get("name") or value.get("resumeTitle")
+            if isinstance(value, str) and value.strip():
+                resume = value.strip()
+                break
         rows.append({
             "vacancy_id": vacancy_id,
             "id": str(topic.get("id") or ""),
             "status": status or last_state or "unknown",
             "name": str(topic.get("vacancyName") or ""),
             "company": str(topic.get("companyName") or ""),
+            "resume": resume,
             "updated_at": str(topic.get("lastModified") or ""),
         })
     return rows

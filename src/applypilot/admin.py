@@ -1,0 +1,2319 @@
+"""Local admin web UI for ApplyPilot.
+
+A dependency-free control panel served on localhost with the standard library.
+It reads local artifacts (screen reports, the SQLite journal, emitted snapshots)
+and launches ``applypilot`` subcommands as subprocesses so the operator can scan,
+screen, sync, dry-run and — behind an explicit confirmation — send applications,
+watching live logs in the browser.
+
+Nothing is exposed beyond a loopback address and real sending stays gated on both an
+explicit confirm and ``reviewed = true`` in the profile.
+"""
+
+from __future__ import annotations
+
+import hmac
+import html
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import webbrowser
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse, urlsplit
+
+from .balance import fetch_balance
+from .config import AppConfig, ConfigError, effective_search, search_groups
+from .letters import LettersError, generate_letter
+from .storage import Store
+
+# Human-readable HH experience tiers.
+EXPERIENCE_LABELS = {
+    "noExperience": "без опыта",
+    "between1And3": "1–3 года",
+    "between3And6": "3–6 лет",
+    "moreThan6": "6+ лет",
+}
+TRACKS_CONFIG = "private/config/tracks.toml"
+RUBRIC_TYPES = ("ai", "infra", "general")
+WATCH_TIMER = "applypilot-watch.timer"
+
+# Fallback used only when private/config/tracks.toml is absent. It points at the
+# standard private profile and search paths without assuming a role or resume.
+DEFAULT_TRACKS = [
+    {"key": "default", "label": "Основной трек", "type": "general",
+     "profile": "private/config/profile.toml", "search": "private/config/search.toml",
+     "resume": ""},
+]
+
+# track key -> normalised track config; populated by load_tracks() so the number
+# of tracks (and their resumes) is driven by config, not hard-coded.
+TRACKS: dict[str, dict[str, Any]] = {}
+
+
+def _normalise_track(entry: dict[str, Any]) -> dict[str, Any] | None:
+    key = re.sub(r"[^a-z0-9_-]", "", str(entry.get("key", "")).strip().lower())
+    if not key:
+        return None
+    rubric = str(entry.get("type", "general")).strip().lower()
+    if rubric not in RUBRIC_TYPES:
+        rubric = "general"
+    return {
+        "key": key,
+        "label": str(entry.get("label") or key),
+        "type": rubric,
+        "profile": str(entry.get("profile") or f"private/config/profile-{key}.toml"),
+        "search": str(entry.get("search") or f"private/config/search-{key}.toml"),
+        "resume": str(entry.get("resume") or ""),
+        "screen_report": str(entry.get("screen_report") or f"private/reports/screen-{key}.json"),
+        "accepted": str(entry.get("accepted") or f"private/data/snapshots/accepted-{key}.json"),
+    }
+
+
+def load_tracks(root: Path) -> dict[str, dict[str, Any]]:
+    """Load track definitions from tracks.toml into the module TRACKS mapping.
+
+    Missing config falls back to one neutral track and is written out so
+    the file becomes the single, editable source of truth.
+    """
+    path = root / TRACKS_CONFIG
+    entries: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            with path.open("rb") as fh:
+                data = tomllib.load(fh)
+            raw = data.get("track", [])
+            if isinstance(raw, list):
+                entries = [e for e in raw if isinstance(e, dict)]
+        except (OSError, tomllib.TOMLDecodeError):
+            entries = []
+    if not entries:
+        entries = [dict(e) for e in DEFAULT_TRACKS]
+        try:
+            _write_tracks_config(path, entries)
+        except OSError:
+            pass
+    TRACKS.clear()
+    for entry in entries:
+        norm = _normalise_track(entry)
+        if norm is not None:
+            TRACKS[norm["key"]] = norm
+    return TRACKS
+
+
+def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
+    """Persist track definitions to tracks.toml with an atomic replacement."""
+    lines = ["# Треки поиска для админки. Число треков динамическое.",
+             "# key/type(ai|infra|general)/profile/search/resume — см. админку «Резюме и треки».", ""]
+    for e in entries:
+        n = _normalise_track(e)
+        if n is None:
+            continue
+        lines.append("[[track]]")
+        for field_name in ("key", "label", "type", "profile", "search", "resume",
+                           "screen_report", "accepted"):
+            lines.append(f'{field_name} = {json.dumps(n[field_name], ensure_ascii=False)}')
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the old configuration intact if the write is interrupted.
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as fh:
+            tmp_path = Path(fh.name)
+            fh.write("\n".join(lines))
+        tmp_path.replace(path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+# Model choices offered in the admin (the first is the stock default).
+MODEL_CHOICES = [
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5",
+    "deepseek-v4-flash-0731",
+    "qwen3-7-flash",
+]
+DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1/chat/completions"
+
+
+@dataclass
+class Job:
+    """A single background subprocess whose output is streamed to the browser."""
+
+    argv: list[str] = field(default_factory=list)
+    label: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    returncode: int | None = None
+    lines: list[str] = field(default_factory=list)
+    process: subprocess.Popen | None = None
+    id: str = ""
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "argv": self.argv,
+            "running": self.process is not None and self.returncode is None,
+            "returncode": self.returncode,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "lines": self.lines[-500:],
+        }
+
+
+# How many finished runs are kept in the on-disk journal (and in memory).
+JOURNAL_KEEP = 60
+# Output lines stored per finished run in the journal (live view keeps more).
+JOURNAL_LINES = 500
+
+
+class JobRunner:
+    """Runs at most one job at a time and keeps a journal of finished runs."""
+
+    def __init__(self, root: Path, journal_path: Path | None = None) -> None:
+        self.root = root
+        self.lock = threading.Lock()
+        self.current: Job | None = None
+        self.journal_path = journal_path
+        # Finished runs, oldest first; seeded from disk so the journal survives
+        # restarts and each new job appends rather than overwriting.
+        self.runs: list[dict[str, Any]] = self._load_journal()
+
+    def _load_journal(self) -> list[dict[str, Any]]:
+        if not self.journal_path or not self.journal_path.exists():
+            return []
+        runs: list[dict[str, Any]] = []
+        try:
+            for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row.get("id"):
+                    runs.append(row)
+        except OSError:
+            return []
+        return runs[-JOURNAL_KEEP:]
+
+    def _persist_journal(self) -> None:
+        if not self.journal_path:
+            return
+        try:
+            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+            body = "\n".join(json.dumps(row, ensure_ascii=False) for row in self.runs)
+            self.journal_path.write_text(body + ("\n" if body else ""), encoding="utf-8")
+        except OSError:
+            pass
+
+    def start(self, argv: list[str], label: str, env: dict[str, str] | None = None) -> tuple[bool, str]:
+        with self.lock:
+            if self.current is not None and self.current.returncode is None:
+                return False, "another job is running"
+            started = time.time()
+            job = Job(argv=argv, label=label, started_at=started,
+                      id=f"{int(started * 1000)}-{label}")
+            run_env = {**os.environ, **(env or {})}
+            try:
+                job.process = subprocess.Popen(
+                    argv, cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=run_env,
+                )
+            except OSError as exc:
+                return False, f"failed to start: {exc}"
+            self.current = job
+        threading.Thread(target=self._pump, args=(job,), daemon=True).start()
+        return True, "started"
+
+    def _pump(self, job: Job) -> None:
+        assert job.process is not None and job.process.stdout is not None
+        for line in job.process.stdout:
+            job.lines.append(line.rstrip("\n"))
+        job.process.wait()
+        job.returncode = job.process.returncode
+        job.finished_at = time.time()
+        record = {
+            "id": job.id, "label": job.label, "argv": job.argv,
+            "started_at": job.started_at, "finished_at": job.finished_at,
+            "returncode": job.returncode, "lines": job.lines[-JOURNAL_LINES:],
+        }
+        with self.lock:
+            self.runs.append(record)
+            self.runs = self.runs[-JOURNAL_KEEP:]
+            self._persist_journal()
+
+    def status(self) -> dict[str, Any] | None:
+        return self.current.snapshot() if self.current else None
+
+    def history(self) -> list[dict[str, Any]]:
+        """Compact list of finished runs, newest first (no output lines)."""
+        with self.lock:
+            runs = list(self.runs)
+        out = []
+        for row in reversed(runs):
+            out.append({
+                "id": row.get("id"), "label": row.get("label", ""),
+                "started_at": row.get("started_at"), "finished_at": row.get("finished_at"),
+                "returncode": row.get("returncode"),
+                "nlines": len(row.get("lines", [])),
+            })
+        return out
+
+    def run_output(self, run_id: str) -> dict[str, Any] | None:
+        """Full captured output for one run (finished journal entry or the live job)."""
+        if self.current and self.current.id == run_id:
+            return self.current.snapshot()
+        with self.lock:
+            for row in reversed(self.runs):
+                if row.get("id") == run_id:
+                    return {**row, "running": False}
+        return None
+
+    def stop(self) -> bool:
+        with self.lock:
+            if self.current and self.current.process and self.current.returncode is None:
+                self.current.process.terminate()
+                return True
+        return False
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def _profile_flag(root: Path, track: str) -> dict[str, Any]:
+    path = root / TRACKS[track]["profile"]
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+_RESUME_STOP = {"мои резюме", "создать резюме", "резюме", "показать ещё", "показать еще"}
+_RESUME_SKIP_PREFIX = ("уровень дохода", "постоянная работа", "проектная работа", "стажировка",
+                       "частичная занятость", "удалённо", "удаленно", "гибрид", "обновлено")
+
+
+def _clean_resume_titles(raw: list[str]) -> list[str]:
+    """Reduce HH's noisy resume labels (card blocks, headings) to clean titles."""
+    out: list[str] = []
+    for entry in raw:
+        for line in str(entry).split("\n"):
+            s = line.strip()
+            low = s.lower()
+            if not s or low in _RESUME_STOP or low.startswith(_RESUME_SKIP_PREFIX):
+                continue
+            out.append(s)
+            break  # first meaningful line of a block is the resume title
+    seen: set[str] = set()
+    result: list[str] = []
+    for title in out:
+        key = title.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(title)
+    return result
+
+
+def _disp(value: Any) -> str:
+    """Decode HTML entities in scanned text so the UI doesn't double-escape them."""
+    return html.unescape(str(value or ""))
+
+
+def _exp_label(value: str) -> str:
+    return EXPERIENCE_LABELS.get(str(value or ""), "—")
+
+
+def _over_experience(profile: dict[str, Any], experience: str) -> bool:
+    """Compare HH's minimum experience tier only when the private profile sets it."""
+    screen = profile.get("screen", {})
+    if not isinstance(screen, dict):
+        return False
+    try:
+        candidate_years = float(screen.get("experience_years"))
+    except (TypeError, ValueError):
+        return False
+    if candidate_years < 0:
+        return False
+    required_minimum = {"between1And3": 1, "between3And6": 3, "moreThan6": 6}.get(experience)
+    return required_minimum is not None and required_minimum > candidate_years
+
+
+def _salary_label(salary: Any) -> str:
+    """Format an HH salary dict into a compact human string, '—' when absent."""
+    if not isinstance(salary, dict):
+        return "—"
+    lo, hi = salary.get("from"), salary.get("to")
+    cur = str(salary.get("currency") or "").upper()
+    sign = "₽" if cur in {"RUR", "RUB", ""} else cur
+    if lo and hi:
+        body = f"{int(lo):,}–{int(hi):,}".replace(",", " ")
+    elif lo:
+        body = f"от {int(lo):,}".replace(",", " ")
+    elif hi:
+        body = f"до {int(hi):,}".replace(",", " ")
+    else:
+        return "—"
+    return f"{body} {sign}".strip()
+
+
+def _is_fresh(published: str, *, days: int = 3) -> bool:
+    """True when the vacancy was published within the last ``days`` days."""
+    if not published:
+        return False
+    try:
+        from datetime import UTC, datetime
+        text = str(published).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - dt).total_seconds() <= days * 86400
+    except (ValueError, TypeError):
+        return False
+
+
+def _today() -> str:
+    from datetime import UTC, datetime
+    return datetime.now(UTC).date().isoformat()
+
+
+def _found_label(first_seen: str) -> str:
+    """Compact 'found on' date (e.g. '22.09'), '—' when unknown."""
+    text = str(first_seen or "").strip()[:10]
+    if not text:
+        return "—"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(text).strftime("%d.%m")
+    except (ValueError, TypeError):
+        return text
+
+
+def _is_new(first_seen: str, today: str | None = None) -> bool:
+    """True when the vacancy was first discovered today (this scan cycle)."""
+    text = str(first_seen or "").strip()[:10]
+    return bool(text) and text == (today or _today())
+
+
+def _norm_title(name: str) -> str:
+    """Normalise a vacancy title for near-duplicate collapsing."""
+    text = str(name or "").lower().strip()
+    return re.sub(r"[\s\W]+", " ", text).strip()
+
+
+_VERDICT_ORDER = {"FIT": 0, "MAYBE": 1, "SKIP": 2, "ERROR": 3}
+
+
+def _dedup_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse HH reposts (same company + title) into their strongest row.
+
+    HH lets employers repost the same vacancy under fresh sequential ids to stay
+    on top of search; those arrive as distinct ids the mechanical id-dedup cannot
+    catch.  We keep the best verdict / highest fit_score and record how many
+    duplicates were folded in so the operator sees one line, not three.
+    """
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows:
+        key = (str(row.get("company", "")).lower().strip(), _norm_title(row.get("name", "")))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    def rank(r: dict[str, Any]) -> tuple[int, int]:
+        return (_VERDICT_ORDER.get(r.get("verdict", ""), 4), -int(r.get("fit_score", 0) or 0))
+
+    collapsed: list[dict[str, Any]] = []
+    for key in order:
+        members = sorted(groups[key], key=rank)
+        best = dict(members[0])
+        best["dupes"] = len(members) - 1
+        best["dupe_ids"] = [str(m.get("id", "")) for m in members[1:]]
+        # Reposts represent the same job to the user: if any variant was handled,
+        # the collapsed row must not reappear as active under another verdict.
+        for flag in ("viewed", "bad", "applied", "blocked", "letter_sent"):
+            best[flag] = any(bool(m.get(flag)) for m in members)
+        if not best.get("application_resume"):
+            best["application_resume"] = next((str(m.get("application_resume") or "")
+                                                for m in members if m.get("application_resume")), "")
+        if not best.get("resume_hint"):
+            best["resume_hint"] = next((str(m.get("resume_hint") or "")
+                                        for m in members if m.get("resume_hint")), "")
+        if not best.get("db_status"):
+            best["db_status"] = next((str(m.get("db_status") or "") for m in members
+                                       if m.get("db_status")), "")
+        # A repost gets a fresh id, so the earliest first_seen across the group
+        # is the vacancy's true discovery date.
+        seens = [str(m.get("first_seen") or "") for m in members if str(m.get("first_seen") or "")]
+        if seens:
+            best["first_seen"] = min(seens)
+        collapsed.append(best)
+    return collapsed
+
+
+class AdminApp:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.root = config.root
+        self.runner = JobRunner(self.root, config.data_dir / "jobs.jsonl")
+        self.settings_path = config.data_dir / "admin-settings.json"
+        self._balance_cache: tuple[float, float | None] = (0.0, None)  # (fetched_at, rub)
+        self._resume_cache: dict[str, Any] = {}  # last-known HH resume titles
+        # Fresh for each admin process; embedded only in its same-origin UI.
+        self._csrf_token = secrets.token_urlsafe(32)
+        load_tracks(self.root)
+
+    @staticmethod
+    def _account_for_profile(profile: dict[str, Any]) -> str:
+        return str(profile.get("account") or "default").strip() or "default"
+
+    def _account_for_track(self, track: str) -> str:
+        return self._account_for_profile(_profile_flag(self.root, track))
+
+    # ---- settings (model + per-user API key) ---------------------------
+    def load_settings(self) -> dict[str, Any]:
+        data = _read_json(self.settings_path) or {}
+        return data if isinstance(data, dict) else {}
+
+    def settings_public(self) -> dict[str, Any]:
+        """Settings for the browser — the API key is NEVER returned, only whether it is set."""
+        s = self.load_settings()
+        criteria = {key: s.get(f"criteria_{key}") or "" for key in TRACKS}
+        return {
+            "model": s.get("model") or DEFAULT_MODEL,
+            "base_url": s.get("base_url") or DEFAULT_BASE_URL,
+            "key_set": bool(s.get("api_key") or os.getenv("AITUNNEL_API_KEY")),
+            "models": MODEL_CHOICES,
+            "constraints": s.get("constraints") or "",
+            "salary_expectation": s.get("salary_expectation") or "",
+            # Per-track screening overrides, plus a list of tracks for the UI.
+            "criteria": criteria,
+            "tracks": [{"key": k, "label": v["label"], "type": v["type"], "resume": v["resume"]}
+                       for k, v in TRACKS.items()],
+        }
+
+    def save_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
+        s = self.load_settings()
+        if patch.get("model"):
+            s["model"] = str(patch["model"]).strip()
+        if patch.get("base_url"):
+            s["base_url"] = str(patch["base_url"]).strip()
+        # Free-text prompt/candidate overrides ("" clears them).
+        fields = ["constraints", "salary_expectation"] + [f"criteria_{key}" for key in TRACKS]
+        for fld in fields:
+            if fld in patch and isinstance(patch[fld], str):
+                s[fld] = patch[fld].strip()
+        # Only overwrite the key when a non-empty value is supplied; "" leaves it as is.
+        api_key = patch.get("api_key")
+        if isinstance(api_key, str) and api_key.strip():
+            s["api_key"] = api_key.strip()
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8")
+        try:
+            self.settings_path.chmod(0o600)
+        except OSError:
+            pass
+        return self.settings_public()
+
+    def _screen_env(self) -> dict[str, str]:
+        key = str(self.load_settings().get("api_key") or "").strip()
+        return {"AITUNNEL_API_KEY": key} if key else {}
+
+    def _api_key(self) -> str:
+        return str(self.load_settings().get("api_key") or "").strip() or os.getenv("AITUNNEL_API_KEY", "")
+
+    def live_balance(self, *, max_age: float = 60.0) -> float | None:
+        """Balance in rubles from aitunnel, cached briefly to avoid per-request calls."""
+        now = time.time()
+        fetched_at, cached = self._balance_cache
+        if cached is not None and now - fetched_at < max_age:
+            return cached
+        key = self._api_key()
+        if not key:
+            return cached
+        base = str(self.load_settings().get("base_url") or DEFAULT_BASE_URL)
+        # fetch_balance wants the API origin, not the chat-completions path.
+        origin = base.split("/v1/")[0] if "/v1/" in base else base
+        value = fetch_balance(key, origin)
+        if value is not None:
+            self._balance_cache = (now, value)
+        return value if value is not None else cached
+
+    # ---- data endpoints -------------------------------------------------
+    def overview(self) -> dict[str, Any]:
+        store = Store(self.config.db_path)
+        account = (self._account_for_track(next(iter(TRACKS))) if TRACKS else "default")
+        session_file = self.config.data_dir / "hh_session.json"
+        watch_log = self.config.data_dir / "watch.log"
+        watch_tail = ""
+        if watch_log.exists():
+            try:
+                watch_tail = "\n".join(watch_log.read_text(encoding="utf-8").splitlines()[-4:])
+            except OSError:
+                watch_tail = ""
+        result: dict[str, Any] = {
+            "session_present": session_file.exists(),
+            "blocked": len(store.blocked_ids(account)) if self.config.db_path.exists() else 0,
+            "balance": self.live_balance(),
+            "watch_tail": watch_tail,
+            "tracks": {},
+            "job": self.runner.status(),
+            "sync": store.latest_sync(account) if self.config.db_path.exists() else None,
+            "negotiation_count": len(store.negotiation_ids(account)) if self.config.db_path.exists() else 0,
+        }
+        # The operator's per-vacancy state, so the dashboard reflects exactly the
+        # same "active" pool as the vacancies tab (handled ones drop off).
+        viewed = self._viewed()
+        bad = self._bad()
+        applied = self._manual_applied()
+        today = _today()
+        for track, cfg in TRACKS.items():
+            track_account = self._account_for_track(track)
+            blocked = store.blocked_ids(track_account) if self.config.db_path.exists() else set()
+            profile = _profile_flag(self.root, track)
+            report = _read_json(self.root / cfg["screen_report"]) or {}
+            results = report.get("results", []) if isinstance(report, dict) else []
+            # Annotate before dedup (mirrors vacancies()), so buckets agree.
+            enriched = [{**r, "fresh": _is_fresh(r.get("published", "")),
+                         "is_new": _is_new(r.get("first_seen", ""), today),
+                         "viewed": str(r.get("id", "")) in viewed,
+                         "bad": str(r.get("id", "")) in bad,
+                         "applied": str(r.get("id", "")) in applied,
+                         "blocked": str(r.get("id", "")) in blocked,
+                         "exp_label": _exp_label(r.get("experience", ""))} for r in results]
+            top = sorted(_dedup_rows(enriched),
+                         key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
+                                        -int(r.get("fit_score", 0) or 0)))
+            # "Active" = not handled (not viewed, not marked bad) — same as the
+            # vacancies tab's active bucket.
+            active = [r for r in top if not (r.get("viewed") or r.get("bad")
+                                              or r.get("applied") or r.get("blocked")
+                                              or r.get("letter_sent"))]
+            # Suggestions worth acting on now: active FIT not yet applied/blocked.
+            top_fit = [{"id": r.get("id"), "name": r.get("name"), "company": r.get("company"),
+                        "url": r.get("url"), "fit_score": r.get("fit_score"),
+                        "verdict": r.get("verdict"), "exp_label": r.get("exp_label"),
+                        "fresh": r.get("fresh"), "is_new": r.get("is_new")}
+                       for r in active
+                       if r.get("verdict") == "FIT" and not r.get("applied")
+                       and not r.get("blocked")][:6]
+            fresh_count = sum(1 for r in active if r.get("fresh")
+                              and r.get("verdict") in ("FIT", "MAYBE"))
+            new_count = sum(1 for r in active if r.get("is_new")
+                            and r.get("verdict") in ("FIT", "MAYBE"))
+            # Unique (deduplicated) counts over the active pool so the overview
+            # matches the vacancies view's active segment.
+            uniq: dict[str, int] = {"FIT": 0, "MAYBE": 0, "SKIP": 0, "ERROR": 0}
+            for r in active:
+                uniq[r.get("verdict", "")] = uniq.get(r.get("verdict", ""), 0) + 1
+            accepted = _read_json(self.root / cfg["accepted"]) or {}
+            result["tracks"][track] = {
+                "label": cfg["label"],
+                "reviewed": bool(profile.get("reviewed", False)),
+                "counts": report.get("counts") if isinstance(report, dict) else None,
+                "counts_unique": uniq,
+                "accepted": len(accepted.get("items", [])) if isinstance(accepted, dict) else 0,
+                "has_report": bool(report),
+                "top_fit": top_fit,
+                "fresh_count": fresh_count,
+                "new_count": new_count,
+                "error_count": int((report.get("counts") or {}).get("ERROR", 0))
+                    if isinstance(report, dict) else 0,
+            }
+        return result
+
+    def spend(self) -> dict[str, Any]:
+        """Aggregate the LLM spend ledger for the stats panel."""
+        path = self.config.data_dir / "spend.jsonl"
+        today = time.strftime("%Y-%m-%d")
+        by_day: dict[str, float] = {}
+        total = 0.0
+        calls = 0
+        balance: float | None = None
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cost = float(row.get("cost_rub") or 0)
+                day = str(row.get("date") or "")
+                by_day[day] = round(by_day.get(day, 0.0) + cost, 4)
+                total += cost
+                calls += 1
+                if row.get("balance") is not None:
+                    balance = float(row["balance"])
+        days = sorted(by_day.items())[-14:]
+        live = self.live_balance()
+        return {
+            "balance": live if live is not None else balance,
+            "balance_live": live is not None,
+            "today_rub": round(by_day.get(today, 0.0), 2),
+            "total_rub": round(total, 2),
+            "calls": calls,
+            "by_day": [{"date": d, "rub": round(v, 2)} for d, v in days],
+        }
+
+    def verdict_stats(self) -> dict[str, Any]:
+        out = {}
+        for track, cfg in TRACKS.items():
+            report = _read_json(self.root / cfg["screen_report"]) or {}
+            out[track] = {"label": cfg["label"],
+                          "counts": report.get("counts") if isinstance(report, dict) else None}
+        return out
+
+    def vacancies(self, track: str) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        report = _read_json(self.root / TRACKS[track]["screen_report"]) or {}
+        results = report.get("results", []) if isinstance(report, dict) else []
+        store = Store(self.config.db_path)
+        account = self._account_for_track(track)
+        statuses = store.read_statuses(account) if self.config.db_path.exists() else {}
+        blocked = store.blocked_ids(account) if self.config.db_path.exists() else set()
+        negotiations = store.negotiation_details(account) if self.config.db_path.exists() else {}
+        attempts = store.attempt_details(account) if self.config.db_path.exists() else {}
+        applied = self._manual_applied()
+        manual_details = self._manual_application_details()
+        letters_sent = self._letters_sent()
+        viewed = self._viewed()
+        bad = self._bad()
+        rows = []
+        for row in results:
+            vid = str(row.get("id", ""))
+            rows.append({
+                **row,
+                "name": _disp(row.get("name", "")),
+                "company": _disp(row.get("company", "")),
+                "db_status": statuses.get(vid, "") or negotiations.get(vid, {}).get("status", ""),
+                "blocked": vid in blocked,
+                "applied": vid in applied,
+                "letter_sent": vid in letters_sent,
+                "letter_sent_at": letters_sent.get(vid, {}).get("sent_at", ""),
+                "application_resume": (attempts.get(vid, {}).get("resume", "")
+                                       or negotiations.get(vid, {}).get("resume", "")
+                                       or manual_details.get(vid, {}).get("resume", "")
+                                       or letters_sent.get(vid, {}).get("resume", "")),
+                "resume_hint": TRACKS[track].get("resume", "")
+                    if vid in blocked or vid in applied else "",
+                "viewed": vid in viewed,
+                "bad": vid in bad,
+                "exp_label": _exp_label(row.get("experience", "")),
+                "over_experience": _over_experience(
+                    _profile_flag(self.root, track), str(row.get("experience", ""))),
+                "salary_label": _salary_label(row.get("salary")),
+                "fresh": _is_fresh(row.get("published", "")),
+            })
+        rows = _dedup_rows(rows)
+        today = _today()
+        for r in rows:
+            r["found_label"] = _found_label(r.get("first_seen", ""))
+            r["is_new"] = _is_new(r.get("first_seen", ""), today)
+        rows.sort(key=lambda r: (_VERDICT_ORDER.get(r.get("verdict", ""), 4),
+                                 -int(r.get("fit_score", 0) or 0)))
+        folded = sum(int(r.get("dupes", 0)) for r in rows)
+        return {"track": track, "model": report.get("model"), "count": len(rows),
+                "folded_duplicates": folded, "rows": rows}
+
+    # ---- job endpoints --------------------------------------------------
+    def start_job(self, body: dict[str, Any]) -> tuple[bool, str]:
+        action = str(body.get("action", ""))
+        track = str(body.get("track") or (next(iter(TRACKS)) if TRACKS else ""))
+        if track not in TRACKS:
+            return False, "unknown track"
+        cfg = TRACKS[track]
+        base = [sys.executable, "-m", "applypilot"]
+        # Global flags (profile/search) go before the subcommand.
+        gflags = ["--profile", cfg["profile"], "--search", cfg["search"]]
+        if action == "scan":
+            argv = base + gflags + ["scan"]
+        elif action == "sync":
+            argv = base + gflags + ["sync"]
+        elif action == "screen":
+            argv = base + gflags + [
+                "screen", "--input", body.get("input") or _track_snapshot(self.root, track),
+                "--track", cfg["type"],
+                "--output", cfg["screen_report"], "--emit-snapshot", cfg["accepted"],
+            ]
+            s = self.load_settings()
+            if str(s.get("model") or "").strip():
+                argv += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                argv += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                argv += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                argv += ["--criteria", str(s[f"criteria_{track}"])]
+            if not self._screen_env() and not os.getenv("AITUNNEL_API_KEY"):
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
+        elif action == "retry_errors":
+            if not self._api_key():
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
+            retry_input, error = self._error_retry_input(track)
+            if error:
+                return False, error
+            s = self.load_settings()
+            argv = base + gflags + ["screen", "--input", str(retry_input), "--track", cfg["type"],
+                                    "--output", cfg["screen_report"], "--emit-snapshot", cfg["accepted"],
+                                    "--retry-errors"]
+            if str(s.get("model") or "").strip():
+                argv += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                argv += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                argv += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                argv += ["--criteria", str(s[f"criteria_{track}"])]
+            return self.runner.start(argv, f"retry_errors:{track}", env=self._screen_env())
+        elif action == "fresh":
+            # Manual version of the watch timer: scan the freshest vacancies for
+            # this track, then screen them, in one streamed job.  Never applies.
+            if not self._api_key():
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
+            import shlex
+            days = max(1, int(body.get("days") or 3))
+            s = self.load_settings()
+            screen_extra = ["--track", cfg["type"], "--output", cfg["screen_report"],
+                            "--emit-snapshot", cfg["accepted"]]
+            if str(s.get("model") or "").strip():
+                screen_extra += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                screen_extra += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                screen_extra += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                screen_extra += ["--criteria", str(s[f"criteria_{track}"])]
+            py = shlex.quote(sys.executable)
+            g = " ".join(shlex.quote(x) for x in gflags)
+            scan_cmd = f"{py} -m applypilot {g} scan --days {days}"
+            screen_args = " ".join(shlex.quote(x) for x in screen_extra)
+            pipeline = (
+                "set -euo pipefail; scan_log=\"$(mktemp)\"; "
+                "trap 'rm -f -- \"$scan_log\"' EXIT; "
+                f"{scan_cmd} 2>&1 | tee \"$scan_log\"; "
+                "snap=\"$(sed -n 's/^status: .*snapshot: //p' \"$scan_log\" | tail -n 1)\"; "
+                "if [[ -z \"$snap\" || ! -f \"$snap\" ]]; then "
+                "echo 'scan did not return its snapshot path' >&2; exit 1; fi; "
+                f"{py} -m applypilot {g} screen --input \"$snap\" {screen_args}"
+            )
+            argv = ["bash", "-lc", pipeline]
+            return self.runner.start(argv, f"fresh:{track}", env=self._screen_env())
+        elif action == "scan_screen":
+            # One click = full scan of this track, then LLM screening of the
+            # result, streamed as a single job.  Never applies.
+            if not self._api_key():
+                return False, "no AITUNNEL_API_KEY: задайте ключ во вкладке «Настройки»"
+            import shlex
+            s = self.load_settings()
+            screen_extra = ["--track", cfg["type"], "--output", cfg["screen_report"],
+                            "--emit-snapshot", cfg["accepted"]]
+            if str(s.get("model") or "").strip():
+                screen_extra += ["--model", str(s["model"]).strip()]
+            if s.get("constraints"):
+                screen_extra += ["--constraints", str(s["constraints"])]
+            if s.get("salary_expectation"):
+                screen_extra += ["--salary-expectation", str(s["salary_expectation"])]
+            if s.get(f"criteria_{track}"):
+                screen_extra += ["--criteria", str(s[f"criteria_{track}"])]
+            py = shlex.quote(sys.executable)
+            g = " ".join(shlex.quote(x) for x in gflags)
+            scan_cmd = f"{py} -m applypilot {g} scan"
+            screen_args = " ".join(shlex.quote(x) for x in screen_extra)
+            pipeline = (
+                "set -euo pipefail; scan_log=\"$(mktemp)\"; "
+                "trap 'rm -f -- \"$scan_log\"' EXIT; "
+                f"{scan_cmd} 2>&1 | tee \"$scan_log\"; "
+                "snap=\"$(sed -n 's/^status: .*snapshot: //p' \"$scan_log\" | tail -n 1)\"; "
+                "if [[ -z \"$snap\" || ! -f \"$snap\" ]]; then "
+                "echo 'scan did not return its snapshot path' >&2; exit 1; fi; "
+                f"{py} -m applypilot {g} screen --input \"$snap\" {screen_args}"
+            )
+            argv = ["bash", "-lc", pipeline]
+            return self.runner.start(argv, f"scan_screen:{track}", env=self._screen_env())
+        elif action == "analytics":
+            argv = base + ["analytics"]
+        elif action in {"apply_dry", "apply_run"}:
+            if not (self.root / cfg["accepted"]).exists():
+                return False, "нет отобранных вакансий — сначала запусти скрининг"
+            mode = str(body.get("mode", "all"))
+            input_path = self._build_apply_input(track, mode, body.get("marked"))
+            if input_path is None:
+                return False, "очередь пуста: нет вакансий под выбранный фильтр"
+            argv = base + gflags + ["apply", "--input", str(input_path)]
+            limit = int(body.get("limit") or 10)
+            argv += ["--limit", str(max(1, limit))]
+            if action == "apply_dry":
+                argv += ["--dry-run"]
+            else:
+                if not body.get("confirm"):
+                    return False, "real sending requires explicit confirmation"
+                if not _profile_flag(self.root, track).get("reviewed", False):
+                    return False, "profile is not reviewed=true; cannot send"
+                argv += ["--run"]
+                if body.get("target"):
+                    argv += ["--target-success", str(int(body["target"]))]
+        else:
+            return False, f"unknown action: {action}"
+        return self.runner.start(argv, f"{action}:{track}", env=self._screen_env())
+
+    def _error_retry_input(self, track: str) -> tuple[Path | None, str]:
+        report = _read_json(self.root / TRACKS[track]["screen_report"]) or {}
+        failed_ids = {str(row.get("id", "")) for row in report.get("results", [])
+                      if isinstance(row, dict) and row.get("verdict") == "ERROR"}
+        failed_ids.discard("")
+        if not failed_ids:
+            return None, "в отчёте нет вакансий с ошибкой AI"
+        found: dict[str, dict[str, Any]] = {}
+        for path in _track_snapshot_paths(self.root, track):
+            data = _read_json(path)
+            if not isinstance(data, dict):
+                continue
+            lists = [data.get("items")] + [segment.get("items") for segment in data.get("segments", [])
+                                           if isinstance(segment, dict)]
+            for items in lists:
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, dict) and str(item.get("id", "")) in failed_ids:
+                        found.setdefault(str(item["id"]), item)
+        missing = failed_ids - found.keys()
+        if missing:
+            return None, f"не найдены исходные описания для {len(missing)} ошибочных вакансий"
+        path = self.config.data_dir / "snapshots" / f"retry-errors-{track}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 3, "source": "hh.ru", "status": "ok",
+                                    "query": f"retry-errors:{track}",
+                                    "items": [found[vid] for vid in sorted(failed_ids)]},
+                                   ensure_ascii=False), encoding="utf-8")
+        return path, ""
+
+    def letter(self, track: str, vid: str) -> dict[str, Any]:
+        """Generate an individual cover letter for one vacancy (in-process)."""
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        item = None
+        for source in (Path(_track_snapshot(self.root, track)), self.root / TRACKS[track]["accepted"]):
+            data = _read_json(source) or {}
+            items = data.get("items", []) if isinstance(data, dict) else []
+            item = next((it for it in items if str(it.get("id", "")) == str(vid)), None)
+            if item is not None:
+                break
+        if item is None:
+            return {"error": "vacancy not found"}
+        s = self.load_settings()
+        key = str(s.get("api_key") or "").strip() or os.getenv("AITUNNEL_API_KEY", "")
+        if not key:
+            return {"error": "no AITUNNEL_API_KEY: задайте ключ в «Настройки»"}
+        try:
+            res = generate_letter(
+                item, _profile_flag(self.root, track), self.config.data_dir / "letter-cache",
+                model=str(s.get("model") or DEFAULT_MODEL).strip(),
+                base_url=str(s.get("base_url") or DEFAULT_BASE_URL).strip(), api_key=key,
+            )
+        except LettersError as exc:
+            return {"error": str(exc)[:200]}
+        return {"text": res.get("text", ""), "source": res.get("source", ""),
+                "url": item.get("url", ""), "name": item.get("name", "")}
+
+    # ---- resumes & tracks ----------------------------------------------
+    def fetch_resumes(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Read active HH resume titles.
+
+        The live HH read (Playwright, ~10s) runs only on ``refresh``; otherwise
+        the last-known result is returned so the tab opens instantly.
+        """
+        if not refresh:
+            return self._resume_cache or {"auth_status": "unknown", "resume_titles": [], "error": ""}
+        session_path = self.config.data_dir / "hh_session.json"
+        result: dict[str, Any] = {"auth_status": "unknown", "resume_titles": [], "error": ""}
+        if not session_path.exists():
+            result["error"] = "нет сессии HH (сделай login)"
+            return result
+        try:
+            from .inspection import inspect_resumes
+            data = inspect_resumes(session_path)
+            result["auth_status"] = data.get("auth_status", "unknown")
+            result["resume_titles"] = _clean_resume_titles(list(data.get("resume_titles", [])))
+        except RuntimeError as exc:  # playwright missing / read-only failure
+            result["error"] = str(exc)[:200]
+        except Exception as exc:  # noqa: BLE001 - a browser read failure is reported, not fatal
+            result["error"] = f"не удалось прочитать резюме: {str(exc)[:160]}"
+        if result["resume_titles"] or not self._resume_cache:
+            self._resume_cache = result
+        return result
+
+    def tracks_overview(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Tracks joined with active HH resumes, flagging mismatches both ways."""
+        resumes = self.fetch_resumes(refresh=refresh)
+        titles = [str(t).strip() for t in resumes.get("resume_titles", [])]
+        title_set = {t.lower() for t in titles}
+        used = set()
+        tracks = []
+        for key, cfg in TRACKS.items():
+            wanted = str(cfg.get("resume") or "").strip()
+            present = wanted.lower() in title_set if wanted else None
+            if present:
+                used.add(wanted.lower())
+            search_data = _read_toml(self.root / cfg["search"])
+            tracks.append({"key": key, "label": cfg["label"], "type": cfg["type"],
+                           "resume": wanted, "profile": cfg["profile"], "search": cfg["search"],
+                           "queries": search_data.get("queries", []),
+                           "resume_present": present})
+        unassigned = [t for t in titles if t.lower() not in {str(c.get("resume", "")).strip().lower()
+                                                              for c in TRACKS.values()}]
+        return {"tracks": tracks, "hh_resumes": titles, "unassigned_resumes": unassigned,
+                "auth_status": resumes.get("auth_status"), "error": resumes.get("error", ""),
+                "rubric_types": list(RUBRIC_TYPES)}
+
+    def add_track(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Create a track, optionally copying a source track's profile and search rules."""
+        key = re.sub(r"[^a-z0-9_-]", "", str(body.get("key", "")).strip().lower())
+        if not key:
+            return {"error": "ключ трека обязателен (латиница, цифры, _-)"}
+        if key in TRACKS:
+            return {"error": f"трек «{key}» уже существует"}
+        rubric = str(body.get("type", "general")).strip().lower()
+        if rubric not in RUBRIC_TYPES:
+            rubric = "general"
+        label = str(body.get("label") or key).strip()
+        resume = str(body.get("resume") or "").strip()
+        queries = [q.strip() for q in re.split(r"[\n,;]+", str(body.get("queries", ""))) if q.strip()]
+        entry = {"key": key, "label": label, "type": rubric, "resume": resume,
+                 "profile": f"private/config/profile-{key}.toml",
+                 "search": f"private/config/search-{key}.toml"}
+        source_key = str(body.get("copy_from") or "").strip()
+        source = TRACKS.get(source_key) if source_key else None
+        if source_key and source is None:
+            return {"error": f"исходный трек «{source_key}» не найден"}
+        try:
+            if source:
+                profile_text = (self.root / source["profile"]).read_text(encoding="utf-8")
+                search_text = (self.root / source["search"]).read_text(encoding="utf-8")
+                if queries:
+                    search_text = self._write_query_list(search_text, queries)
+                (self.root / entry["profile"]).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / entry["profile"]).write_text(profile_text, encoding="utf-8")
+                (self.root / entry["search"]).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / entry["search"]).write_text(search_text, encoding="utf-8")
+                # Keep the selected resume consistent with the copied profile.
+                entry["resume"] = source.get("resume", "")
+            else:
+                self._scaffold_profile(self.root / entry["profile"], resume)
+                self._scaffold_search(self.root / entry["search"], queries)
+            entries = [dict(v) for v in TRACKS.values()] + [entry]
+            _write_tracks_config(self.root / TRACKS_CONFIG, entries)
+        except (OSError, ValueError) as exc:
+            return {"error": f"не удалось создать файлы трека: {str(exc)[:160]}"}
+        # Reload first so the new key is a recognised settings field, then save
+        # any per-track screening criteria supplied with the form.
+        load_tracks(self.root)
+        criteria = str(body.get("criteria") or "").strip()
+        if not criteria and source:
+            criteria = str(self.load_settings().get(f"criteria_{source_key}") or "").strip()
+        if criteria:
+            self.save_settings({f"criteria_{key}": criteria})
+        return {"ok": True, "key": key, "profile": entry["profile"], "search": entry["search"],
+                "note": ("Настройки скопированы — проверь профиль и поисковые запросы."
+                         if source else "Заполни [professional] в профиле данными из резюме (PDF) и проверь запросы.")}
+
+    def update_track(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Edit a track's label, rubric, assigned resume and search queries."""
+        key = str(body.get("key") or "").strip()
+        if key not in TRACKS:
+            return {"error": "трек не найден"}
+        cfg = TRACKS[key]
+        label = str(body.get("label", cfg["label"])).strip()
+        rubric = str(body.get("type", cfg["type"])).strip().lower()
+        resume = str(body.get("resume", cfg["resume"])).strip()
+        if not label:
+            return {"error": "название трека обязательно"}
+        if rubric not in RUBRIC_TYPES:
+            return {"error": "неизвестная рубрика"}
+        queries_raw = body.get("queries")
+        queries = ([q.strip() for q in re.split(r"[\n,;]+", str(queries_raw)) if q.strip()]
+                   if isinstance(queries_raw, str) else None)
+        if queries is not None and not queries:
+            return {"error": "укажи хотя бы один поисковый запрос"}
+        entries = [dict(v) for v in TRACKS.values()]
+        for entry in entries:
+            if entry["key"] == key:
+                entry.update(label=label, type=rubric, resume=resume)
+        profile_path = self.root / cfg["profile"]
+        search_path = self.root / cfg["search"]
+        try:
+            if queries is not None:
+                search_text = search_path.read_text(encoding="utf-8")
+                search_path.write_text(self._write_query_list(search_text, queries), encoding="utf-8")
+            if profile_path.exists():
+                profile_text = profile_path.read_text(encoding="utf-8")
+                if re.search(r"(?m)^default\s*=", profile_text):
+                    profile_text = re.sub(r"(?m)^default\s*=.*$",
+                                          f"default = {json.dumps(resume, ensure_ascii=False)}",
+                                          profile_text, count=1)
+                    profile_path.write_text(profile_text, encoding="utf-8")
+            _write_tracks_config(self.root / TRACKS_CONFIG, entries)
+        except OSError as exc:
+            return {"error": f"не удалось сохранить трек: {str(exc)[:160]}"}
+        load_tracks(self.root)
+        return {"ok": True, "key": key}
+
+    @staticmethod
+    def _write_query_list(search_text: str, queries: list[str]) -> str:
+        q_toml = "[\n" + "".join(f"  {json.dumps(x, ensure_ascii=False)},\n" for x in queries) + "]"
+        replacement = f"queries = {q_toml}"
+        if re.search(r"(?m)^queries\s*=.*?(?=^\w[\w-]*\s*=|^\[|\Z)", search_text, re.DOTALL):
+            return re.sub(r"(?m)^queries\s*=.*?(?=^\w[\w-]*\s*=|^\[|\Z)",
+                          replacement + "\n", search_text, count=1, flags=re.DOTALL)
+        return replacement + "\n\n" + search_text
+
+    def delete_track(self, key: str) -> dict[str, Any]:
+        """Remove a track from active configuration, retaining its files and history."""
+        if key not in TRACKS:
+            return {"error": "трек не найден"}
+        if len(TRACKS) <= 1:
+            return {"error": "нельзя удалить последний трек"}
+        job = self.runner.status()
+        if job and job.get("running") and str(job.get("label", "")).endswith(f":{key}"):
+            return {"error": "дождись завершения задачи этого трека или останови её"}
+        entries = [dict(cfg) for track_key, cfg in TRACKS.items() if track_key != key]
+        try:
+            _write_tracks_config(self.root / TRACKS_CONFIG, entries)
+        except OSError as exc:
+            return {"error": f"не удалось сохранить треки: {str(exc)[:160]}"}
+        load_tracks(self.root)
+        return {"ok": True, "key": key}
+
+    def _scaffold_profile(self, path: Path, resume: str) -> None:
+        if path.exists():
+            return
+        rt = json.dumps(resume or "ЗАПОЛНИ: точное название резюме на HH", ensure_ascii=False)
+        text = (
+            '# Профиль трека. Добавляй только собственные факты и предпочтения.\n'
+            '# Укажи точное название резюме на HH; реальные отклики выключены до reviewed=true.\n'
+            'name = ""\nlocation = ""\nenglish_level = ""\n'
+            'reviewed = false\n\n'
+            '[limits]\nper_run = 15\nper_day = 40\n\n'
+            '[apply]\ndelay_min_seconds = 20\ndelay_max_seconds = 45\n'
+            'long_pause_every = 8\nlong_pause_min_seconds = 60\nlong_pause_max_seconds = 150\n\n'
+            '[screen]\nmodel = "gpt-5-mini"\n'
+            'base_url = "https://api.aitunnel.ru/v1/chat/completions"\nconcurrency = 2\n'
+            '# Optional, private candidate-specific preferences:\n'
+            '# constraints = ""\n# salary_expectation = ""\n# criteria = ""\n'
+            '# experience_years = 0\n\n'
+            '[cover_letter]\nmode = "off"\n\n'
+            '[professional]\n# ЗАПОЛНИ из резюме/PDF: summary, skills, [[professional.experience]].\n'
+            'summary = ""\nskills = []\n\n'
+            f'[resumes]\ndefault = {rt}\n'
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _scaffold_search(self, path: Path, queries: list[str]) -> None:
+        if path.exists():
+            return
+        q = queries or ["ЗАПОЛНИ запрос"]
+        q_toml = "[\n" + "".join(f'  {json.dumps(x, ensure_ascii=False)},\n' for x in q) + "]"
+        text = (
+            '# Поисковая конфигурация трека. Настрой запросы, регион и фильтры под себя.\n'
+            f'queries = {q_toml}\n'
+            'areas = [113]  # HH: вся Россия; замени на нужные region ID при необходимости\n'
+            'only_remote = false\ndays = 14\nmin_score = 0\n\n'
+            '[salary]\nfrom = 0\nmissing = "include"\n\n'
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    # ---- manual "applied" set (assisted-loop closure) ------------------
+    def _applied_path(self) -> Path:
+        return self.config.data_dir / "manual-applied.json"
+
+    def _manual_applied(self) -> set[str]:
+        data = _read_json(self._applied_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_applied(self, vid: str, on: bool = True, *, track: str = "", resume: str = "") -> dict[str, Any]:
+        s = self._manual_applied()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._applied_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        details = self._manual_application_details()
+        if on and (track or resume):
+            details[str(vid)] = {"track": track, "resume": resume,
+                                 "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        elif not on:
+            details.pop(str(vid), None)
+        self._manual_application_details_path().write_text(json.dumps(details, ensure_ascii=False),
+                                                           encoding="utf-8")
+        return {"ok": True, "applied": len(s), "on": on}
+
+    def _manual_application_details_path(self) -> Path:
+        return self.config.data_dir / "manual-application-details.json"
+
+    def _manual_application_details(self) -> dict[str, dict[str, str]]:
+        data = _read_json(self._manual_application_details_path()) or {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): value for key, value in data.items() if isinstance(value, dict)}
+
+    def _letters_sent_path(self) -> Path:
+        return self.config.data_dir / "manual-letters-sent.json"
+
+    def _letters_sent(self) -> dict[str, dict[str, str]]:
+        data = _read_json(self._letters_sent_path()) or {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): value for key, value in data.items() if isinstance(value, dict)}
+
+    def mark_letter_sent(self, vid: str, *, track: str, resume: str,
+                         on: bool = True) -> dict[str, Any]:
+        letters = self._letters_sent()
+        if on:
+            letters[str(vid)] = {"track": track, "resume": resume,
+                                 "sent_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        else:
+            letters.pop(str(vid), None)
+        path = self._letters_sent_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(letters, ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "letter_sent": str(vid) in letters}
+
+    # ---- viewed set (opened on HH → hidden from the pool) --------------
+    def _viewed_path(self) -> Path:
+        return self.config.data_dir / "viewed.json"
+
+    def _viewed(self) -> set[str]:
+        data = _read_json(self._viewed_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_viewed(self, vid: str, on: bool = True) -> dict[str, Any]:
+        s = self._viewed()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._viewed_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "viewed": len(s), "on": on}
+
+    # ---- bad set (user marked "не то" → out of the pool and the queue) --
+    def _bad_path(self) -> Path:
+        return self.config.data_dir / "bad.json"
+
+    def _bad(self) -> set[str]:
+        data = _read_json(self._bad_path()) or []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
+    def mark_bad(self, vid: str, on: bool = True) -> dict[str, Any]:
+        s = self._bad()
+        s.add(str(vid)) if on else s.discard(str(vid))
+        path = self._bad_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(s), ensure_ascii=False), encoding="utf-8")
+        return {"ok": True, "bad": len(s), "on": on}
+
+    def export_bad(self) -> str:
+        """Dump all vacancies marked 'bad' as Markdown for manual prompt tuning."""
+        bad = self._bad()
+        if not bad:
+            return "# Плохие вакансии\n\nПока пусто — помечай неподходящие кнопкой «👎 плохая».\n"
+        # id -> full item (from every scan/accepted snapshot)
+        items: dict[str, dict[str, Any]] = {}
+        snap_dir = self.root / "private/data/snapshots"
+        for path in snap_dir.glob("*.json"):
+            data = _read_json(path)
+            if not isinstance(data, dict):
+                continue
+            lists = [data.get("items")] + [seg.get("items") for seg in data.get("segments", [])
+                                           if isinstance(seg, dict)]
+            for lst in lists:
+                if isinstance(lst, list):
+                    for it in lst:
+                        if isinstance(it, dict) and str(it.get("id", "")):
+                            items.setdefault(str(it["id"]), it)
+        # id -> screener verdict/reason/track
+        verdicts: dict[str, dict[str, Any]] = {}
+        for track, cfg in TRACKS.items():
+            report = _read_json(self.root / cfg["screen_report"]) or {}
+            for r in report.get("results", []) if isinstance(report, dict) else []:
+                verdicts.setdefault(str(r.get("id", "")), {**r, "track": track})
+        lines = [f"# Плохие вакансии ({len(bad)}) — для ручной донастройки промпта скрининга", "",
+                 ("Помечены оператором как «не то». Разбирай общие признаки и переноси их в "
+                  "правила скрининга (вкладка «Настройки»)."), ""]
+        for vid in sorted(bad):
+            it = items.get(vid, {})
+            v = verdicts.get(vid, {})
+            name = _disp(it.get("name") or v.get("name") or f"id {vid}")
+            company = _disp(it.get("company") or v.get("company") or "")
+            lines.append(f"## {name} — {company}".rstrip(" —"))
+            lines.append(f"- id: {vid}  ·  url: {it.get('url') or v.get('url') or ''}")
+            lines.append(f"- опыт (HH): {it.get('experience', '—')}  ·  зарплата: "
+                         f"{_salary_label(it.get('salary'))}  ·  формат: {it.get('schedule', '—')}")
+            if v:
+                lines.append(f"- вердикт скринера: {v.get('verdict', '?')} "
+                             f"fit={v.get('fit_score', '?')} — {_disp(v.get('reason', ''))}")
+            desc = _disp(it.get("description", "")).strip()
+            if desc:
+                lines.append("- описание:")
+                lines.append("  " + desc[:1500].replace("\n", "\n  "))
+            lines.append("")
+        return "\n".join(lines)
+
+    # ---- apply queue (what a run will actually send to) ----------------
+    def apply_queue(self, track: str, mode: str = "all", limit: int = 10,
+                    marked: list[str] | None = None) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        rows = self.vacancies(track).get("rows", [])
+        marks = {str(m) for m in (marked or [])}
+        # User-reviewed rows stay out of the action queue even though their scan
+        # and screening history remain visible in the vacancy view.
+        accepted = [r for r in rows if r.get("verdict") in ("FIT", "MAYBE")
+                    and not r.get("bad") and not r.get("viewed")]
+        if mode == "fit":
+            accepted = [r for r in accepted if r.get("verdict") == "FIT"]
+        elif mode == "marked":
+            accepted = [r for r in accepted if str(r.get("id")) in marks]
+        queue = [{"id": str(r.get("id")), "name": r.get("name"), "company": r.get("company"),
+                  "url": r.get("url"), "verdict": r.get("verdict"), "fit_score": r.get("fit_score"),
+                  "exp_label": r.get("exp_label"), "over_experience": r.get("over_experience"),
+                  "salary_label": r.get("salary_label"), "blocked": r.get("blocked"),
+                  "applied": r.get("applied")} for r in accepted]
+        sendable = [q for q in queue if not q["blocked"] and not q["applied"]]
+        reviewed = bool(_profile_flag(self.root, track).get("reviewed", False))
+        return {"track": track, "mode": mode, "limit": limit, "reviewed": reviewed,
+                "total": len(queue), "sendable": len(sendable),
+                "will_send": min(int(limit), len(sendable)), "rows": queue}
+
+    def _build_apply_input(self, track: str, mode: str, marked: list[str] | None) -> Path | None:
+        """Write a filtered snapshot (by mode) for `apply --input`; None on empty."""
+        cfg = TRACKS[track]
+        accepted = _read_json(self.root / cfg["accepted"]) or {}
+        items = accepted.get("items", []) if isinstance(accepted, dict) else []
+        report = _read_json(self.root / cfg["screen_report"]) or {}
+        verdict_by = {str(r.get("id")): r.get("verdict") for r in report.get("results", [])}
+        marks = {str(m) for m in (marked or [])}
+        applied = self._manual_applied()
+        bad = self._bad()
+        viewed = self._viewed()
+        blocked = Store(self.config.db_path).blocked_ids(self._account_for_track(track)) \
+            if self.config.db_path.exists() else set()
+        keep = []
+        for it in items:
+            vid = str(it.get("id"))
+            if vid in applied or vid in bad or vid in viewed or vid in blocked:
+                continue
+            if mode == "fit" and verdict_by.get(vid) != "FIT":
+                continue
+            if mode == "marked" and vid not in marks:
+                continue
+            keep.append(it)
+        if not keep:
+            return None
+        path = self.config.data_dir / "snapshots" / f"apply-input-{track}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 3, "source": "hh.ru", "status": "ok",
+                                    "query": f"apply:{track}:{mode}", "items": keep},
+                                   ensure_ascii=False), encoding="utf-8")
+        return path
+
+    # ---- watch timer (systemd user unit) -------------------------------
+    def watch_status(self) -> dict[str, Any]:
+        def sc(*args: str) -> str:
+            try:
+                return subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                                      text=True, timeout=6, check=False).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        installed = (Path.home() / ".config/systemd/user" / WATCH_TIMER).exists()
+        log = self.config.data_dir / "watch.log"
+        tail = ""
+        if log.exists():
+            try:
+                tail = "\n".join(log.read_text(encoding="utf-8").splitlines()[-6:])
+            except OSError:
+                tail = ""
+        return {"installed": installed,
+                "active": sc("is-active", WATCH_TIMER) if installed else "inactive",
+                "enabled": sc("is-enabled", WATCH_TIMER) if installed else "disabled",
+                "interval_min": self._watch_interval(installed),
+                "next": sc("show", WATCH_TIMER, "-p", "NextElapseUSecRealtime", "--value")
+                if installed else "",
+                "systemctl": bool(shutil.which("systemctl")), "log_tail": tail}
+
+    def _watch_interval(self, installed: bool = True) -> int:
+        src = (Path.home() / ".config/systemd/user" / WATCH_TIMER) if installed else \
+            (self.root / "packaging" / WATCH_TIMER)
+        try:
+            m = re.search(r"OnUnitActiveSec\s*=\s*(\d+)\s*(min|h|s)?", src.read_text(encoding="utf-8"))
+            if m:
+                n, unit = int(m.group(1)), (m.group(2) or "s")
+                return n * 60 if unit == "h" else (n if unit == "min" else max(1, n // 60))
+        except OSError:
+            pass
+        return 60
+
+    def watch_control(self, action: str, minutes: int | None = None) -> dict[str, Any]:
+        if not shutil.which("systemctl"):
+            return {"error": "systemctl не найден — используйте cron (см. packaging/README)"}
+        dst_dir = Path.home() / ".config/systemd/user"
+        src_dir = self.root / "packaging"
+        out: list[str] = []
+
+        def sc(*args: str) -> tuple[int, str]:
+            try:
+                r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                                   text=True, timeout=15, check=False)
+                return r.returncode, (r.stdout + r.stderr).strip()
+            except (OSError, subprocess.SubprocessError) as exc:
+                return 1, str(exc)
+
+        try:
+            if action in ("install", "interval"):
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                # service: point APPLYPILOT_HOME at this repo
+                svc = (src_dir / "applypilot-watch.service").read_text(encoding="utf-8")
+                svc = re.sub(r"APPLYPILOT_HOME=\S+", f"APPLYPILOT_HOME={self.root}", svc)
+                if f"APPLYPILOT_HOME={self.root}" not in svc:
+                    svc = svc.replace("[Service]", f"[Service]\nEnvironment=APPLYPILOT_HOME={self.root}", 1)
+                (dst_dir / "applypilot-watch.service").write_text(svc, encoding="utf-8")
+                tmr = (src_dir / WATCH_TIMER).read_text(encoding="utf-8")
+                mins = max(5, int(minutes or self._watch_interval(False)))
+                tmr = re.sub(r"OnUnitActiveSec\s*=\s*\S+", f"OnUnitActiveSec={mins}min", tmr)
+                (dst_dir / WATCH_TIMER).write_text(tmr, encoding="utf-8")
+                sc("daemon-reload")
+                out.append(f"units → {dst_dir}, интервал {mins} мин")
+            if action in ("install", "enable"):
+                rc, msg = sc("enable", "--now", WATCH_TIMER)
+                out.append(msg or ("включён" if rc == 0 else "не удалось включить"))
+            elif action == "interval":
+                sc("restart", WATCH_TIMER)
+                out.append("интервал обновлён")
+            elif action == "disable":
+                rc, msg = sc("disable", "--now", WATCH_TIMER)
+                out.append(msg or "выключен")
+        except OSError as exc:
+            return {"error": str(exc)[:200]}
+        return {"ok": True, "message": "; ".join(o for o in out if o) or "готово",
+                "status": self.watch_status()}
+
+
+def _track_queries(root: Path, track: str) -> set[str]:
+    cfg = TRACKS[track]
+    conf = AppConfig.discover(root=root, profile=cfg["profile"], search=cfg["search"])
+    try:
+        groups = search_groups(effective_search(conf.load_search(), None))
+        return {str(query).strip().lower()
+                for group in groups for query in group.get("queries", [])}
+    except (ConfigError, OSError, ValueError):
+        return set()
+
+
+def _track_snapshot(root: Path, track: str) -> str:
+    """Newest scan snapshot for this track, or its own accepted snapshot path."""
+    paths = _track_snapshot_paths(root, track)
+    return str(paths[0]) if paths else str(root / TRACKS[track]["accepted"])
+
+
+def _track_snapshot_paths(root: Path, track: str) -> list[Path]:
+    """Scan snapshots whose recorded search terms belong to one configured track."""
+    directory = root / "private/data/snapshots"
+    files = sorted(directory.glob("hh_vacancies_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    queries = _track_queries(root, track)
+    matching: list[Path] = []
+    for path in files:
+        data = _read_json(path) or {}
+        segment_queries = {str(seg.get("query", "")).strip().lower() for seg in data.get("segments", [])}
+        if queries and (segment_queries & queries):
+            matching.append(path)
+    return matching
+
+
+def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        MAX_POST_BYTES = 1_048_576
+
+        def log_message(self, *_args: Any) -> None:  # keep the console quiet
+            return
+
+        def _send(self, code: int, payload: Any, content_type: str = "application/json") -> None:
+            data = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", content_type + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(data)
+
+        @staticmethod
+        def _normalise_host(host: str) -> str | None:
+            host = host.strip().lower().rstrip(".")
+            if not host:
+                return None
+            if host == "localhost":
+                return host
+            try:
+                return ipaddress.ip_address(host).compressed
+            except ValueError:
+                return None
+
+        @classmethod
+        def _is_loopback_host(cls, host: str) -> bool:
+            normalised = cls._normalise_host(host)
+            if normalised == "localhost":
+                return True
+            if normalised is None:
+                return False
+            try:
+                return ipaddress.ip_address(normalised).is_loopback
+            except ValueError:
+                return False
+
+        @classmethod
+        def _authority(cls, value: str) -> tuple[str, int | None] | None:
+            if any(char in value for char in "\\/\r\n\t @?#"):
+                return None
+            try:
+                parsed = urlsplit("//" + value)
+                if not parsed.hostname or parsed.username or parsed.password or parsed.path:
+                    return None
+                host = cls._normalise_host(parsed.hostname)
+                if host is None:
+                    return None
+                return host, parsed.port
+            except ValueError:
+                return None
+
+        def _valid_host(self) -> bool:
+            values = self.headers.get_all("Host", [])
+            if len(values) != 1:
+                return False
+            authority = self._authority(values[0])
+            return bool(authority and self._is_loopback_host(authority[0])
+                         and authority[1] == self.server.server_port)
+
+        def _valid_origin(self) -> bool:
+            values = self.headers.get_all("Origin", [])
+            host_values = self.headers.get_all("Host", [])
+            if len(values) != 1 or len(host_values) != 1:
+                return False
+            try:
+                parsed = urlsplit(values[0])
+                origin_host = self._normalise_host(parsed.hostname or "")
+                origin_port = parsed.port
+            except ValueError:
+                return False
+            host_authority = self._authority(host_values[0])
+            return bool(parsed.scheme == "http" and not parsed.username and not parsed.password
+                        and not parsed.path and not parsed.query and not parsed.fragment
+                        and origin_host and self._is_loopback_host(parsed.hostname or "")
+                        and origin_port == self.server.server_port and host_authority
+                        and (origin_host, origin_port) == host_authority)
+
+        def _post_guard(self) -> bool:
+            if not self._valid_host():
+                self._send(403, {"error": "invalid Host header"})
+                return False
+            if not self._valid_origin():
+                self._send(403, {"error": "invalid or missing Origin"})
+                return False
+            content_types = self.headers.get_all("Content-Type", [])
+            if len(content_types) != 1 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
+                self._send(415, {"error": "Content-Type must be application/json"})
+                return False
+            tokens = self.headers.get_all("X-ApplyPilot-Token", [])
+            if len(tokens) != 1 or not hmac.compare_digest(tokens[0], app._csrf_token):
+                self._send(403, {"error": "invalid CSRF token"})
+                return False
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1:
+                self._send(411, {"error": "Content-Length is required"})
+                return False
+            try:
+                length = int(lengths[0])
+            except ValueError:
+                self._send(400, {"error": "invalid Content-Length"})
+                return False
+            if length < 0:
+                self._send(400, {"error": "invalid Content-Length"})
+                return False
+            if length > self.MAX_POST_BYTES:
+                self._send(413, {"error": "request body is too large"})
+                return False
+            self._post_length = length
+            return True
+
+        def do_GET(self) -> None:
+            if not self._valid_host():
+                self._send(403, {"error": "invalid Host header"})
+                return
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                page = INDEX_HTML.replace("__APPLYPILOT_CSRF_TOKEN__", app._csrf_token)
+                self._send(200, page.encode(), "text/html")
+            elif parsed.path == "/api/overview":
+                self._send(200, app.overview())
+            elif parsed.path == "/api/vacancies":
+                track = parse_qs(parsed.query).get("track", [next(iter(TRACKS), "")])[0]
+                self._send(200, app.vacancies(track))
+            elif parsed.path == "/api/job":
+                self._send(200, app.runner.status() or {})
+            elif parsed.path == "/api/jobs":
+                self._send(200, {"current": app.runner.status(),
+                                 "history": app.runner.history()})
+            elif parsed.path == "/api/job-output":
+                run_id = parse_qs(parsed.query).get("id", [""])[0]
+                self._send(200, app.runner.run_output(run_id) or {})
+            elif parsed.path == "/api/settings":
+                self._send(200, app.settings_public())
+            elif parsed.path == "/api/stats":
+                self._send(200, {"spend": app.spend(), "verdicts": app.verdict_stats()})
+            elif parsed.path == "/api/resumes":
+                refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
+                self._send(200, app.tracks_overview(refresh=refresh))
+            elif parsed.path == "/api/watch":
+                self._send(200, app.watch_status())
+            elif parsed.path == "/api/bad-export":
+                self._send(200, app.export_bad().encode("utf-8"), "text/markdown")
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self) -> None:
+            if not self._post_guard():
+                return
+            parsed = urlparse(self.path)
+            body = _read_json_bytes(self.rfile.read(self._post_length))
+            if not isinstance(body, dict):
+                self._send(400, {"error": "request body must be a JSON object"})
+                return
+            if parsed.path == "/api/job":
+                ok, message = app.start_job(body)
+                self._send(200 if ok else 409, {"ok": ok, "message": message})
+            elif parsed.path == "/api/stop":
+                self._send(200, {"ok": app.runner.stop()})
+            elif parsed.path == "/api/settings":
+                self._send(200, app.save_settings(body))
+            elif parsed.path == "/api/letter":
+                b = body
+                self._send(200, app.letter(str(b.get("track") or next(iter(TRACKS), "")), str(b.get("id", ""))))
+            elif parsed.path == "/api/track":
+                res = app.add_track(body)
+                self._send(200 if res.get("ok") else 400, res)
+            elif parsed.path == "/api/track/edit":
+                res = app.update_track(body)
+                self._send(200 if res.get("ok") else 400, res)
+            elif parsed.path == "/api/track/delete":
+                b = body
+                res = app.delete_track(str(b.get("key", "")))
+                self._send(200 if res.get("ok") else 400, res)
+            elif parsed.path == "/api/queue":
+                b = body
+                self._send(200, app.apply_queue(str(b.get("track") or next(iter(TRACKS), "")), str(b.get("mode", "all")),
+                                                 int(b.get("limit") or 10), b.get("marked")))
+            elif parsed.path == "/api/applied":
+                b = body
+                self._send(200, app.mark_applied(str(b.get("id", "")), bool(b.get("on", True)),
+                                                  track=str(b.get("track", "")),
+                                                  resume=str(b.get("resume", ""))))
+            elif parsed.path == "/api/letter-sent":
+                b = body
+                self._send(200, app.mark_letter_sent(str(b.get("id", "")),
+                                                     track=str(b.get("track", "")),
+                                                     resume=str(b.get("resume", "")),
+                                                     on=bool(b.get("on", True))))
+            elif parsed.path == "/api/viewed":
+                b = body
+                self._send(200, app.mark_viewed(str(b.get("id", "")), bool(b.get("on", True))))
+            elif parsed.path == "/api/bad":
+                b = body
+                self._send(200, app.mark_bad(str(b.get("id", "")), bool(b.get("on", True))))
+            elif parsed.path == "/api/watch":
+                b = body
+                res = app.watch_control(str(b.get("action", "")), b.get("minutes"))
+                self._send(200 if res.get("ok") else 400, res)
+            else:
+                self._send(404, {"error": "not found"})
+
+    return Handler
+
+
+def _read_json_bytes(raw: bytes) -> Any:
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _is_loopback_host_name(host: str) -> bool:
+    name = host.strip().lower().rstrip(".").strip("[]")
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = False) -> None:
+    if not _is_loopback_host_name(host):
+        raise ValueError("admin host must be localhost or a loopback IP address")
+    host_value = host.strip().lower().rstrip(".")
+    if host_value.strip("[]") == "localhost":
+        bind_host = "127.0.0.1"
+    else:
+        bind_host = ipaddress.ip_address(host_value.strip("[]")).compressed
+    app = AdminApp(config)
+    # A larger accept backlog: the live-polling UI opens several short-lived
+    # connections, and the stdlib default of 5 can refuse bursts.
+    ThreadingHTTPServer.request_queue_size = 128
+    server_class = _IPv6ThreadingHTTPServer if ":" in bind_host else ThreadingHTTPServer
+    server = server_class((bind_host, port), _handler(app))
+    url_host = f"[{bind_host}]" if ":" in bind_host else bind_host
+    url = f"http://{url_host}:{port}"
+    print(f"ApplyPilot admin: {url}  (Ctrl-C to stop)")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001,S110 - opening a browser is best-effort
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping admin")
+    finally:
+        server.server_close()
+
+
+
+
+
+
+
+
+
+
+INDEX_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ApplyPilot admin</title>
+<style>
+:root{--bg:#0f1216;--card:#1a1f27;--card2:#20262f;--fg:#e7ecf3;--mut:#93a1b3;--line:#2b333f;
+--fit:#2fbf71;--maybe:#e2b13c;--skip:#e15c5c;--accent:#4c8dff;--warn:#f0883e;--star:#ffd23f;--hdr:60px}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 system-ui,Segoe UI,Roboto,sans-serif}
+header{padding:10px 18px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:center;
+flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:30}
+h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer;color:var(--fg);font-size:13px}
+.tab.active{border-color:var(--accent);color:#fff;background:#223049}
+.bal{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:13px}
+.bal b{color:var(--fit)}
+main{padding:18px;max-width:1480px;margin:0 auto}
+.grid{display:grid;gap:12px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.two{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+.card h3{margin:0 0 10px;font-size:12px;color:var(--mut);font-weight:700;text-transform:uppercase;letter-spacing:.6px}
+.big{font-size:24px;font-weight:750;line-height:1.1}
+.sub{color:var(--mut);font-size:12px;margin-top:4px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 13px;cursor:pointer;font-size:13px}
+button.ghost{background:var(--card2);border:1px solid var(--line);color:var(--fg)}
+button.mini{padding:5px 10px;font-size:12px}
+button.danger{background:var(--skip)}
+button:disabled{opacity:.45;cursor:not-allowed}
+label{color:var(--mut);font-size:12px}
+input,select,textarea{background:#11151b;border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:7px 8px;font-family:inherit;font-size:13px}
+textarea{resize:vertical;width:100%;line-height:1.5}
+.field{display:flex;flex-direction:column;gap:5px;margin-bottom:12px}
+.field>label{font-weight:600}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin-top:12px}
+table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:600;font-size:12px;background:#151a21}
+tr:hover td{background:#151b22}
+td.nowrap,th.nowrap{white-space:nowrap}
+td.reason{color:var(--mut);max-width:44ch}
+.pill{padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;display:inline-block}
+.FIT{background:rgba(47,191,113,.16);color:var(--fit)}
+.MAYBE{background:rgba(226,177,60,.16);color:var(--maybe)}
+.SKIP{background:rgba(225,92,92,.16);color:var(--skip)}
+.ERROR{background:rgba(147,161,179,.16);color:var(--mut)}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:70vh;overflow:auto;white-space:pre-wrap;margin:0}
+.muted{color:var(--mut)}.hide{display:none}.hl{color:var(--warn)}
+.badge{font-size:11px;padding:1px 7px;border-radius:6px;background:var(--card2);border:1px solid var(--line);color:var(--mut);margin-left:6px;white-space:nowrap;display:inline-block}
+.fresh{color:var(--fit);border-color:rgba(47,191,113,.4)}
+.new{color:var(--star);border-color:rgba(255,210,63,.45)}
+.applied{color:var(--accent);border-color:rgba(76,141,255,.4)}
+.star{cursor:pointer;font-size:17px;color:#3a434f;user-select:none}.star.on{color:var(--star)}
+.tf{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
+.tf:last-child{border-bottom:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:var(--card);border:0;border-right:1px solid var(--line);border-radius:0;color:var(--mut);font-weight:600}
+.seg button:last-child{border-right:0}
+.seg button.on{background:#223049;color:#fff}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:8px 0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:0}
+.settings-grid{display:grid;grid-template-columns:minmax(320px,1fr) 2fr;gap:16px;align-items:start}
+@media(max-width:1000px){.settings-grid{grid-template-columns:1fr}}
+.qrow.send{background:rgba(47,191,113,.07)}
+.chip{display:inline-block;padding:3px 10px;border-radius:999px;background:var(--card2);border:1px solid var(--line);font-size:12px;margin-right:6px}
+.stack>*+*{margin-top:14px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
+.modal.hide{display:none}
+.modal .box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;max-width:720px;width:100%;max-height:90vh;overflow:auto}
+.modal h3{margin:0 0 6px;text-transform:none;font-size:16px;color:var(--fg)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.logruns{display:flex;flex-direction:column;gap:3px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:6px;margin:10px 0}
+.logrun{display:flex;gap:10px;align-items:center;padding:6px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent;font-size:13px}
+.logrun:hover{background:#151b22}
+.logrun.sel{background:#223049;border-color:var(--accent)}
+.logrun .rl{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.logrun .rt{color:var(--mut);font-size:12px;white-space:nowrap}
+.rc-ok{color:var(--fit)}.rc-err{color:var(--skip)}.rc-run{color:var(--accent)}
+</style></head><body>
+<header><h1>ApplyPilot</h1>
+<div class="tabs" id="tabs">
+<div class="tab active" data-t="overview">Обзор</div>
+<div class="tab" data-t="vac">Вакансии</div>
+<div class="tab" data-t="apply">Отклики</div>
+<div class="tab" data-t="stats">Статистика</div>
+<div class="tab" data-t="tracks">Резюме и треки</div>
+<div class="tab" data-t="log">Лог</div>
+<div class="tab" data-t="settings">Настройки</div>
+</div>
+<div class="bal"><span id="hbal" class="muted"></span><span id="jobstate" class="muted"></span></div>
+</header>
+<main>
+<section id="overview"></section>
+
+<section id="vac" class="hide">
+  <div class="row"><label>Трек</label><select id="vtrack"></select>
+    <span class="seg" id="vstatusseg"></span>
+    <button class="ghost mini" onclick="loadVac()">Обновить</button>
+    <span id="vmeta" class="muted"></span></div>
+  <div class="row"><span class="seg" id="vseg"></span>
+    <label><input type="checkbox" id="vnew"> новые</label>
+    <label><input type="checkbox" id="vfresh"> свежие</label>
+    <label><input type="checkbox" id="vmarked"> отмеченные ★</label></div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--fit)"></span>FIT — подходит</span>
+    <span><span class="dot" style="background:var(--maybe)"></span>MAYBE — на грани</span>
+    <span><span class="dot" style="background:var(--skip)"></span>SKIP — мимо</span>
+    <span><span class="dot" style="background:var(--warn)"></span>опыт выше указанного в профиле</span>
+    <span><span class="dot" style="background:var(--fit)"></span>свежая · ★ пометить</span>
+  </div>
+  <div class="tablewrap"><div id="vtable"></div></div>
+</section>
+
+<section id="apply" class="hide"></section>
+
+<section id="stats" class="hide">
+  <div class="grid kpis" id="spendcards"></div>
+  <div class="card" style="margin-top:12px"><h3>Расход по дням, ₽</h3><div id="spendbars"></div></div>
+  <div class="card" style="margin-top:12px"><h3>Вердикты по трекам</h3><div id="verdictbars"></div></div>
+</section>
+
+<section id="tracks" class="hide">
+  <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Активные резюме на HH и треки</h3>
+    <button class="ghost mini" onclick="loadTracks(true)">Обновить с HH</button></div>
+    <p class="muted" id="tracksmeta">Управляй треками здесь. Удаление исключает трек из следующих запусков поиска, но сохраняет файлы профиля, отчёты и резюме на HH. «Обновить с HH» читает резюме через сессию (~10с).</p>
+    <div class="tablewrap"><div id="trackstable"></div></div>
+    <div id="trackmsg" class="muted" style="margin-top:8px"></div>
+    <div id="unassigned"></div>
+  </div>
+  <div class="card" style="margin-top:12px"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Автопоиск свежих вакансий (таймер)</h3>
+    <button class="ghost mini" onclick="loadWatch()">Обновить статус</button></div>
+    <p class="muted">Регулярный скан свежих + скрининг для всех треков (systemd-таймер). Отклики остаются ручными. «Проверить свежие сейчас» доступно на вкладке «Обзор».</p>
+    <div id="watchbox" class="muted">загрузка…</div>
+  </div>
+  <div class="card" style="margin-top:12px;max-width:760px"><h3>Добавить трек</h3>
+    <p class="muted">Можно скопировать профиль, резюме и правила поиска существующего трека, а затем задать свои запросы.</p>
+    <div class="grid two">
+      <div class="field"><label>Ключ (латиница)</label><input id="tkey" placeholder="напр. ml, backend"></div>
+      <div class="field"><label>Название</label><input id="tlabel" placeholder="напр. ML Engineer"></div>
+      <div class="field"><label>Рубрика скрининга</label><select id="ttype"></select></div>
+      <div class="field"><label>Резюме на HH (точное название)</label><input id="tresume" placeholder="как в профиле HH"></div>
+      <div class="field"><label>Копировать настройки из</label><select id="tcopy"><option value="">Создать пустой шаблон</option></select></div>
+    </div>
+    <div class="field"><label>Поисковые запросы (по одному в строке)</label>
+      <textarea id="tqueries" rows="4" placeholder="Software Engineer&#10;Developer"></textarea></div>
+    <div class="field"><label>Доп. правила скрининга (необязательно)</label><textarea id="tcriteria" rows="3"></textarea></div>
+    <div class="row"><button onclick="addTrack()">Создать трек</button><span id="tmsg" class="muted"></span></div>
+  </div>
+  <div class="card hide" id="trackeditor" style="margin-top:12px;max-width:760px"><h3>Редактировать трек</h3>
+    <input id="etrackkey" type="hidden">
+    <div class="grid two">
+      <div class="field"><label>Название</label><input id="etlabel"></div>
+      <div class="field"><label>Рубрика скрининга</label><select id="ettype"></select></div>
+      <div class="field"><label>Резюме на HH (точное название)</label><input id="etresume"></div>
+    </div>
+    <div class="field"><label>Поисковые запросы (по одному в строке)</label><textarea id="etqueries" rows="6"></textarea></div>
+    <div class="row"><button onclick="saveTrack()">Сохранить</button><button class="ghost" onclick="closeTrackEditor()">Отмена</button><span id="etmsg" class="muted"></span></div>
+  </div>
+</section>
+
+<section id="log" class="hide">
+  <div class="row"><span id="logmeta" class="muted"></span>
+    <button class="ghost mini" id="logrefresh" onclick="logFollow=true;refreshJob()">К последней</button>
+    <button class="danger mini" id="logstop" onclick="stopJob()">Стоп</button></div>
+  <div class="muted" style="font-size:12px;margin:2px 0 0">Журнал прогонов — каждая задача сохраняется отдельной строкой. Клик по строке открывает её вывод.</div>
+  <div id="logruns" class="logruns"></div>
+  <pre id="logbox"></pre>
+</section>
+
+<section id="settings" class="hide">
+  <div class="settings-grid">
+    <div class="stack">
+      <div class="card"><h3>Модель и ключ (LLM: скрининг и письма)</h3>
+        <div class="field"><label>Модель</label><select id="smodel"></select></div>
+        <div class="field"><label>Base URL</label><input id="sbase"></div>
+        <div class="field"><label>API-ключ (пусто — не менять)</label><input id="skey" type="password" placeholder="sk-aitunnel-..."></div>
+        <p class="muted" style="margin:0">Ключ хранится локально (права 600), в интерфейс не возвращается. У каждого пользователя свой ключ.</p>
+      </div>
+      <div class="card"><h3>Статус</h3>
+        <div class="sub" id="sstatus"></div></div>
+    </div>
+    <div class="stack">
+      <div class="card"><h3>Кандидат</h3>
+        <div class="field"><label>Ограничения кандидата (опыт, метод работы, интервью, формат)</label>
+          <textarea id="sconstraints" style="min-height:180px"></textarea></div>
+        <div class="field"><label>Зарплатный ориентир</label>
+          <textarea id="ssalary" style="min-height:72px"></textarea></div>
+      </div>
+      <div class="card"><h3>Правила скрининга по трекам</h3>
+        <div id="scrit" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(360px,1fr))"></div></div>
+    </div>
+  </div>
+  <div class="row" style="margin-top:14px"><button onclick="saveSettings()">Сохранить настройки</button><span id="skeystate" class="muted"></span></div>
+</section>
+</main>
+
+<div id="modal" class="modal hide" onclick="if(event.target===this)closeModal()">
+  <div class="box">
+    <h3 id="lettertitle">Сопроводительное письмо</h3>
+    <div class="muted" id="lettersub" style="margin-bottom:8px"></div>
+    <textarea id="lettertext" style="min-height:280px"></textarea>
+    <div class="row"><button onclick="copyAndOpen()">Копировать и открыть на HH</button>
+      <button class="ghost" onclick="copyLetter()">Копировать</button>
+      <button class="ghost" onclick="markApplied()">✓ Отметить: откликнулся</button>
+      <button class="ghost" onclick="markLetterSent()">✓ Письмо отправлено на HH</button>
+      <button class="ghost" onclick="closeModal()">Закрыть</button>
+      <span id="letterhint" class="muted"></span></div>
+    <p class="muted">Проверь и при необходимости поправь письмо. Отклик и отправку письма делаешь на HH сам (ассистированный режим). «Отметить» уберёт вакансию из очереди откликов.</p>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const ADMIN_TOKEN="__APPLYPILOT_CSRF_TOKEN__";
+const SECTIONS=["overview","vac","apply","stats","tracks","log","settings"];
+let tab="overview",TRACKS=[],VFILTER="";
+function setHdr(){document.documentElement.style.setProperty('--hdr',(document.querySelector('header').offsetHeight)+'px');}
+addEventListener('resize',setHdr);
+function show(t){tab=t;location.hash=t;
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
+  SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));setHdr();
+  ({overview:loadOverview,vac:loadVac,apply:loadApply,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
+document.querySelectorAll(".tab").forEach(el=>el.onclick=()=>show(el.dataset.t));
+async function api(p,opt={}){const method=(opt.method||"GET").toUpperCase();
+  if(method==="POST"){const headers=new Headers(opt.headers||{});headers.set("Content-Type","application/json");
+    headers.set("X-ApplyPilot-Token",ADMIN_TOKEN);opt={...opt,headers,body:opt.body||"{}"};}
+  const r=await fetch(p,opt);return r.json();}
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function escAttr(s){return esc(s).replace(/\"/g,"&quot;").replace(/'/g,"&#39;");}
+function jsArg(s){const slash=String.fromCharCode(92),json=JSON.stringify(String(s));
+  const escaped=json.replace(/[<>&]/g,c=>slash+"u"+c.charCodeAt(0).toString(16).padStart(4,"0"))
+    .split(String.fromCharCode(0x2028)).join(slash+"u2028")
+    .split(String.fromCharCode(0x2029)).join(slash+"u2029");
+  return escAttr(escaped);}
+function safeInt(v,fallback=0){if(v==null||v==="")return fallback;const n=Number(v);return Number.isFinite(n)?Math.trunc(n):fallback;}
+function safeVerdict(v){return ["FIT","MAYBE","SKIP","ERROR"].includes(v)?v:"";}
+function safeHHUrl(raw){try{const u=new URL(String(raw));const h=u.hostname.toLowerCase();
+  return u.protocol==="https:"&&!u.username&&!u.password&&(!u.port||u.port==="443")&&(h==="hh.ru"||h.endsWith(".hh.ru"))?u.href:"";
+  }catch(e){return "";}}
+function hhLink(url,label,viewedId){const href=safeHHUrl(url);if(!href)return esc(label);
+  const view=viewedId===undefined?"":` onclick="markViewed(${jsArg(viewedId)})"`;
+  return `<a href="${escAttr(href)}" target="_blank" rel="noopener noreferrer"${view}>${esc(label)}</a>`;}
+function rub(v){return v==null?"—":Number(v).toLocaleString("ru-RU");}
+function marks(){try{return new Set(JSON.parse(localStorage.getItem("ap_marks")||"[]"))}catch(e){return new Set()}}
+function saveMarks(s){try{localStorage.setItem("ap_marks",JSON.stringify([...s]))}catch(e){}}
+function toggleMark(id){const s=marks();s.has(id)?s.delete(id):s.add(id);saveMarks(s);loadVac();}
+function fillTrackSelects(tracks){TRACKS=tracks||[];
+  for(const id of ["#vtrack","#atrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
+    sel.innerHTML=TRACKS.map(t=>`<option value="${escAttr(t.key)}">${esc(t.label)}</option>`).join("");
+    if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
+  const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
+
+/* ---- overview ---- */
+async function loadOverview(){const d=await api("/api/overview");
+  fillTrackSelects(Object.keys(d.tracks||{}).map(k=>({key:k,label:d.tracks[k].label})));
+  let h='<div class="grid kpis">';
+  h+=card("Баланс, ₽",rub(d.balance),d.balance!=null?"aitunnel":"нет ключа");
+  h+=card("Сессия HH",d.session_present?"есть":"нет");
+  const sync=d.sync||{},syncAt=sync.created_at?new Date(sync.created_at).toLocaleString("ru-RU"):"ещё не запускалась";
+  const syncDetail=sync.status?`Последняя: ${esc(sync.status)} · ${sync.item_count||0} откликов · ${esc(syncAt)}`:"Нет данных о синхронизации";
+  h+=`<div class="card"><h3>Синхронизация HH</h3><div class="big">${d.negotiation_count||0}</div><div class="sub">${syncDetail}${sync.error?`<br><span class="hl">${esc(sync.error)}</span>`:""}</div><button class="ghost mini" style="margin-top:8px" onclick="job('sync',${jsArg(Object.keys(d.tracks||{})[0]||'')})">Синхронизировать статусы</button></div>`;
+  h+=card("В блок-листе",d.blocked,"уже откликался (исключены)");
+  h+='</div><div class="grid two" style="margin-top:12px">';
+  for(const k in d.tracks){const t=d.tracks[k];const c=t.counts_unique||t.counts||{};
+    h+=`<div class="card"><div class="row" style="justify-content:space-between;margin:0"><h3 style="margin:0">${esc(t.label)}</h3>`
+      +(t.new_count?`<button class="badge new" onclick="gotoVacBucket(${jsArg(k)},'new')">🆕 новых ${t.new_count}</button>`:"")+(t.fresh_count?`<button class="badge fresh" onclick="gotoVacBucket(${jsArg(k)},'fresh')">🟢 свежих ${t.fresh_count}</button>`:"")+`</div>`
+      +`<div class="big" style="margin:8px 0">${(c.FIT||0)} <span class="muted" style="font-size:13px">подходящих (FIT)</span></div>`
+      +`<div class="row" style="gap:6px;margin:0 0 8px"><span class="pill FIT">FIT ${c.FIT??0}</span><span class="pill MAYBE">MAYBE ${c.MAYBE??0}</span><span class="pill SKIP">SKIP ${c.SKIP??0}</span>${t.error_count?`<span class="pill ERROR">ERR ${t.error_count}</span>`:""}</div>`
+      +(t.reviewed?'<div class="badge fresh" style="margin:0 0 8px">профиль проверен — реальные отклики разрешены</div>':'<div class="badge" style="margin:0 0 8px;color:var(--warn)">профиль не проверен → реальные отклики заблокированы</div>')
+      +`<div class="row" style="margin:0"><button class="mini" onclick="job('scan_screen',${jsArg(k)})" title="Полный скан HH + LLM-скрининг за один клик">Разобрать вакансии</button>`
+      +`<button class="ghost mini" onclick="gotoVac(${jsArg(k)},'FIT')">Показать FIT →</button>`
+      +`<button class="ghost mini" onclick="gotoApply(${jsArg(k)})">Откликнуться</button>`
+      +`<button class="ghost mini" onclick="job('fresh',${jsArg(k)})">Только свежие</button>`
+      +(t.error_count?`<button class="ghost mini" onclick="job('retry_errors',${jsArg(k)})">Повторить AI-ошибки (${t.error_count})</button>`:"")+`</div>`;
+    if((t.top_fit||[]).length){h+='<div style="margin-top:12px">';
+      for(const f of t.top_fit){h+=`<div class="tf"><div>${hhLink(f.url,f.name,String(f.id))}`
+        +(f.is_new?'<span class="badge new">новая</span>':"")+(f.fresh?'<span class="badge fresh">свежая</span>':"")+`<div class="muted">${esc(f.company||"")} · ${esc(f.exp_label||"")}</div></div>`
+        +`<div style="text-align:right;white-space:nowrap"><span class="pill FIT">${safeInt(f.fit_score)}</span><br>`
+        +`<button class="ghost mini" style="margin-top:4px" onclick="genLetter(${jsArg(k)},${jsArg(f.id)},${jsArg(encodeURIComponent(f.url||""))})">Письмо</button></div></div>`;}
+      h+='</div>';}
+    h+='</div>';}
+  h+='</div>';
+  $("#overview").innerHTML=h;
+  $("#hbal").innerHTML=d.balance!=null?`баланс <b>${rub(d.balance)} ₽</b>`:"";}
+function card(t,b,sub){return `<div class="card"><h3>${esc(t)}</h3><div class="big">${esc(b)}</div>${sub?`<div class="sub">${esc(sub)}</div>`:""}</div>`;}
+function gotoVac(track,filter){if(track)$("#vtrack").value=track;VFILTER=filter;show("vac");}
+function gotoVacBucket(track,kind){if(track)$("#vtrack").value=track;VSTATUS="active";VFILTER="";
+  $("#vnew").checked=kind==="new";$("#vfresh").checked=kind==="fresh";show("vac");}
+function gotoApply(track){pendingApplyTrack=track;show("apply");}
+
+/* ---- jobs ---- */
+async function job(action,track){const body={action,track:track||(TRACKS[0]&&TRACKS[0].key)||""};
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
+
+/* ---- vacancies ---- */
+let VSTATUS="active";
+function bucket(r){return r.bad?"bad":((r.viewed||r.applied||r.blocked||r.letter_sent)?"viewed":"active");}
+async function loadVac(){const tr=$("#vtrack").value;if(!tr)return;
+  const onlyFresh=$("#vfresh").checked,onlyNew=$("#vnew").checked,onlyMarked=$("#vmarked").checked,mk=marks();
+  const d=await api("/api/vacancies?track="+encodeURIComponent(tr));
+  const all=d.rows||[];
+  const bc={active:0,viewed:0,bad:0};all.forEach(r=>bc[bucket(r)]++);
+  $("#vstatusseg").innerHTML=[["active","Активные",bc.active],["viewed","Просмотренные / обработанные",bc.viewed],["bad","Плохие",bc.bad]]
+    .map(([v,l,n])=>`<button class="${VSTATUS===v?"on":""}" onclick="VSTATUS='${v}';loadVac()">${l} ${n}</button>`).join("");
+  let scoped=all.filter(r=>bucket(r)===VSTATUS);
+  const cnt={FIT:0,MAYBE:0,SKIP:0};scoped.forEach(r=>cnt[r.verdict]=(cnt[r.verdict]||0)+1);
+  const allN=VSTATUS==="active"?((cnt.FIT||0)+(cnt.MAYBE||0)):scoped.length;
+  $("#vseg").innerHTML=[["","все",allN],["FIT","FIT",cnt.FIT||0],["MAYBE","MAYBE",cnt.MAYBE||0],["SKIP","SKIP",cnt.SKIP||0]]
+    .map(([v,l,n])=>`<button class="${VFILTER===v?"on":""}" onclick="VFILTER='${v}';loadVac()">${l} ${n}</button>`).join("");
+  let rows=scoped.filter(r=> VFILTER? r.verdict===VFILTER : (VSTATUS!=="active"||r.verdict!=="SKIP"));
+  if(onlyFresh)rows=rows.filter(r=>r.fresh);
+  if(onlyNew)rows=rows.filter(r=>r.is_new);
+  if(onlyMarked)rows=rows.filter(r=>mk.has(String(r.id)));
+  const dup=d.folded_duplicates?` · свернуто дублей: ${d.folded_duplicates}`:"";
+  const exportBtn=VSTATUS==="bad"?` <button class="ghost mini" onclick="exportBad()">Выгрузить в текст (.md)</button>`:"";
+  $("#vmeta").innerHTML=`модель ${esc(d.model||"—")} · показано ${rows.length}${dup}${exportBtn}`;
+  let h='<table><tr><th>★</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th class="nowrap">Найдена</th><th>Вакансия</th><th>Причина</th><th class="nowrap">Статус</th><th></th></tr>';
+  for(const r of rows){const id=String(r.id);const on=mk.has(id);
+    const expc=r.over_experience?' class="hl nowrap"':' class="nowrap"';
+    const badges=(r.is_new?'<span class="badge new">новая</span>':"")+(r.fresh?'<span class="badge fresh">свежая</span>':"")+(r.dupes?`<span class="badge">повторов: ${safeInt(r.dupes)}</span>`:"")
+      +(r.applied?'<span class="badge applied">откликнулся</span>':"")+(r.viewed?'<span class="badge">просмотрено</span>':"")+(r.bad?'<span class="badge" style="color:var(--skip)">плохая</span>':"");
+    const statusLabel={not_viewed:"отклик отправлен · не просмотрен",viewed:"отклик просмотрен",
+      invitation:"приглашение",discard:"отказ",phone_interview:"телефонное интервью",interview:"собеседование"};
+    const status=r.blocked?'<span class="muted">HH: отклик найден</span>':(r.applied?'<span class="muted">отклик отмечен</span>':esc(statusLabel[r.db_status]||r.db_status||""));
+    const badBtn=r.bad?`<button class="ghost mini" onclick="markBad(${jsArg(id)},false)">вернуть</button>`
+      :`<button class="ghost mini" title="пометить как не то" onclick="markBad(${jsArg(id)},true)">👎 плохая</button>`;
+    const verdict=safeVerdict(r.verdict);
+    h+=`<tr><td><span class="star ${on?"on":""}" onclick="toggleMark(${jsArg(id)})">${on?"★":"☆"}</span></td>
+      <td><span class="pill ${verdict}">${esc(verdict||"?")}</span></td>
+      <td class="nowrap">${safeInt(r.fit_score,"")}</td>
+      <td${expc} title="${r.over_experience?'требуемый опыт выше указанного в профиле':''}">${esc(r.exp_label||"—")}</td>
+      <td class="muted nowrap">${esc(r.salary_label||"—")}</td>
+      <td class="${r.is_new?'':'muted '}nowrap" title="${escAttr(r.first_seen||'')}">${esc(r.found_label||"—")}</td>
+      <td>${hhLink(r.url,r.name,id)}${badges}<div class="muted">${esc(r.company||"")}</div></td>
+      <td class="reason">${esc(r.reason||"")}${r.application_resume?`<div class="muted">Резюме отклика: ${esc(r.application_resume)}</div>`:(r.resume_hint?`<div class="muted">Резюме трека (HH не передал): ${esc(r.resume_hint)}</div>`:"")}${r.letter_sent?'<div class="muted">Письмо отмечено отправленным вручную</div>':""}</td>
+      <td class="nowrap">${status}</td>
+      <td class="nowrap"><button class="ghost mini" onclick="genLetter(${jsArg(tr)},${jsArg(id)},${jsArg(encodeURIComponent(r.url||""))})">Письмо</button> ${badBtn}</td></tr>`;}
+  $("#vtable").innerHTML=h+"</table>";}
+async function markViewed(id){try{await api("/api/viewed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});}catch(e){}
+  setTimeout(()=>{if(tab==="vac")loadVac();if(tab==="overview")loadOverview();},400);}
+async function markBad(id,on){await api("/api/bad",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,on})});loadVac();}
+async function exportBad(){const r=await fetch("/api/bad-export");const text=await r.text();
+  const blob=new Blob([text],{type:"text/markdown;charset=utf-8"});const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");a.href=url;a.download="bad-vacancies.md";document.body.appendChild(a);a.click();
+  a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);}
+["vtrack","vfresh","vnew","vmarked"].forEach(id=>{const el=$("#"+id);if(el)el.onchange=loadVac;});
+
+/* ---- apply queue ---- */
+let pendingApplyTrack=null,applyMode="all";
+async function loadApply(){const sec=$("#apply");
+  const track=pendingApplyTrack||($("#atrack")&&$("#atrack").value)||(TRACKS[0]&&TRACKS[0].key)||"";pendingApplyTrack=null;
+  sec.innerHTML=`<div class="card"><div class="row" style="margin:0">
+    <label>Трек</label><select id="atrack"></select>
+    <span class="seg" id="aseg"></span>
+    <label>Лимит</label><input id="alimit" type="number" value="10" style="width:74px">
+    <button class="ghost mini" onclick="loadApply()">Обновить</button></div>
+    <div id="asummary" class="row" style="margin-top:10px"></div>
+    <div class="tablewrap"><div id="aqueue"></div></div>
+    <div class="row" style="margin-top:12px"><button class="ghost" onclick="runApply('apply_dry')">Пробный запуск (ничего не отправит)</button></div>
+    <div id="areal"></div>
+  </div>`;
+  $("#atrack").innerHTML=TRACKS.map(t=>`<option value="${escAttr(t.key)}">${esc(t.label)}</option>`).join("");
+  $("#atrack").value=track;$("#alimit").value=lastLimit;
+  $("#atrack").onchange=loadApply;$("#alimit").onchange=refreshQueue;
+  $("#aseg").innerHTML=[["all","все accepted"],["fit","только FIT"],["marked","только ★"]]
+    .map(([m,l])=>`<button class="${applyMode===m?"on":""}" onclick="applyMode='${m}';refreshQueue()">${l}</button>`).join("");
+  refreshQueue();}
+let lastLimit=10;
+async function refreshQueue(){const track=$("#atrack").value;lastLimit=+$("#alimit").value||10;
+  const body={track,mode:applyMode,limit:lastLimit,marked:[...marks()]};
+  const d=await api("/api/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const willSend=safeInt(d.will_send),sendable=safeInt(d.sendable),total=safeInt(d.total);
+  $("#asummary").innerHTML=`<span class="chip">Отправим <b>${willSend}</b> из ${sendable} готовых</span>`
+    +`<span class="chip">в очереди ${total}</span>`
+    +(d.reviewed?'<span class="chip" style="color:var(--fit)">профиль проверен</span>':'<span class="chip" style="color:var(--warn)">профиль не проверен — реальная отправка заблокирована</span>');
+  let h='<table><tr><th>#</th><th>Вердикт</th><th class="nowrap">fit</th><th class="nowrap">Опыт</th><th class="nowrap">Зарплата</th><th>Вакансия</th><th class="nowrap">Статус</th><th></th></tr>';
+  let n=0;
+  for(const r of (d.rows||[])){const skip=r.blocked||r.applied;if(!skip)n++;
+    const willrow=(!skip&&n<=willSend);
+    const st=r.blocked?'откликался':(r.applied?'отмечен':(willrow?'в отправке':'ждёт'));
+    const verdict=safeVerdict(r.verdict);
+    h+=`<tr class="qrow ${willrow?'send':''}"><td>${skip?'—':n}</td>
+      <td><span class="pill ${verdict}">${esc(verdict||'?')}</span></td><td class="nowrap">${safeInt(r.fit_score,'')}</td>
+      <td class="nowrap ${r.over_experience?'hl':''}">${esc(r.exp_label||'—')}</td>
+      <td class="muted nowrap">${esc(r.salary_label||'—')}</td>
+      <td>${hhLink(r.url,r.name)}<div class="muted">${esc(r.company||'')}</div></td>
+      <td class="nowrap muted">${st}</td>
+      <td><button class="ghost mini" onclick="genLetter(${jsArg(track)},${jsArg(r.id)},${jsArg(encodeURIComponent(r.url||''))})">Письмо</button></td></tr>`;}
+  $("#aqueue").innerHTML=h+"</table>";
+  $("#areal").innerHTML=d.reviewed?
+    `<hr style="border-color:var(--line)"><div class="row"><input type="checkbox" id="aconfirm"><label for="aconfirm">Подтверждаю реальную отправку ${willSend} откликов работодателям</label></div>
+     <div class="row"><button class="danger" onclick="runApply('apply_run')">Отправить реальные отклики</button></div>`
+    :`<p class="muted">Реальная отправка заблокирована: в профиле трека <code>reviewed = false</code>. Проверь отобранное пробным запуском; включение реальной отправки — отдельный осознанный шаг.</p>`;}
+async function runApply(action){const track=$("#atrack").value;
+  const body={action,track,mode:applyMode,limit:+$("#alimit").value||10,marked:[...marks()]};
+  if(action==="apply_run"){if(!$("#aconfirm")||!$("#aconfirm").checked){alert("Отметь галку подтверждения");return;}body.confirm=true;}
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
+
+/* ---- stats ---- */
+async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
+  $("#spendcards").innerHTML=card("Баланс, ₽",rub(sp.balance),sp.balance_live?"aitunnel (live)":"из леджера")
+    +card("Сегодня, ₽",sp.today_rub??0)+card("Всего потрачено, ₽",sp.total_rub??0)+card("Запросов к LLM",sp.calls??0);
+  const days=sp.by_day||[];const mx=Math.max(1,...days.map(d=>d.rub));
+  $("#spendbars").innerHTML=days.map(d=>bar(d.date,d.rub,mx,'var(--accent)','₽')).join("")||'<span class="muted">нет данных</span>';
+  let vh="";const vd=s.verdicts||{};for(const k in vd){const t=vd[k],c=t.counts;
+    if(!c){vh+=`<div class="muted" style="margin:8px 0">${esc(t.label)}: нет отчёта</div>`;continue;}
+    const tot=Math.max(1,(c.FIT||0)+(c.MAYBE||0)+(c.SKIP||0)+(c.ERROR||0));
+    vh+=`<div style="margin:10px 0"><b>${esc(t.label)}</b>`+seg('FIT',c.FIT||0,tot,'var(--fit)')+seg('MAYBE',c.MAYBE||0,tot,'var(--maybe)')+seg('SKIP',c.SKIP||0,tot,'var(--skip)')+seg('ERROR',c.ERROR||0,tot,'var(--mut)')+`</div>`;}
+  $("#verdictbars").innerHTML=vh;}
+function bar(label,val,mx,color,unit){val=Number(val)||0;mx=Math.max(1,Number(mx)||1);const w=Math.max(0,Math.min(100,Math.round(100*val/mx)));return `<div class="row" style="gap:8px"><span class="muted" style="width:110px">${esc(label)}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:14px;border-radius:6px"></div></div><span style="width:80px;text-align:right">${esc(val)}${esc(unit||'')}</span></div>`;}
+function seg(label,val,tot,color){val=Number(val)||0;tot=Math.max(1,Number(tot)||1);const w=Math.max(0,Math.min(100,Math.round(100*val/tot)));return `<div class="row" style="gap:8px"><span class="muted" style="width:72px">${esc(label)}</span><div style="flex:1;background:#11151b;border-radius:6px"><div style="width:${w}%;background:${color};height:12px;border-radius:6px"></div></div><span style="width:44px;text-align:right">${esc(val)}</span></div>`;}
+
+/* ---- job log (journal) ---- */
+let logSel=null,logFollow=true;const logCache={};
+const JOB_LABELS={scan:"Скан",scan_screen:"Разобрать вакансии",fresh:"Свежие",screen:"Скрининг",
+  retry_errors:"Повторный AI-скрининг ошибок",sync:"Синхронизация с HH",analytics:"Аналитика",apply_dry:"Пробный отклик",apply_run:"Реальные отклики"};
+function jobLabel(label){const[a,t]=String(label||"").split(":");return (JOB_LABELS[a]||a||"задача")+(t?" · "+t:"");}
+function ts(sec){if(!sec)return"";const d=new Date(sec*1000);return d.toLocaleString("ru-RU",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+function dur(a,b){if(!a||!b)return"";const s=Math.max(0,Math.round(b-a));return s<60?s+"с":Math.floor(s/60)+"м "+(s%60)+"с";}
+function runStatus(r){if(r.running)return['<span class="spin"></span>','rc-run','идёт'];
+  return r.returncode===0?['✓','rc-ok','код 0']:['✕','rc-err','код '+r.returncode];}
+async function refreshJob(){const d=await api("/api/jobs");const cur=d.current;const hist=d.history||[];
+  const running=!!(cur&&cur.running);
+  // Live entry sits on top of the journal; a finished current is already in history.
+  const entries=running?[{...cur,running:true},...hist]:hist;
+  if(running)logSel=cur.id;
+  else if(logFollow)logSel=(entries[0]&&entries[0].id)||null;
+  if(!entries.some(e=>e.id===logSel))logSel=(entries[0]&&entries[0].id)||null;
+  // render list
+  $("#logruns").innerHTML=entries.length?entries.map(r=>{const[ic,cl,txt]=runStatus(r);
+    return `<div class="logrun ${r.id===logSel?'sel':''}" onclick="selectRun(${jsArg(r.id)})">`
+      +`<span class="${cl}">${ic}</span><span class="rl">${esc(jobLabel(r.label))}</span>`
+      +`<span class="rt">${ts(r.started_at)}${r.finished_at?' · '+dur(r.started_at,r.finished_at):''} · ${txt}</span></div>`;}).join("")
+    :'<div class="muted" style="padding:8px">Задач ещё не запускалось. Журнал появится после «Разобрать вакансии», скрининга, пробного запуска или отклика.</div>';
+  // output for selected run
+  await showRunOutput(logSel,running&&logSel===cur.id?cur:null);
+  const sel=entries.find(e=>e.id===logSel);
+  $("#logmeta").innerHTML=sel?(`<b>${esc(jobLabel(sel.label))}</b> — `+(sel.running?'<span class="spin"></span> идёт':('завершено ('+runStatus(sel)[2]+')'))):'<span class="muted">нет задач</span>';
+  $("#logstop").disabled=!running;
+  $("#jobstate").textContent=running?(jobLabel(cur.label)+' ▶'):(hist[0]?jobLabel(hist[0].label)+' ✓':"");
+  return running;}
+async function showRunOutput(id,liveJob){const box=$("#logbox");
+  if(!id){box.textContent="";return;}
+  if(liveJob){box.textContent=(liveJob.lines||[]).join("\\n");box.scrollTop=box.scrollHeight;return;}
+  if(logCache[id]){box.textContent=logCache[id].join("\\n");return;}
+  const o=await api("/api/job-output?id="+encodeURIComponent(id));const lines=o.lines||[];
+  logCache[id]=lines;box.textContent=lines.join("\\n");}
+function selectRun(id){logSel=id;logFollow=false;refreshJob();}
+async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
+
+/* ---- tracks + watch ---- */
+async function loadTracks(refresh){if(refresh)$("#tracksmeta").innerHTML='<span class="spin"></span> читаю резюме с HH…';
+  const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
+  fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label})));
+  const copy=$("#tcopy"), currentCopy=copy.value;
+  copy.innerHTML='<option value="">Создать пустой шаблон</option>'+(d.tracks||[]).map(t=>'<option value="'+escAttr(t.key)+'">'+esc(t.label)+'</option>').join("");
+  copy.value=currentCopy||(d.tracks||[])[0]?.key||"";
+  const types=d.rubric_types||["ai","infra","general"];
+  for(const id of ["ttype","ettype"]){const sel=$("#"+id),old=sel.value;sel.innerHTML=types.map(x=>'<option value="'+escAttr(x)+'">'+esc(x)+'</option>').join("");if(old)sel.value=old;}
+  const checked=d.auth_status==="confirmed";
+  let h='<table><tr><th>Трек</th><th>Рубрика</th><th>Резюме на HH</th><th class="nowrap">Статус</th><th>Файлы</th><th></th></tr>';
+  for(const t of (d.tracks||[])){let st;
+    if(!checked)st='<span class="badge">не проверено</span>';
+    else if(t.resume_present===true)st='<span class="pill FIT">на HH ✓</span>';
+    else if(t.resume_present===false)st='<span class="pill SKIP">нет на HH</span>';
+    else st='<span class="muted">резюме не указано</span>';
+    h+=`<tr><td><b>${esc(t.label)}</b><div class="muted">${esc(t.key)}</div></td><td>${esc(t.type)}</td>
+      <td>${esc(t.resume||"—")}</td><td class="nowrap">${st}</td>
+      <td class="muted" style="font-size:12px">${esc(t.profile)}<br>${esc(t.search)}</td>
+      <td class="nowrap"><button class="danger mini" data-delete-track="${esc(t.key)}" ${d.tracks.length<=1?'disabled title="Последний трек удалить нельзя"':''}>Удалить</button></td></tr>`;}
+  $("#trackstable").innerHTML=h+"</table>";
+  $("#trackstable").querySelectorAll("[data-delete-track]").forEach(btn=>{
+    const edit=document.createElement("button");edit.className="ghost mini";edit.textContent="Изменить";
+    edit.onclick=()=>editTrack((d.tracks||[]).find(t=>t.key===btn.dataset.deleteTrack));btn.before(edit);
+  });
+  $("#trackstable").querySelectorAll("[data-delete-track]").forEach(btn=>btn.onclick=()=>deleteTrack(btn.dataset.deleteTrack));
+  const un=(d.unassigned_resumes||[]);
+  $("#unassigned").innerHTML=(d.error?`<div class="hl" style="margin-top:8px">${esc(d.error)}</div>`:"")
+    +(un.length?`<div style="margin-top:10px" class="muted">Резюме на HH без трека: ${un.map(esc).join(", ")}. При необходимости добавь трек ниже.</div>`
+    :(checked?'<div class="muted" style="margin-top:10px">Все активные резюме HH привязаны к трекам.</div>':""));
+  $("#tracksmeta").textContent="Управляй треками здесь. Удаление исключает трек из следующих запусков поиска, но сохраняет файлы профиля, отчёты и резюме на HH. «Обновить с HH» читает резюме через сессию (~10с).";
+  loadWatch();}
+async function deleteTrack(key){const t=TRACKS.find(x=>x.key===key);if(!t)return;
+  if(!confirm("Удалить трек «"+String(t.label||"")+"» из ApplyPilot?\\n\\nСледующие поиски по нему не запустятся. Файлы профиля, отчёты и резюме на HH останутся."))return;
+  const msg=$("#trackmsg");msg.textContent="Удаляю трек…";
+  try{const r=await api("/api/track/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key})});
+    if(r.error){msg.textContent="Ошибка: "+r.error;return;}
+    await loadTracks(false);msg.textContent=`Трек «${t.label}» удалён из поиска.`;
+  }catch(e){msg.textContent="Ошибка: "+e.message;}}
+async function loadWatch(){const w=await api("/api/watch");
+  if(!w.systemctl){$("#watchbox").innerHTML='<span class="hl">systemctl недоступен — используй cron (см. packaging/README).</span>';return;}
+  const active=w.active==="active";
+  let h=`<div class="row" style="margin:0">
+    <span class="chip">${w.installed?(active?'<b style="color:var(--fit)">включён</b>':'установлен, выключен'):'не установлен'}</span>
+    <label>Интервал, мин</label><input id="winterval" type="number" value="${Math.max(1,Math.min(1440,safeInt(w.interval_min,60)))}" style="width:80px">`;
+  if(!w.installed||!active)h+=`<button class="mini" onclick="watchCtl('install')">Установить и включить</button>`;
+  else h+=`<button class="ghost mini" onclick="watchCtl('interval')">Применить интервал</button><button class="danger mini" onclick="watchCtl('disable')">Выключить</button>`;
+  h+=`</div>`;
+  if(w.next)h+=`<div class="muted" style="margin-top:6px">следующий запуск: ${esc(w.next)}</div>`;
+  h+=w.log_tail?`<pre style="margin-top:8px;max-height:140px">${esc(w.log_tail)}</pre>`:'<div class="muted" style="margin-top:6px">лог автопоиска пуст</div>';
+  $("#watchbox").innerHTML=h;}
+async function watchCtl(action){const mins=+($("#winterval")&&$("#winterval").value)||60;
+  $("#watchbox").innerHTML='<span class="spin"></span> применяю…';
+  const r=await api("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,minutes:mins})});
+  if(r.error)alert("Ошибка: "+r.error);loadWatch();}
+
+/* ---- settings ---- */
+async function loadSettings(){const s=await api("/api/settings");fillTrackSelects(s.tracks);
+  const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
+  $("#sbase").value=s.base_url||"";
+  $("#sstatus").innerHTML=`Ключ: ${s.key_set?'<b style="color:var(--fit)">задан ✓</b>':'<span class="hl">не задан</span>'}<br>Модель: ${esc(s.model)}<br>Треков: ${(s.tracks||[]).length}`;
+  $("#skeystate").textContent=s.key_set?"ключ задан ✓":"ключ не задан";
+  $("#sconstraints").value=s.constraints||"";$("#ssalary").value=s.salary_expectation||"";
+  const cr=s.criteria||{};
+  $("#scrit").innerHTML=(s.tracks||[]).map(t=>`<div class="field"><label>${esc(t.label)} <span class="muted">(${esc(t.type)})</span></label><textarea data-crit="${escAttr(t.key)}" style="min-height:150px">${esc(cr[t.key]||"")}</textarea></div>`).join("")||'<span class="muted">нет треков</span>';}
+async function saveSettings(){const body={model:$("#smodel").value,base_url:$("#sbase").value,
+  constraints:$("#sconstraints").value,salary_expectation:$("#ssalary").value};
+  document.querySelectorAll("#scrit textarea[data-crit]").forEach(t=>{body["criteria_"+t.dataset.crit]=t.value;});
+  const k=$("#skey").value.trim();if(k)body.api_key=k;
+  const s=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  $("#skey").value="";$("#skeystate").textContent=(s.key_set?"ключ задан ✓":"ключ не задан")+" · сохранено ✓";loadSettings();}
+
+/* ---- add track ---- */
+async function addTrack(){const body={key:$("#tkey").value,label:$("#tlabel").value,type:$("#ttype").value,
+  resume:$("#tresume").value,queries:$("#tqueries").value,criteria:$("#tcriteria").value,copy_from:$("#tcopy").value};
+  $("#tmsg").innerHTML='<span class="spin"></span> создаю…';
+  const r=await api("/api/track",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.error){$("#tmsg").textContent="Ошибка: "+r.error;return;}
+  $("#tmsg").textContent="Готово: "+r.profile+" — "+(r.note||"");
+  $("#tkey").value=$("#tlabel").value=$("#tresume").value=$("#tqueries").value=$("#tcriteria").value="";loadTracks(false);}
+function editTrack(t){if(!t)return;
+  $("#etrackkey").value=t.key;$("#etlabel").value=t.label;$("#ettype").value=t.type;$("#etresume").value=t.resume||"";
+  $("#etqueries").value=(t.queries||[]).join("\\n");$("#etmsg").textContent="";
+  $("#trackeditor").classList.remove("hide");$("#trackeditor").scrollIntoView({behavior:"smooth",block:"center"});}
+function closeTrackEditor(){$("#trackeditor").classList.add("hide");}
+async function saveTrack(){const body={key:$("#etrackkey").value,label:$("#etlabel").value,type:$("#ettype").value,
+  resume:$("#etresume").value,queries:$("#etqueries").value};
+  $("#etmsg").innerHTML='<span class="spin"></span> сохраняю…';
+  const r=await api("/api/track/edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.error){$("#etmsg").textContent="Ошибка: "+r.error;return;}
+  closeTrackEditor();await loadTracks(false);await loadSettings();$("#trackmsg").textContent="Изменения сохранены.";}
+
+/* ---- letter modal ---- */
+let modalCtx={track:"",id:""};
+function closeModal(){$("#modal").classList.add("hide");}
+function openHH(){const u=safeHHUrl($("#modal").dataset.url||"");if(u)window.open(u,"_blank","noopener,noreferrer");
+  if(u&&modalCtx.id)markViewed(modalCtx.id);}
+function copyLetter(){const t=$("#lettertext").value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(()=>$("#letterhint").textContent="скопировано ✓").catch(()=>$("#letterhint").textContent="не удалось скопировать");}
+function copyAndOpen(){copyLetter();openHH();}
+async function markApplied(){if(!modalCtx.id)return;
+  const selected=TRACKS.find(t=>t.key===modalCtx.track)||{};
+  await api("/api/applied",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:modalCtx.id,on:true,track:modalCtx.track,resume:selected.resume||""})});
+  $("#letterhint").textContent="отмечено: откликнулся ✓";if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
+async function markLetterSent(){if(!modalCtx.id)return;
+  const selected=TRACKS.find(t=>t.key===modalCtx.track)||{};
+  await api("/api/letter-sent",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:modalCtx.id,track:modalCtx.track,resume:selected.resume||""})});
+  $("#letterhint").textContent="письмо отмечено отправленным ✓";
+  if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
+async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("hide");modalCtx={track,id};
+  try{m.dataset.url=safeHHUrl(decodeURIComponent(url||""));}catch(e){m.dataset.url="";}
+  $("#lettertitle").textContent="Сопроводительное письмо";$("#lettersub").textContent="";
+  $("#letterhint").innerHTML='<span class="spin"></span> генерирую…';$("#lettertext").value="";
+  const r=await api("/api/letter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({track,id})});
+  if(r.error){$("#letterhint").textContent="";$("#lettertext").value="Ошибка: "+r.error;return;}
+  $("#lettersub").textContent=r.name||"";$("#lettertext").value=r.text||"";
+  if(!m.dataset.url&&r.url)m.dataset.url=safeHHUrl(r.url);
+  const ta=$("#lettertext");ta.style.height="auto";ta.style.height=Math.min(500,ta.scrollHeight+8)+"px";
+  $("#letterhint").textContent="готово — проверь и нажми «Копировать и открыть на HH»";}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});
+
+/* ---- boot ---- */
+let prevRunning=false;
+setInterval(async()=>{const running=await refreshJob();
+  if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();if(tab==="apply")refreshQueue();}
+  prevRunning=running;},3000);
+async function init(){setHdr();try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}
+  const h=(location.hash||"").replace("#","");show(SECTIONS.includes(h)?h:"overview");}
+init();
+</script>
+</body></html>"""

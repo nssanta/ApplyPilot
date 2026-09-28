@@ -2,6 +2,12 @@
 
 `cli` owns command parsing and orchestration. `config` resolves paths and TOML profiles. `parser` fetches and normalizes public vacancy pages. `scoring` is pure and shared by `plan` and `apply`. `storage` owns SQLite state and idempotent imports. `llm` is opt-in and lazy. `session` and `autoapply` import Playwright only inside browser commands. `analytics` reads local history without network access.
 
+## Optional LLM + admin layer
+
+`screen` is an opt-in second pass after the mechanical `scan`→score filter: it sends candidate descriptions to an OpenAI-compatible model (aitunnel, default `gpt-5-mini`) and returns a structured FIT/MAYBE/SKIP verdict with `fit_score` and reason. Track descriptions are broad; candidate facts and preferences come only from the private profile's allowlisted fields and optional `[screen]` settings. Empty preferences add no assumptions. The per-vacancy cache key includes the rubric and prompt version. Screening never applies and never touches the session; it writes a verdict report and, optionally, an accepted snapshot for `apply`. `letters` drafts an individual cover letter per vacancy from allowlisted profile facts. `pacing` computes humanized apply delays. `balance` reads the configured provider balance. The API key comes from `AITUNNEL_API_KEY`, `private/config/aitunnel.key`, or the admin settings file — never the repository.
+
+`admin` serves a dependency-free localhost web UI (`http.server`) that reads local artifacts and launches `applypilot` subcommands as subprocesses. A per-process CSRF token, same-origin `Origin`, loopback `Host` validation, and JSON-only POSTs protect every action; Host validation also covers reads to reject DNS rebinding. Tracks are config-driven from `private/config/tracks.toml` (a track = resume + search config + rubric type), so the number of tracks is not hard-coded. Small JSON sets under the data dir hold per-vacancy user state — `manual-applied.json`, `viewed.json`, `bad.json` — and feed the review and apply queue. A scan snapshot retains found vacancies; application history blocks only the matching account's applied or ambiguous submissions downstream. Real sending stays gated on `reviewed = true` plus an explicit confirmation. `packaging/applypilot-watch.*` provides a systemd user timer for periodic scan+screen (applying stays manual).
+
 The normal read-only flow is:
 
 ```text

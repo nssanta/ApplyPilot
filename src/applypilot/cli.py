@@ -10,8 +10,10 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from . import __version__
+from . import __version__, letters
+from .admin import serve as admin_serve
 from .analytics import report
 from .config import (
     AppConfig,
@@ -24,7 +26,15 @@ from .config import (
 )
 from .cover_letters import letter_mode, load_letter_profile, render_template
 from .llm import generate
-from .parser import ScanSegment, enrich_items, load_items, save_snapshot, scan_many
+from .pacing import next_delay
+from .parser import (
+    ScanSegment,
+    enrich_items,
+    load_items,
+    save_snapshot,
+    scan_many,
+    stamp_first_seen,
+)
 from .presets import ROLE_PRESETS
 from .quality import run_benchmark
 from .review import write_review
@@ -33,6 +43,13 @@ from .scoring import (
     evaluate_search_filter,
     filter_candidates,
     prioritize_for_enrichment,
+)
+from .screen import (
+    DEFAULT_BASE_URL,
+    DEFAULT_CONCURRENCY,
+    DEFAULT_MODEL,
+    ScreenError,
+    screen_vacancies,
 )
 from .session import check_session, login, save_state, validate_state
 from .storage import Store
@@ -144,6 +161,25 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--top", type=int, default=20)
     review.add_argument("--output", type=Path)
     review.add_argument("--preset", choices=PRESET_CHOICES)
+
+    screen = sub.add_parser("screen", help="LLM fit-screening of filtered vacancies (opt-in)")
+    screen.add_argument("--input", required=True, type=Path)
+    screen.add_argument("--preset", choices=PRESET_CHOICES)
+    screen.add_argument("--limit", type=int, default=200)
+    screen.add_argument("--min-score", type=int, default=None)
+    screen.add_argument("--track", choices=["ai", "infra", "general"], default="general")
+    screen.add_argument("--accept", choices=["fit", "fit+maybe"], default="fit+maybe",
+                        help="which verdicts are written to the emitted snapshot")
+    screen.add_argument("--model", default=None)
+    screen.add_argument("--concurrency", type=int, default=None)
+    screen.add_argument("--criteria", default=None, help="override the screening rubric (prompt)")
+    screen.add_argument("--constraints", default=None, help="override candidate constraints")
+    screen.add_argument("--salary-expectation", default=None, help="override salary expectation line")
+    screen.add_argument("--output", type=Path, help="private JSON verdict report")
+    screen.add_argument("--emit-snapshot", type=Path,
+                        help="write a snapshot of accepted vacancies for `apply`")
+    screen.add_argument("--retry-errors", action="store_true",
+                        help="retry only ERROR rows and merge results into the existing report")
     config_cmd = sub.add_parser("config", help="inspect effective configuration")
     config_sub = config_cmd.add_subparsers(dest="config_action", required=True)
     config_show = config_sub.add_parser("show", help="show effective search settings")
@@ -154,6 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
     template_init = templates_sub.add_parser("init", help="create a new template without overwriting")
     template_init.add_argument("--name", required=True, choices=list_templates())
     template_init.add_argument("--output", required=True, type=Path)
+
+    admin = sub.add_parser("admin", help="serve the local admin web UI")
+    admin.add_argument("--host", default="127.0.0.1")
+    admin.add_argument("--port", type=int, default=8765)
+    admin.add_argument("--open", action="store_true", help="open the admin page in a browser")
     return parser
 
 
@@ -179,6 +220,19 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
 def _account(profile: dict) -> str:
     """Use an explicit private account key, retaining legacy compatibility."""
     return str(profile.get("account") or "default").strip() or "default"
+
+
+def _operator_excluded_ids(data_dir: Path) -> set[str]:
+    """Return IDs manually handled in the admin UI that must not reach apply."""
+    ids: set[str] = set()
+    for filename in ("viewed.json", "bad.json", "manual-applied.json"):
+        try:
+            data = json.loads((data_dir / filename).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, list):
+            ids.update(str(value) for value in data if value is not None and str(value).strip())
+    return ids
 
 
 def _default_limit(profile: dict) -> int:
@@ -242,6 +296,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"network: error ({exc})")
         return 0
 
+    if args.command == "admin":
+        try:
+            admin_serve(config, host=args.host, port=args.port, open_browser=args.open)
+        except ValueError as exc:
+            print(f"admin: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     session_path = config.data_dir / "hh_session.json"
     if args.command == "login":
         login(session_path)
@@ -300,8 +362,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.request_budget is not None and args.request_budget < 1:
             print("--request-budget must be positive", file=sys.stderr)
             return 2
-        remaining_requests = int(search["request_budget"])
+        request_budget = int(search["request_budget"])
         page = args.page if args.page is not None else 0
+        group_specs = []
         for group in groups:
             queries = [args.query] if args.query else list(group.get("queries", []))
             if args.add_query and not args.query:
@@ -310,26 +373,39 @@ def main(argv: list[str] | None = None) -> int:
             if not queries:
                 continue
             areas = args.area if args.area is not None else [int(value) for value in (group.get("areas") or [113])]
-            if remaining_requests <= 0:
-                segments.append(ScanSegment(queries[0], areas[0], 0, "truncated", 0,
-                                            "search request budget reached"))
-                break
             pages = args.pages if args.pages is not None else int(group["max_pages"])
             remote = args.remote if args.remote is not None else bool(group.get("only_remote", False))
             days = args.days if args.days is not None else group.get("days")
             date_from = (datetime.now(UTC) - timedelta(days=int(days))).date().isoformat() if days else None
-            group_items, group_segments = scan_many(queries, areas, pages, remote, date_from=date_from,
-                                                    start_page=page, pause_seconds=1.0,
-                                                    request_budget=remaining_requests)
-            remaining_requests -= sum(segment.requests for segment in group_segments)
-            group_name = str(group.get("group_name") or "default")
-            for item in group_items:
-                item["search_group"] = group_name
-            all_items.extend(group_items)
-            segments.extend(group_segments)
+            group_specs.append({"queries": queries, "areas": areas, "pages": pages,
+                                "remote": remote, "date_from": date_from,
+                                "name": str(group.get("group_name") or "default")})
         if not group_queries:
             print("search query is required (or configure private/config/search.toml)", file=sys.stderr)
             return 2
+        # Reserve half of the shared request budget for each sort. The newest-first
+        # pass gets the extra request when the budget is odd.
+        newest_budget = (request_budget + 1) // 2
+        sort_budgets = (("publication_time", newest_budget),
+                        ("relevance", request_budget - newest_budget))
+        for order_by, allocated_budget in sort_budgets:
+            mode_remaining = allocated_budget
+            for spec in group_specs:
+                if mode_remaining <= 0:
+                    segments.append(ScanSegment(
+                        spec["queries"][0], spec["areas"][0], 0, "truncated", 0,
+                        "search request budget reached", order_by=order_by))
+                    break
+                group_items, group_segments = scan_many(
+                    spec["queries"], spec["areas"], spec["pages"], spec["remote"],
+                    date_from=spec["date_from"], start_page=page, pause_seconds=1.0,
+                    request_budget=mode_remaining, order_by=order_by,
+                )
+                mode_remaining -= sum(segment.requests for segment in group_segments)
+                for item in group_items:
+                    item["search_group"] = spec["name"]
+                all_items.extend(group_items)
+                segments.extend(group_segments)
         deduplicated: dict[str, dict] = {}
         for item in all_items:
             vacancy_id = str(item.get("id", ""))
@@ -343,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
                                                 | set(item.get("area_sources", [])))
             existing["search_groups"] = sorted(set(existing.get("search_groups", [existing.get("search_group", "")]))
                                                | {item.get("search_group", "")})
+            existing["sort_sources"] = sorted(set(existing.get("sort_sources", []))
+                                               | set(item.get("sort_sources", [])))
         all_items = list(deduplicated.values())
         group_by_name = {str(group.get("group_name") or "default"): group for group in groups}
         details_limit = (args.details_limit if args.details_limit is not None
@@ -355,9 +433,14 @@ def main(argv: list[str] | None = None) -> int:
             if str(item.get("id", "")) not in candidate_ids:
                 item["description_status"] = "provisional"
         enriched, detail_errors = enrich_items(enrichment_items, details_limit, pause_seconds=1.0)
-        enriched_ids = {str(item.get("id", "")) for item in enriched}
-        all_items = [item for item in all_items if str(item.get("id", "")) in enriched_ids or
-                     str(item.get("id", "")) not in candidate_ids]
+        # Keep the full search result set in the snapshot, even if a detail request
+        # failed or a candidate was only provisional. Enrichment annotates rows;
+        # it does not determine whether a vacancy remains discoverable.
+        enriched_by_id = {str(item.get("id", "")): item for item in enriched}
+        for item in all_items:
+            enriched_item = enriched_by_id.get(str(item.get("id", "")))
+            if enriched_item is not None:
+                item.update(enriched_item)
         for item in all_items:
             group_search = group_by_name.get(str(item.get("search_group", "default")), search)
             decision = evaluate_search_filter(item, group_search)
@@ -375,12 +458,16 @@ def main(argv: list[str] | None = None) -> int:
             status = "truncated"
         else:
             status = "ok" if all_items else "empty"
+        # Record when each vacancy was first discovered so the UI can tell a
+        # brand-new vacancy from one carried over from an earlier scan.
+        stamp_first_seen(all_items, config.data_dir / "seen.json")
         path = save_snapshot(all_items, config.snapshots_dir, " | ".join(queries), status,
                              "\n".join(errors), segments, args.preset or search.get("preset"))
         print(f"status: {status}; items: {len(all_items)}; segments: {len(segments)}; snapshot: {path}")
         for segment in segments:
             print(f"segment: query={segment.query!r} area={segment.area} pages={segment.pages} "
-                  f"requests={segment.requests} status={segment.status} items={segment.items}")
+                  f"requests={segment.requests} order_by={segment.order_by} "
+                  f"status={segment.status} items={segment.items}")
         return 0 if status in {"ok", "empty", "truncated"} else 2
     if args.command in {"plan", "apply"}:
         items = load_items(args.input)
@@ -397,8 +484,9 @@ def main(argv: list[str] | None = None) -> int:
             print("--limit must be positive", file=sys.stderr)
             return 2
         min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
+        blocked_ids = store.blocked_ids(account) | _operator_excluded_ids(config.data_dir)
         selected = _print_candidates(items, profile, limit, min_score,
-                                      args.skip_security, store.blocked_ids(account), args.rescore)
+                                      args.skip_security, blocked_ids, args.rescore)
         if args.command == "plan":
             output = args.output or _default_artifact(config, "plans", "json")
             _write_private_json(output, {
@@ -575,6 +663,116 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or config.data_dir / "reports" / "review.html"
         print(f"review: {write_review(load_items(args.input), _profile(config, search), output, args.top)}")
         return 0
+    if args.command == "screen":
+        raw_items = load_items(args.input)
+        retry_previous: dict[str, Any] = {}
+        retry_accepted: list[dict[str, Any]] = []
+        if args.retry_errors:
+            try:
+                retry_previous = json.loads(args.output.read_text(encoding="utf-8")) if args.output and args.output.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                retry_previous = {}
+            previous_rows = retry_previous.get("results", []) if isinstance(retry_previous, dict) else []
+            failed_ids = {str(row.get("id", "")) for row in previous_rows
+                          if isinstance(row, dict) and row.get("verdict") == "ERROR"}
+            raw_items = [item for item in raw_items if str(item.get("id", "")) in failed_ids]
+            retry_ids = {str(item.get("id", "")) for item in raw_items}
+            if not raw_items:
+                print("screen: no retryable ERROR rows found in the input", file=sys.stderr)
+                return 2
+            if args.emit_snapshot and args.emit_snapshot.exists():
+                try:
+                    previous_snapshot = json.loads(args.emit_snapshot.read_text(encoding="utf-8"))
+                    retry_accepted = [item for item in previous_snapshot.get("items", [])
+                                      if isinstance(item, dict)
+                                      and str(item.get("id", "")) not in retry_ids]
+                except (OSError, json.JSONDecodeError):
+                    retry_accepted = []
+        try:
+            search = effective_search(config.load_search(), args.preset)
+        except ConfigError as exc:
+            print(f"invalid search configuration: {exc}", file=sys.stderr)
+            return 2
+        profile = _profile(config, search)
+        # Admin-supplied prompt overrides (candidate/criteria/salary) patch the screen config.
+        screen_over = dict(profile.get("screen", {}) or {})
+        if args.criteria:
+            screen_over["criteria"] = args.criteria
+        if args.constraints:
+            screen_over["constraints"] = args.constraints
+        if args.salary_expectation:
+            screen_over["salary_expectation"] = args.salary_expectation
+        profile = {**profile, "screen": screen_over}
+        account = _account(profile)
+        min_score = args.min_score if args.min_score is not None else int(search.get("min_score", 0))
+        candidates = filter_candidates(
+            raw_items, profile, args.limit, min_score,
+            blocked_ids=Store(config.db_path).blocked_ids(account),
+        )
+        by_id = {str(item.get("id", "")): item for item in raw_items}
+        to_screen: list[dict] = []
+        for candidate in candidates:
+            item = dict(by_id.get(candidate.id, {}))
+            item["score"] = candidate.score
+            to_screen.append(item)
+        screen_cfg = profile.get("screen", {}) or {}
+        model = args.model or screen_cfg.get("model") or DEFAULT_MODEL
+        base_url = screen_cfg.get("base_url") or DEFAULT_BASE_URL
+        concurrency = args.concurrency or int(screen_cfg.get("concurrency", DEFAULT_CONCURRENCY))
+        report_path = args.output or _default_artifact(config, "reports", "json")
+
+        def _counts(rows: list[dict]) -> dict[str, int]:
+            return {verdict: sum(1 for row in rows if row.get("verdict") == verdict)
+                    for verdict in ("FIT", "MAYBE", "SKIP", "ERROR")}
+
+        streamed: list[dict] = []
+
+        def _merge_retry_rows(new_rows: list[dict]) -> list[dict]:
+            merged = {str(row.get("id", "")): row for row in
+                      (retry_previous.get("results", []) if args.retry_errors else [])
+                      if isinstance(row, dict) and row.get("id")}
+            merged.update({str(row.get("id", "")): row for row in new_rows if row.get("id")})
+            return list(merged.values())
+
+        def _on_result(row: dict, done: int, total: int) -> None:
+            streamed.append(row)
+            # Live progress line (streamed to the admin log) + incremental report.
+            print(f"[{done}/{total}] {row.get('verdict', '?'):5} "
+                  f"fit={row.get('fit_score', 0):>3} {row.get('name', '')[:70]}", flush=True)
+            report_rows = _merge_retry_rows(streamed)
+            _write_private_json(report_path, {"model": model, "track": args.track,
+                                              "counts": _counts(report_rows), "results": report_rows,
+                                              "progress": {"done": done, "total": total}})
+
+        try:
+            results = screen_vacancies(
+                to_screen, profile, config.data_dir / "screen-cache",
+                model=model, base_url=base_url, track=args.track, concurrency=concurrency,
+                on_result=_on_result, ledger_path=config.data_dir / "spend.jsonl",
+            )
+        except ScreenError as exc:
+            print(f"screen: error ({exc})", file=sys.stderr)
+            return 3
+        report_rows = _merge_retry_rows(results)
+        counts = _counts(report_rows)
+        _write_private_json(report_path, {"model": model, "track": args.track,
+                                          "counts": counts, "results": report_rows})
+        accepted = {"FIT"} if args.accept == "fit" else {"FIT", "MAYBE"}
+        accepted_ids = [row["id"] for row in results if row.get("verdict") in accepted]
+        for verdict in ("FIT", "MAYBE", "SKIP", "ERROR"):
+            print(f"{verdict}: {counts[verdict]}")
+        print(f"screened: {len(results)}; model={model}; track={args.track}")
+        print(f"screen_report: {report_path}")
+        if args.emit_snapshot:
+            accepted_items = [by_id[i] for i in accepted_ids if i in by_id]
+            if args.retry_errors:
+                accepted_items = retry_accepted + accepted_items
+            _write_private_json(args.emit_snapshot, {
+                "schema_version": 3, "source": "hh.ru", "status": "ok",
+                "query": f"screen:{args.track}", "items": accepted_items,
+            })
+            print(f"accepted ({args.accept}): {len(accepted_items)} -> {args.emit_snapshot}")
+        return 0
     if args.command == "config" and args.config_action == "show":
         raw = config.load_search()
         values = effective_search(raw, args.preset)
@@ -648,6 +846,11 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     timing = profile.get("apply", {}) or {}
     delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
     delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
+    # Humanised pacing: occasional longer pauses to avoid tripping bot heuristics.
+    long_pause_every = int(timing.get("long_pause_every", 0))
+    long_pause_min = max(0.0, float(timing.get("long_pause_min_seconds", 0)))
+    long_pause_max = max(long_pause_min, float(timing.get("long_pause_max_seconds", long_pause_min)))
+    pacing_rng = random.Random()
     confirmation_timeout = max(0.0, float(timing.get("confirmation_timeout_seconds", 15)))
     run_status = "completed"
     stop_reason = ""
@@ -667,6 +870,12 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
             )
             page = context.new_page()
             for index, item in enumerate(selected, 1):
+                vacancy_id = str(item.get("id", ""))
+                if vacancy_id in _operator_excluded_ids(config.data_dir):
+                    reason = "manually marked viewed, bad, or applied in admin"
+                    store.mark_run_item(run_id, vacancy_id, "skipped", reason)
+                    print(f"{vacancy_id}: skipped — {reason}")
+                    continue
                 preflight_error = _submission_preflight(item, letter_enabled)
                 if preflight_error:
                     store.record(item, "needs_manual", preflight_error, run_id, account)
@@ -725,7 +934,11 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     stop_reason = f"confirmed success target reached ({confirmed_successes})"
                     break
                 if index < len(selected) and delay_max:
-                    time.sleep(random.uniform(delay_min, delay_max))
+                    time.sleep(next_delay(
+                        pacing_rng, min_seconds=delay_min, max_seconds=delay_max, index=index,
+                        long_pause_every=long_pause_every,
+                        long_pause_min=long_pause_min, long_pause_max=long_pause_max,
+                    ))
         except KeyboardInterrupt:
             run_status = "interrupted"
             stop_reason = "run interrupted"
@@ -786,12 +999,26 @@ def _prepare_cover_letter(config: AppConfig, item: dict, profile: dict) -> tuple
         return render_template(vacancy, prepared), "template"
     settings = prepared.get("cover_letter", {})
     fallback = render_template(vacancy, prepared) if settings.get("fallback_to_template", False) else None
-    llm = prepared.get("llm", {})
-    if not isinstance(llm, dict) or not isinstance(llm.get("model", ""), str):
-        raise ConfigError("llm.model must be a string")
+    provider = str(settings.get("provider", "openrouter") or "openrouter").strip()
+    if provider not in ("openrouter", "aitunnel"):
+        raise ConfigError("cover_letter.provider must be openrouter or aitunnel")
     try:
-        text, source = generate(vacancy, prepared, config.data_dir / "llm-cache",
-                                str(llm.get("model", "")), enabled=True, required=True)
+        if provider == "aitunnel":
+            # Same per-vacancy generator and prompt the admin UI uses (letters.py),
+            # so the letter that is sent is the one that was previewed.
+            screen = prepared.get("screen", {}) if isinstance(prepared.get("screen"), dict) else {}
+            model = str(settings.get("model") or screen.get("model") or letters.DEFAULT_MODEL).strip()
+            base_url = str(settings.get("base_url") or screen.get("base_url")
+                           or letters.DEFAULT_BASE_URL).strip()
+            result = letters.generate_letter(vacancy, prepared, config.data_dir / "letter-cache",
+                                             model=model, base_url=base_url)
+            text, source = str(result.get("text", "")), str(result.get("source", "generated"))
+        else:
+            llm = prepared.get("llm", {})
+            if not isinstance(llm, dict) or not isinstance(llm.get("model", ""), str):
+                raise ConfigError("llm.model must be a string")
+            text, source = generate(vacancy, prepared, config.data_dir / "llm-cache",
+                                    str(llm.get("model", "")), enabled=True, required=True)
         if not text.strip():
             raise RuntimeError("provider returned an empty cover letter")
         return text, source
