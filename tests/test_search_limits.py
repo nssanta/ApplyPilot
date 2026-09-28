@@ -6,6 +6,7 @@ import requests
 from applypilot.cli import main
 from applypilot.parser import save_snapshot, scan, scan_many
 from applypilot.scoring import filter_candidates
+from applypilot.storage import Store
 
 
 class Response:
@@ -23,9 +24,11 @@ class Client:
     def __init__(self, responses):
         self.responses = iter(responses)
         self.calls = []
+        self.params = []
 
     def get(self, url, **kwargs):
         self.calls.append(url)
+        self.params.append(kwargs.get("params", {}))
         response = next(self.responses)
         if isinstance(response, Exception):
             raise response
@@ -70,7 +73,7 @@ def test_unrecognized_search_structure_is_not_empty_success(state):
 def test_cli_shares_actual_request_budget_across_groups(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("applypilot.parser.time.sleep", lambda _: None)
-    client = Client([Response(503), Response(), Response()])
+    client = Client([Response(), Response()])
     monkeypatch.setattr("applypilot.parser.requests.Session", lambda: client)
     search = tmp_path / "search.toml"
     search.write_text('''request_budget = 2
@@ -91,6 +94,98 @@ queries = ["Python"]
     snapshot = json.loads(next((data / "snapshots").glob("hh_vacancies_*.json")).read_text())
     assert snapshot["status"] == "truncated"
     assert sum(segment["requests"] for segment in snapshot["segments"]) == 2
+    assert {segment["order_by"] for segment in snapshot["segments"]} == {
+        "publication_time", "relevance",
+    }
+
+
+def test_cli_searches_by_date_and_relevance_then_deduplicates(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("applypilot.parser.time.sleep", lambda _: None)
+    client = Client([Response(), Response()])
+    monkeypatch.setattr("applypilot.parser.requests.Session", lambda: client)
+    search = tmp_path / "search.toml"
+    search.write_text('''queries = ["Go"]
+max_pages = 1
+request_budget = 2
+details_limit = 0
+''', encoding="utf-8")
+    data = tmp_path / "data"
+
+    result = main(["--search", str(search), "--data-dir", str(data), "scan"])
+
+    assert result == 0
+    assert [params["order_by"] for params in client.params] == [
+        "publication_time", "relevance",
+    ]
+    snapshot = json.loads(next((data / "snapshots").glob("hh_vacancies_*.json")).read_text())
+    assert [item["id"] for item in snapshot["items"]] == ["1"]
+    assert snapshot["items"][0]["sort_sources"] == ["publication_time", "relevance"]
+
+
+def test_scan_keeps_seen_and_journaled_vacancies_in_snapshot(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("applypilot.parser.time.sleep", lambda _: None)
+    monkeypatch.setattr("applypilot.parser.requests.Session", lambda: Client([Response(), Response()]))
+    search = tmp_path / "search.toml"
+    search.write_text('''queries = ["Go"]
+details_limit = 0
+''', encoding="utf-8")
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "seen.json").write_text('{"1":"2026-09-20"}', encoding="utf-8")
+    snapshots = data / "snapshots"
+    snapshots.mkdir()
+    (snapshots / "hh_vacancies_previous.json").write_text(
+        json.dumps({"items": [{"id": "1"}]}), encoding="utf-8")
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "screen-other-track.json").write_text(
+        json.dumps({"results": [{"id": "1", "verdict": "SKIP"}]}), encoding="utf-8")
+    Store(data / "applypilot.sqlite3").record({"id": "1"}, "prepared", account="default")
+
+    result = main(["--search", str(search), "--data-dir", str(data), "scan"])
+
+    assert result == 0
+    newest = max(snapshots.glob("hh_vacancies_*.json"), key=lambda path: path.stat().st_mtime_ns)
+    snapshot = json.loads(newest.read_text(encoding="utf-8"))
+    assert [item["id"] for item in snapshot["items"]] == ["1"]
+    assert snapshot["items"][0]["first_seen"] == "2026-09-20"
+    assert snapshot["items"][0]["description_status"] == "provisional"
+    assert snapshot["status"] == "ok"
+
+
+def test_scan_keeps_candidate_when_description_fetch_fails(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("applypilot.parser.time.sleep", lambda _: None)
+    client = Client([Response(), Response()])
+    monkeypatch.setattr("applypilot.parser.requests.Session", lambda: client)
+    monkeypatch.setattr("applypilot.cli.prioritize_for_enrichment",
+                        lambda *_args, **_kwargs: [SimpleNamespace(id="1")])
+
+    def failed_detail(items, *_args, **_kwargs):
+        for item in items:
+            item["description_status"] = "network_error"
+        return items, ["1: network error"]
+
+    monkeypatch.setattr("applypilot.cli.enrich_items", failed_detail)
+    search = tmp_path / "search.toml"
+    search.write_text('''queries = ["Go"]
+max_pages = 1
+request_budget = 2
+details_limit = 10
+''', encoding="utf-8")
+    data = tmp_path / "data"
+
+    result = main(["--search", str(search), "--data-dir", str(data), "scan"])
+
+    assert result == 0
+    snapshot = json.loads(next((data / "snapshots").glob("hh_vacancies_*.json")).read_text())
+    assert [item["id"] for item in snapshot["items"]] == ["1"]
+    assert snapshot["items"][0]["description_status"] == "network_error"
+    assert "1: network error" in snapshot["error"]
 
 
 @pytest.mark.parametrize("allowed", [None, ["moreThan6"]])

@@ -38,6 +38,7 @@ class ScanSegment:
     items: int
     error: str = ""
     requests: int = 0
+    order_by: str = "relevance"
 
 
 class _BudgetExhausted(Exception):
@@ -118,10 +119,12 @@ def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
 def scan(query: str, area: int = 113, page: int = 0, only_remote: bool = False,
          timeout: float = 20.0, session: requests.Session | None = None,
          date_from: str | None = None, max_attempts: int = 2,
-         request_budget: int | None = None) -> ScanResult:
+         request_budget: int | None = None, order_by: str = "relevance") -> ScanResult:
+    if order_by not in {"relevance", "publication_time"}:
+        raise ValueError("order_by must be relevance or publication_time")
     params: dict[str, Any] = {"text": query, "area": area, "page": page,
                               "items_on_page": 50, "search_field": "vacancy_name",
-                              "order_by": "relevance"}
+                              "order_by": order_by}
     if only_remote:
         params["schedule"] = "remote"
     if date_from:
@@ -184,12 +187,15 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
               session: requests.Session | None = None,
               page_limit: int | None = None, start_page: int = 0,
               pause_seconds: float = 1.0,
-              request_budget: int | None = None) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
+              request_budget: int | None = None,
+              order_by: str = "relevance") -> tuple[list[dict[str, Any]], list[ScanSegment]]:
     """Scan a bounded query/area/page matrix and retain segment-level diagnostics.
 
     ``request_budget`` limits actual search HTTP requests, rather than merely
     the number of query strings.  This keeps a multi-region scan predictable.
     """
+    if order_by not in {"relevance", "publication_time"}:
+        raise ValueError("order_by must be relevance or publication_time")
     client = session or requests.Session()
     unique: dict[str, dict[str, Any]] = {}
     segments: list[ScanSegment] = []
@@ -209,7 +215,7 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                 break
             if remaining_requests is not None and remaining_requests <= 0:
                 segments.append(ScanSegment(query, area, 0, "truncated", 0,
-                                            "search request budget reached"))
+                                            "search request budget reached", order_by=order_by))
                 aborted = True
                 break
             fetched = 0
@@ -227,7 +233,7 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                     if elapsed < pause_seconds:
                         time.sleep(pause_seconds - elapsed)
                 result = scan(query, area, page, only_remote, session=client, date_from=date_from,
-                              request_budget=remaining_requests)
+                              request_budget=remaining_requests, order_by=order_by)
                 last_request_at = time.monotonic()
                 pages_used += 1
                 requests_used += result.requests
@@ -239,11 +245,13 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                 for item in result.items:
                     item["query_sources"] = sorted(set(item.get("query_sources", [])) | {query})
                     item["area_sources"] = sorted(set(item.get("area_sources", [])) | {area})
+                    item["sort_sources"] = sorted(set(item.get("sort_sources", [])) | {order_by})
                     key = str(item.get("id") or "")
                     if key:
                         unique.setdefault(key, item)
                         unique[key]["query_sources"] = sorted(set(unique[key].get("query_sources", [])) | {query})
                         unique[key]["area_sources"] = sorted(set(unique[key].get("area_sources", [])) | {area})
+                        unique[key]["sort_sources"] = sorted(set(unique[key].get("sort_sources", [])) | {order_by})
                 if result.status != "ok" or len(result.items) < 50 or (
                     result.total is not None and (page + 1) * 50 >= result.total
                 ):
@@ -252,7 +260,7 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
                     result.total is not None and pages_used * 50 < result.total):
                 segment_status = "truncated"
             segments.append(ScanSegment(query, area, pages_used, segment_status,
-                                        fetched, segment_error, requests_used))
+                                        fetched, segment_error, requests_used, order_by))
             if segment_status in {"failed", "captcha"}:
                 aborted = True
     return list(unique.values()), segments
@@ -381,6 +389,86 @@ def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
         if os.path.exists(temp_name):
             os.unlink(temp_name)
     return path
+
+
+def stamp_first_seen(items: list[dict[str, Any]], registry_path: Path,
+                     today: str | None = None) -> list[dict[str, Any]]:
+    """Attach and persist the date each vacancy id was first seen by a scan.
+
+    A small ``id -> YYYY-MM-DD`` registry is kept next to the data so a vacancy
+    keeps its original discovery date across scans, while genuinely new ids get
+    today's date.  Each item gains ``first_seen`` (the recorded date) and
+    ``is_new`` (True when that date is today), which lets the UI tell an
+    unseen-before vacancy from one that was already in a previous scan.
+    """
+    today = today or datetime.now(UTC).date().isoformat()
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        if not isinstance(registry, dict):
+            registry = {}
+    except (OSError, json.JSONDecodeError):
+        registry = {}
+    changed = False
+    for item in items:
+        vacancy_id = str(item.get("id") or "")
+        if not vacancy_id:
+            continue
+        seen = str(registry.get(vacancy_id) or "")
+        if not seen:
+            seen = today
+            registry[vacancy_id] = seen
+            changed = True
+        item["first_seen"] = seen
+        item["is_new"] = seen == today
+    if changed:
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".seen-", dir=registry_path.parent, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(registry, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_name, registry_path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+    return items
+
+
+def journaled_vacancy_ids(data_dir: Path, *, exclude_paths: Iterable[Path] = (),
+                          include_registry: bool = True) -> set[str]:
+    """Return vacancy IDs already present in scan history or screening journals."""
+    excluded = {path.resolve() for path in exclude_paths}
+    paths: set[Path] = set()
+    snapshots = data_dir / "snapshots"
+    reports = {data_dir / "reports", data_dir.parent / "reports"}
+    if snapshots.exists():
+        paths.update(snapshots.glob("*.json"))
+    for directory in reports:
+        if directory.exists():
+            paths.update(directory.glob("*.json"))
+    if include_registry:
+        paths.add(data_dir / "seen.json")
+
+    found: set[str] = set()
+    for path in paths:
+        if path.resolve() in excluded:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if path.name == "seen.json" and isinstance(payload, dict):
+            found.update(str(value) for value in payload if str(value))
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for collection in (payload.get("items"), payload.get("results")):
+            if isinstance(collection, list):
+                found.update(str(item.get("id") or item.get("vacancyId") or "")
+                             for item in collection if isinstance(item, dict)
+                             and (item.get("id") or item.get("vacancyId")))
+    return found
 
 
 def load_items(path: Path) -> list[dict[str, Any]]:
