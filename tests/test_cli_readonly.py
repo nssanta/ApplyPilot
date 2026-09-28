@@ -16,6 +16,32 @@ def test_dry_run_does_not_create_or_change_journal(tmp_path, monkeypatch):
     assert store.statuses() == before
 
 
+def test_cli_dry_run_respects_admin_viewed_bad_and_manual_applied_flags(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    input_path = tmp_path / "vacancies.json"
+    input_path.write_text(json.dumps({"items": [
+        {"id": "viewed", "name": "Role", "score": 100},
+        {"id": "bad", "name": "Role", "score": 100},
+        {"id": "manual", "name": "Role", "score": 100},
+        {"id": "open", "name": "Role", "score": 100},
+    ]}), encoding="utf-8")
+    data_dir = tmp_path / "private" / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "viewed.json").write_text('["viewed"]', encoding="utf-8")
+    (data_dir / "bad.json").write_text('["bad"]', encoding="utf-8")
+    (data_dir / "manual-applied.json").write_text('["manual"]', encoding="utf-8")
+
+    assert main(["--data-dir", str(data_dir), "apply", "--input", str(input_path),
+                 "--dry-run", "--limit", "10"]) == 0
+
+    store = Store(data_dir / "applypilot.sqlite3")
+    with store.connect() as conn:
+        run_id = conn.execute("SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()[0]
+        selected_ids = {row[0] for row in conn.execute(
+            "SELECT vacancy_id FROM run_items WHERE run_id=?", (run_id,))}
+    assert selected_ids == {"open"}
+
+
 def test_review_uses_the_requested_preset_without_touching_the_journal(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     input_path = tmp_path / "vacancies.json"

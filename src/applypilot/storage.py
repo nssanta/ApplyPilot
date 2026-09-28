@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS reservations (
 );
 CREATE TABLE IF NOT EXISTS negotiation_statuses (
   account TEXT NOT NULL, vacancy_id TEXT NOT NULL, status TEXT NOT NULL,
-  name TEXT NOT NULL DEFAULT '', company TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '', company TEXT NOT NULL DEFAULT '', resume TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL, fetched_at TEXT NOT NULL,
   PRIMARY KEY (account, vacancy_id)
 );
@@ -125,6 +125,9 @@ class Store:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sync_snapshots)")}
         if "account" not in columns:
             conn.execute("ALTER TABLE sync_snapshots ADD COLUMN account TEXT NOT NULL DEFAULT 'default'")
+        negotiation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(negotiation_statuses)")}
+        if "resume" not in negotiation_columns:
+            conn.execute("ALTER TABLE negotiation_statuses ADD COLUMN resume TEXT NOT NULL DEFAULT ''")
 
     def read_statuses(self, account: str = "default") -> dict[str, str]:
         """Read an existing journal without creating a database or schema."""
@@ -141,6 +144,27 @@ class Store:
                 "SELECT vacancy_id,status FROM attempts WHERE account=?", (account,))}
         except sqlite3.Error:
             return {}
+        finally:
+            conn.close()
+
+    def journaled_vacancy_ids(self) -> set[str]:
+        """Read every vacancy ID ever written to the application journal."""
+        if not self.path.exists():
+            return set()
+        uri = f"file:{self.path.resolve()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            return set()
+        try:
+            found: set[str] = set()
+            for table in ("attempts", "events", "run_items", "negotiation_statuses"):
+                try:
+                    found.update(str(row[0]) for row in conn.execute(
+                        f"SELECT DISTINCT vacancy_id FROM {table}") if row[0])
+                except sqlite3.Error:
+                    continue
+            return found
         finally:
             conn.close()
 
@@ -203,11 +227,61 @@ class Store:
     def statuses(self, account: str = "default") -> dict[str, str]:
         return self.read_statuses(account) if self.path.exists() else {}
 
+    def negotiation_ids(self, account: str = "default") -> set[str]:
+        """Read vacancy IDs present in HH negotiations (synced applications), read-only.
+
+        Any vacancy in the negotiation ledger is one the account already applied to,
+        regardless of the HH-side status, so it must never be re-applied to.
+        """
+        if not self.path.exists():
+            return set()
+        uri = f"file:{self.path.resolve()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error:
+            return set()
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["vacancy_id"] for row in conn.execute(
+                "SELECT vacancy_id FROM negotiation_statuses WHERE account=?", (account,))}
+        except sqlite3.Error:
+            return set()
+        finally:
+            conn.close()
+
+    def negotiation_details(self, account: str = "default") -> dict[str, dict[str, str]]:
+        """Read the latest synced HH status and resume label for each vacancy."""
+        if not self.path.exists():
+            return {}
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT vacancy_id,status,resume,updated_at FROM negotiation_statuses WHERE account=?",
+                (account,),
+            ).fetchall()
+            return {row["vacancy_id"]: {"status": row["status"], "resume": row["resume"],
+                                        "updated_at": row["updated_at"]} for row in rows}
+
+    def attempt_details(self, account: str = "default") -> dict[str, dict[str, str]]:
+        """Read saved application outcomes including the resume selected at submit time."""
+        if not self.path.exists():
+            return {}
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT vacancy_id,status,resume,note,updated_at FROM attempts WHERE account=?",
+                (account,),
+            ).fetchall()
+            return {row["vacancy_id"]: {"status": row["status"], "resume": row["resume"],
+                                        "note": row["note"], "updated_at": row["updated_at"]}
+                    for row in rows}
+
     def blocked_ids(self, account: str = "default") -> set[str]:
-        return {
+        blocked = {
             vacancy_id for vacancy_id, status in self.read_statuses(account).items()
             if status in BLOCKED_STATUSES
         }
+        # Anything already in HH negotiations (applied to manually or by a prior run) is blocked.
+        blocked |= self.negotiation_ids(account)
+        return blocked
 
     def start_run(self, run_id: str, account: str, mode: str, input_path: Path,
                   requested_limit: int, items: list[dict[str, Any]]) -> None:
@@ -393,13 +467,14 @@ class Store:
             for vacancy_id, row in normalized:
                 conn.execute(
                     """INSERT INTO negotiation_statuses
-                    (account,vacancy_id,status,name,company,updated_at,fetched_at)
-                    VALUES(?,?,?,?,?,?,?)
+                    (account,vacancy_id,status,name,company,resume,updated_at,fetched_at)
+                    VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(account,vacancy_id) DO UPDATE SET status=excluded.status,
-                    name=excluded.name,company=excluded.company,updated_at=excluded.updated_at,
+                    name=excluded.name,company=excluded.company,resume=excluded.resume,updated_at=excluded.updated_at,
                     fetched_at=excluded.fetched_at""",
                     (account, vacancy_id, str(row.get("status", "")), row.get("name", ""),
-                     row.get("company", ""), str(row.get("updated_at", "")), fetched_at),
+                     row.get("company", ""), str(row.get("resume", "")),
+                     str(row.get("updated_at", "")), fetched_at),
                 )
             if snapshot_status is not None:
                 conn.execute(

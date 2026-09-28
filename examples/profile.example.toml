@@ -1,9 +1,11 @@
-name = "Example Candidate"
-location = "Remote"
-english_level = "technical reading"
+# Add only candidate details that you want ApplyPilot to use.
+name = ""
+location = ""
+english_level = ""
 profile_version = "example-1"
 reviewed = false
-account = "hh-primary"
+# Optional: use an account label to keep separate HH profiles' history isolated.
+# account = "my-hh-account"
 
 [limits]
 per_run = 5
@@ -46,6 +48,14 @@ skills = []
 # description = ""
 # achievements = []
 
+[screen]
+model = "gpt-5-mini"
+# Candidate-specific screening preferences are optional and have no hidden defaults.
+# constraints = ""
+# salary_expectation = ""
+# criteria = ""
+# experience_years = 0
+
 # [[professional.projects]]
 # name = ""
 # role = ""
@@ -54,13 +64,7 @@ skills = []
 # achievements = []
 
 [resumes]
-default = "AI Agent Engineer"
-ai_agent = "AI Agent Engineer"
-ml = "ML Engineer"
-python = "Python Backend"
-go = "Go Backend"
+default = "REPLACE_WITH_EXACT_HH_RESUME_TITLE"
 
 [answers]
 motivation = "Describe your motivation here."
-salary = "Discussed individually."
-english = "Technical reading and written communication."
