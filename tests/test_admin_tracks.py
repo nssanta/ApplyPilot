@@ -1,15 +1,36 @@
 import json
 import tomllib
 
-from applypilot.admin import (
-    TRACKS_CONFIG,
-    AdminApp,
-    _over_experience,
-    _track_snapshot,
-    _write_tracks_config,
-)
-from applypilot.config import AppConfig
+import pytest
+
+from applypilot.admin import AdminApp, _over_experience, _track_snapshot
+from applypilot.config import AppConfig, ConfigError
 from applypilot.storage import Store
+from applypilot.tracks import TRACKS_CONFIG, _write_tracks_config, load_tracks
+
+
+def test_broken_tracks_file_is_preserved(tmp_path):
+    config_path = tmp_path / TRACKS_CONFIG
+    config_path.parent.mkdir(parents=True)
+    original = '[[track]]\nkey = "ai"\nBROKEN'
+    config_path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="left unchanged"):
+        load_tracks(tmp_path)
+
+    assert config_path.read_text(encoding="utf-8") == original
+
+
+def test_track_paths_cannot_escape_private(tmp_path):
+    config_path = tmp_path / TRACKS_CONFIG
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '[[track]]\nkey = "ai"\nprofile = "../../outside.toml"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="below private"):
+        load_tracks(tmp_path)
 
 
 def test_delete_track_keeps_other_tracks_and_files(tmp_path):
@@ -110,6 +131,7 @@ def test_scan_screen_uses_snapshot_path_returned_by_its_scan(tmp_path, monkeypat
         "search": "private/config/search-alpha.toml",
     }])
     app = AdminApp(AppConfig.discover(root=tmp_path))
+    app.save_settings({"base_url": "https://provider.example/v1/chat/completions"})
     captured = {}
     monkeypatch.setattr(app, "_api_key", lambda: "test-key")
     monkeypatch.setattr(app.runner, "start", lambda argv, label, env=None:
@@ -120,6 +142,7 @@ def test_scan_screen_uses_snapshot_path_returned_by_its_scan(tmp_path, monkeypat
     assert "ls -t private/data/snapshots" not in command
     assert 'tee "$scan_log"' in command
     assert 'screen --input "$snap"' in command
+    assert "--base-url https://provider.example/v1/chat/completions" in command
 
 
 def test_apply_queue_and_input_exclude_viewed_bad_and_handled_items(tmp_path):

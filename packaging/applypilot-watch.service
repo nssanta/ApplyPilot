@@ -11,7 +11,7 @@
 #
 # Ручной прогон прямо сейчас:      systemctl --user start applypilot-watch.service
 # Логи юнита:                      journalctl --user -u applypilot-watch.service
-# Лог самого watcher:              ~/Загрузки/ApplyPilot/private/data/watch.log
+# Лог самого watcher:              $APPLYPILOT_HOME/private/data/watch.log
 #
 # Правьте APPLYPILOT_HOME ниже под свой путь к репозиторию.
 # Ключ aitunnel можно задать здесь через Environment=AITUNNEL_API_KEY=sk-aitunnel-...
@@ -24,7 +24,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-Environment=APPLYPILOT_HOME=%h/Загрузки/ApplyPilot
+Environment=APPLYPILOT_HOME=%h/ApplyPilot
 # Environment=AITUNNEL_API_KEY=sk-aitunnel-...
-ExecStart=%h/Загрузки/ApplyPilot/packaging/applypilot-watch.sh
+# The shell expands APPLYPILOT_HOME, so manual installs only need to edit the
+# Environment line above. The web admin rewrites both paths to the active checkout.
+ExecStart=/bin/bash -lc 'exec "$APPLYPILOT_HOME/packaging/applypilot-watch.sh"'
 Nice=10

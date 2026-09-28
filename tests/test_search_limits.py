@@ -92,11 +92,9 @@ queries = ["Python"]
     assert result == 0
     assert len(client.calls) == 2
     snapshot = json.loads(next((data / "snapshots").glob("hh_vacancies_*.json")).read_text())
-    assert snapshot["status"] == "truncated"
+    assert snapshot["status"] == "ok"
     assert sum(segment["requests"] for segment in snapshot["segments"]) == 2
-    assert {segment["order_by"] for segment in snapshot["segments"]} == {
-        "publication_time", "relevance",
-    }
+    assert {segment["order_by"] for segment in snapshot["segments"]} == {"relevance"}
 
 
 def test_cli_searches_by_date_and_relevance_then_deduplicates(tmp_path, monkeypatch):
@@ -112,7 +110,10 @@ details_limit = 0
 ''', encoding="utf-8")
     data = tmp_path / "data"
 
-    result = main(["--search", str(search), "--data-dir", str(data), "scan"])
+    result = main([
+        "--search", str(search), "--data-dir", str(data),
+        "scan", "--sort-mode", "balanced",
+    ])
 
     assert result == 0
     assert [params["order_by"] for params in client.params] == [

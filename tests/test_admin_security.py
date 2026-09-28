@@ -127,6 +127,16 @@ def test_admin_refuses_public_bind_addresses(tmp_path):
         serve(AppConfig.discover(root=tmp_path), host="0.0.0.0")
 
 
+def test_admin_rejects_insecure_remote_provider_url(tmp_path):
+    app = AdminApp(AppConfig.discover(root=tmp_path))
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        app.save_settings({"base_url": "http://example.com/v1/chat/completions"})
+
+    saved = app.save_settings({"base_url": "http://127.0.0.1:9000/v1/chat/completions"})
+    assert saved["base_url"] == "http://127.0.0.1:9000/v1/chat/completions"
+
+
 def test_admin_ui_escapes_event_arguments_and_only_links_to_hh():
     assert "function jsArg(s)" in INDEX_HTML
     assert "function safeHHUrl(raw)" in INDEX_HTML

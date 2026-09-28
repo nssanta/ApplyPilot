@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, letters
-from .admin import serve as admin_serve
 from .analytics import report
 from .config import (
     AppConfig,
@@ -87,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--pages", type=int)
     scan_cmd.add_argument("--request-budget", type=int,
                           help="maximum search HTTP requests; overrides TOML")
+    scan_cmd.add_argument(
+        "--sort-mode",
+        choices=("relevance", "newest", "balanced"),
+        help="search ordering strategy; default comes from TOML (legacy default: relevance)",
+    )
     scan_cmd.add_argument("--days", type=int)
     scan_cmd.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
     scan_cmd.add_argument("--preset", choices=PRESET_CHOICES)
@@ -171,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     screen.add_argument("--accept", choices=["fit", "fit+maybe"], default="fit+maybe",
                         help="which verdicts are written to the emitted snapshot")
     screen.add_argument("--model", default=None)
+    screen.add_argument("--base-url", default=None,
+                        help="OpenAI-compatible chat-completions endpoint")
     screen.add_argument("--concurrency", type=int, default=None)
     screen.add_argument("--criteria", default=None, help="override the screening rubric (prompt)")
     screen.add_argument("--constraints", default=None, help="override candidate constraints")
@@ -297,9 +303,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "admin":
+        # Keep the CLI/headless path independent from the optional web UI.
+        from .admin import serve as admin_serve
+
         try:
             admin_serve(config, host=args.host, port=args.port, open_browser=args.open)
-        except ValueError as exc:
+        except (ConfigError, ValueError) as exc:
             print(f"admin: {exc}", file=sys.stderr)
             return 2
         return 0
@@ -335,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
             search["work_formats"] = args.work_format
         if args.request_budget is not None:
             search["request_budget"] = args.request_budget
+        if args.sort_mode is not None:
+            search["sort_mode"] = args.sort_mode
         if args.add_query:
             additions = [value.strip() for value in args.add_query if value.strip()]
             if not additions:
@@ -383,11 +394,20 @@ def main(argv: list[str] | None = None) -> int:
         if not group_queries:
             print("search query is required (or configure private/config/search.toml)", file=sys.stderr)
             return 2
-        # Reserve half of the shared request budget for each sort. The newest-first
-        # pass gets the extra request when the budget is odd.
-        newest_budget = (request_budget + 1) // 2
-        sort_budgets = (("publication_time", newest_budget),
-                        ("relevance", request_budget - newest_budget))
+        # Preserve the historical CLI behavior unless the user explicitly
+        # requests freshness or the two-pass strategy. UI/watch callers can opt
+        # into those modes without silently halving legacy relevance budgets.
+        sort_mode = str(search.get("sort_mode", "relevance"))
+        if sort_mode == "relevance":
+            sort_budgets = (("relevance", request_budget),)
+        elif sort_mode == "newest":
+            sort_budgets = (("publication_time", request_budget),)
+        else:
+            newest_budget = (request_budget + 1) // 2
+            sort_budgets = (
+                ("publication_time", newest_budget),
+                ("relevance", request_budget - newest_budget),
+            )
         for order_by, allocated_budget in sort_budgets:
             mode_remaining = allocated_budget
             for spec in group_specs:
@@ -717,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
             to_screen.append(item)
         screen_cfg = profile.get("screen", {}) or {}
         model = args.model or screen_cfg.get("model") or DEFAULT_MODEL
-        base_url = screen_cfg.get("base_url") or DEFAULT_BASE_URL
+        base_url = args.base_url or screen_cfg.get("base_url") or DEFAULT_BASE_URL
         concurrency = args.concurrency or int(screen_cfg.get("concurrency", DEFAULT_CONCURRENCY))
         report_path = args.output or _default_artifact(config, "reports", "json")
 
