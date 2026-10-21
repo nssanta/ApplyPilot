@@ -703,6 +703,46 @@ class AdminApp:
         return {"track": track, "model": report.get("model"), "count": len(rows),
                 "folded_duplicates": folded, "rows": rows}
 
+    def campaign_queue(self, track: str, view: str = "all", limit: int = 100) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track", "items": []}
+        account = self._account_for_track(track)
+        store = Store(self.config.db_path)
+        try:
+            rows = store.list_campaign_vacancies(account, track, view, limit)
+        except ValueError as exc:
+            return {"error": str(exc), "items": []}
+        return {"account": account, "track": track, "view": view, "count": len(rows), "items": rows}
+
+    def campaign_history(self, track: str = "", limit: int = 20) -> dict[str, Any]:
+        account = self._account_for_track(track) if track in TRACKS else self._account_for_profile(
+            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
+        )
+        rows = Store(self.config.db_path).campaign_history(account, track or None, limit)
+        return {"account": account, "track": track or None, "runs": rows}
+
+    def inbox_messages(self, track: str = "", limit: int = 100) -> dict[str, Any]:
+        if track and track not in TRACKS:
+            return {"error": "unknown track", "messages": []}
+        account = self._account_for_track(track) if track else self._account_for_profile(
+            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
+        )
+        rows = Store(self.config.db_path).inbox_messages(account)
+        return {"account": account, "messages": rows[-max(1, min(1000, int(limit))):]}
+
+    def set_campaign_review(self, track: str, vacancy_id: str, state: str,
+                            reason: str, notes: str | None = None) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        account = self._account_for_track(track)
+        try:
+            Store(self.config.db_path).set_review_state(
+                account, "hh.ru", vacancy_id, state, reason=reason, notes=notes, track=track,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return {"ok": True, "id": str(vacancy_id), "state": state.upper()}
+
     # ---- фоновые задачи --------------------------------------------------
     def start_job(self, body: dict[str, Any]) -> tuple[bool, str]:
         action = str(body.get("action", ""))
@@ -717,8 +757,109 @@ class AdminApp:
             # UI явно использует двухпроходный поиск. Обычный CLI сохраняет
             # исторический relevance-only режим, пока пользователь не выберет другой.
             argv = base + gflags + ["scan", "--sort-mode", "balanced"]
+        elif action == "campaign":
+            try:
+                days = int(body.get("days", 3))
+                limit = int(body.get("limit", 100))
+            except (TypeError, ValueError):
+                return False, "days and limit must be integers"
+            if days < 1 or days > 365 or limit < 1 or limit > 100:
+                return False, "days должен быть 1–365, limit — 1–100"
+            argv = base + gflags + ["run", "campaign", "--track", track,
+                                    "--days", str(days), "--limit", str(limit),
+                                    "--sort-mode", str(body.get("sort_mode") or "newest")]
+            query_value = body.get("queries") or body.get("query") or []
+            queries = [query_value] if isinstance(query_value, str) else query_value
+            if not isinstance(queries, list):
+                return False, "queries must be a string or list"
+            for query in queries:
+                value = str(query).strip()
+                if len(value) > 200:
+                    return False, "queries must be at most 200 characters"
+                if value:
+                    argv += ["--query", value]
+            if len(queries) > 100:
+                return False, "at most 100 queries are allowed"
+            areas = body.get("areas") or body.get("area") or []
+            if isinstance(areas, (int, str)):
+                areas = [areas]
+            if not isinstance(areas, list):
+                return False, "areas must be a list"
+            try:
+                for area in areas:
+                    area_id = int(area)
+                    if area_id < 1:
+                        raise ValueError
+                    argv += ["--area", str(area_id)]
+            except (TypeError, ValueError):
+                return False, "area IDs must be positive integers"
+            if body.get("remote") is True:
+                argv += ["--remote"]
+            elif body.get("remote") is False:
+                argv += ["--no-remote"]
+            if body.get("salary_from") is not None:
+                try:
+                    salary_from = int(body["salary_from"])
+                    if salary_from < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return False, "salary_from must be a non-negative integer"
+                argv += ["--salary-from", str(salary_from)]
+            if body.get("salary_currency"):
+                argv += ["--salary-currency", str(body["salary_currency"])[:8]]
+            if body.get("pages") is not None:
+                try:
+                    pages = int(body["pages"])
+                except (TypeError, ValueError):
+                    return False, "pages must be an integer"
+                if pages < 1 or pages > 100:
+                    return False, "pages must be between 1 and 100"
+                argv += ["--pages", str(pages)]
+            if body.get("request_budget") is not None:
+                try:
+                    budget = int(body["request_budget"])
+                except (TypeError, ValueError):
+                    return False, "request_budget must be an integer"
+                if budget < 1 or budget > 10000:
+                    return False, "request_budget must be between 1 and 10000"
+                argv += ["--request-budget", str(budget)]
+        elif action in {"queue_apply_dry", "queue_apply_run"}:
+            try:
+                limit = int(body.get("limit", 10))
+            except (TypeError, ValueError):
+                return False, "limit must be an integer"
+            if limit < 1 or limit > 100:
+                return False, "limit must be between 1 and 100"
+            argv = base + gflags + ["queue", "apply", "--track", track,
+                                    "--limit", str(limit)]
+            argv += ["--dry-run"] if action == "queue_apply_dry" else ["--run"]
+            if action == "queue_apply_run":
+                if not body.get("confirm"):
+                    return False, "real sending requires explicit confirmation"
+                if not _profile_flag(self.root, track).get("reviewed", False):
+                    return False, "profile is not reviewed=true; cannot send"
+                if body.get("target"):
+                    try:
+                        target = int(body["target"])
+                    except (TypeError, ValueError):
+                        return False, "target must be an integer"
+                    if target < 1 or target > limit:
+                        return False, "target must be between 1 and limit"
+                    argv += ["--target-success", str(target)]
         elif action == "sync":
             argv = base + gflags + ["sync"]
+        elif action == "inbox_sync":
+            if not os.getenv("HH_ACCESS_TOKEN", "").strip():
+                return False, "set HH_ACCESS_TOKEN for the official read-only API before syncing"
+            try:
+                max_chats = int(body.get("max_chats", 20))
+                messages_per_chat = int(body.get("messages_per_chat", 20))
+            except (TypeError, ValueError):
+                return False, "max_chats and messages_per_chat must be integers"
+            if not 1 <= max_chats <= 100 or not 1 <= messages_per_chat <= 50:
+                return False, "max_chats must be 1-100 and messages_per_chat must be 1-50"
+            argv = base + gflags + ["inbox", "sync", "--max-chats", str(max_chats),
+                                    "--messages-per-chat", str(messages_per_chat)]
         elif action == "screen":
             argv = base + gflags + [
                 "screen", "--input", body.get("input") or _track_snapshot(self.root, track),
@@ -852,7 +993,8 @@ class AdminApp:
                     argv += ["--target-success", str(int(body["target"]))]
         else:
             return False, f"unknown action: {action}"
-        return self.runner.start(argv, f"{action}:{track}", env=self._screen_env())
+        job_env = None if action in {"campaign", "sync", "inbox_sync"} else self._screen_env()
+        return self.runner.start(argv, f"{action}:{track}", env=job_env)
 
     def _error_retry_input(self, track: str) -> tuple[Path | None, str]:
         report = _read_json(self.root / TRACKS[track]["screen_report"]) or {}
@@ -886,11 +1028,16 @@ class AdminApp:
         return path, ""
 
     def letter(self, track: str, vid: str) -> dict[str, Any]:
-        """Генерирует индивидуальное сопроводительное письмо для одной вакансии в текущем процессе."""
+        """Создаёт постоянный черновик письма по данным очереди или старого snapshot."""
         if track not in TRACKS:
             return {"error": "unknown track"}
-        item = None
+        account = self._account_for_track(track)
+        item = next((row for row in Store(self.config.db_path).list_campaign_vacancies(
+            account, track, "all", limit=1000
+        ) if str(row.get("id")) == str(vid)), None)
         for source in (Path(_track_snapshot(self.root, track)), self.root / TRACKS[track]["accepted"]):
+            if item is not None:
+                break
             data = _read_json(source) or {}
             items = data.get("items", []) if isinstance(data, dict) else []
             item = next((it for it in items if str(it.get("id", "")) == str(vid)), None)
@@ -898,23 +1045,101 @@ class AdminApp:
                 break
         if item is None:
             return {"error": "vacancy not found"}
+        store = Store(self.config.db_path)
+        existing = next((task for task in store.workflow_tasks(account, "letter")
+                         if task.get("track") == track and str(task.get("vacancy_id")) == str(vid)), None)
+        if existing and str(existing.get("draft_text") or "").strip():
+            return {"task_id": existing["task_id"], "task_status": existing["status"],
+                    "text": existing["draft_text"],
+                    "source": (existing.get("payload") or {}).get("source", "saved"),
+                    "url": item.get("url", ""), "name": item.get("name", "")}
+        profile_path = self.root / TRACKS[track]["profile"]
+        profile = _profile_flag(self.root, track)
+        try:
+            from .cover_letters import letter_mode, load_letter_profile, render_template
+
+            mode = letter_mode(profile)
+            prepared = load_letter_profile(profile, profile_path)
+            if mode == "template":
+                text = render_template(item, prepared)
+                source = "template"
+                result = {"text": text, "source": source}
+            else:
+                result = None
+        except (ConfigError, ValueError) as exc:
+            return {"error": str(exc)[:200]}
         s = self.load_settings()
         key = aitunnel_api_key(self.root, str(s.get("api_key") or ""))
-        if not key:
+        if result is None and not key:
             return {"error": "no AITUNNEL_API_KEY: задайте ключ в «Настройки»"}
+        if result is None:
+            try:
+                result = generate_letter(
+                    item, profile, self.config.data_dir / "letter-cache",
+                    model=str(s.get("model") or DEFAULT_MODEL).strip(),
+                    base_url=_validate_provider_url(str(s.get("base_url") or DEFAULT_BASE_URL)),
+                    api_key=key,
+                )
+            except (ConfigError, LettersError) as exc:
+                return {"error": str(exc)[:200]}
+        text = str(result.get("text") or "")
+        if not text.strip():
+            return {"error": "letter generator returned an empty draft"}
+        task_id = store.create_workflow_task(
+            account, "hh.ru", str(vid), track, "letter", "DRAFT",
+            payload={"source": str(result.get("source") or "generated"),
+                     "resume": str(item.get("resume") or TRACKS[track].get("resume") or ""),
+                     "manual_send_required": True},
+            draft_text=text,
+        )
+        saved = store.workflow_task(task_id, account) or {}
+        return {"task_id": task_id, "task_status": saved.get("status", "DRAFT"),
+                "text": saved.get("draft_text", text),
+                "source": result.get("source", ""), "url": item.get("url", ""),
+                "name": item.get("name", "")}
+
+    def workflow_tasks(self, track: str = "", task_type: str | None = None) -> dict[str, Any]:
+        if track and track not in TRACKS:
+            return {"error": "unknown track", "tasks": []}
+        account = self._account_for_track(track) if track else self._account_for_profile(
+            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
+        )
+        rows = Store(self.config.db_path).workflow_tasks(account, task_type)
+        if track:
+            rows = [row for row in rows if row.get("track") == track]
+        return {"account": account, "track": track or None, "tasks": rows}
+
+    def update_workflow_task(self, task_id: str, action: str, draft_text: str | None = None,
+                             track: str = "") -> dict[str, Any]:
+        if track and track not in TRACKS:
+            return {"error": "unknown track"}
+        account = self._account_for_track(track) if track else self._account_for_profile(
+            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
+        )
+        store = Store(self.config.db_path)
+        existing = store.workflow_task(task_id, account)
+        if existing is None:
+            return {"error": "workflow task not found"}
+        if track and existing.get("track") != track:
+            return {"error": "workflow task belongs to a different track"}
         try:
-            res = generate_letter(
-                item, _profile_flag(self.root, track), self.config.data_dir / "letter-cache",
-                model=str(s.get("model") or DEFAULT_MODEL).strip(),
-                base_url=_validate_provider_url(
-                    str(s.get("base_url") or DEFAULT_BASE_URL)
-                ),
-                api_key=key,
-            )
-        except (ConfigError, LettersError) as exc:
-            return {"error": str(exc)[:200]}
-        return {"text": res.get("text", ""), "source": res.get("source", ""),
-                "url": item.get("url", ""), "name": item.get("name", "")}
+            row = store.update_workflow_task(task_id, account, draft_text=draft_text, action=action)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return {"ok": True, "task": row}
+
+    def workflow_task(self, task_id: str, track: str = "") -> dict[str, Any]:
+        if track and track not in TRACKS:
+            return {"error": "unknown track"}
+        account = self._account_for_track(track) if track else self._account_for_profile(
+            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
+        )
+        row = Store(self.config.db_path).workflow_task(task_id, account)
+        if row is None:
+            return {"error": "workflow task not found"}
+        if track and row.get("track") != track:
+            return {"error": "workflow task belongs to a different track"}
+        return {"task": row}
 
     # ---- резюме и треки -------------------------------------------------
     def fetch_resumes(self, *, refresh: bool = False) -> dict[str, Any]:
@@ -1146,6 +1371,11 @@ class AdminApp:
             details.pop(str(vid), None)
         self._manual_application_details_path().write_text(json.dumps(details, ensure_ascii=False),
                                                            encoding="utf-8")
+        if on and track in TRACKS:
+            Store(self.config.db_path).record_manual_application(
+                self._account_for_track(track), "hh.ru", str(vid),
+                "owner marked as applied in local admin",
+            )
         return {"ok": True, "applied": len(s), "on": on}
 
     def _manual_application_details_path(self) -> Path:
@@ -1353,64 +1583,8 @@ class AdminApp:
         return 60
 
     def watch_control(self, action: str, minutes: int | None = None) -> dict[str, Any]:
-        if not shutil.which("systemctl"):
-            return {"error": "systemctl не найден — используйте cron (см. packaging/README)"}
-        dst_dir = Path.home() / ".config/systemd/user"
-        src_dir = self.root / "packaging"
-        out: list[str] = []
-
-        def sc(*args: str) -> tuple[int, str]:
-            try:
-                r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
-                                   text=True, timeout=15, check=False)
-                return r.returncode, (r.stdout + r.stderr).strip()
-            except (OSError, subprocess.SubprocessError) as exc:
-                return 1, str(exc)
-
-        try:
-            if action in ("install", "interval"):
-                dst_dir.mkdir(parents=True, exist_ok=True)
-                # Подставляем текущий checkout и в Environment, и в ExecStart.
-                svc = (src_dir / "applypilot-watch.service").read_text(encoding="utf-8")
-                root_value = str(self.root).replace(chr(92), chr(92) * 2).replace(
-                    chr(34), chr(92) + chr(34)
-                )
-                env_line = f'Environment="APPLYPILOT_HOME={root_value}"'
-                if re.search(r"(?m)^Environment=.*APPLYPILOT_HOME=.*$", svc):
-                    svc = re.sub(
-                        r"(?m)^Environment=.*APPLYPILOT_HOME=.*$",
-                        env_line,
-                        svc,
-                        count=1,
-                    )
-                else:
-                    svc = svc.replace("[Service]", f"[Service]\n{env_line}", 1)
-                watcher = self.root / "packaging" / "applypilot-watch.sh"
-                watcher_value = str(watcher).replace(chr(92), chr(92) * 2).replace(
-                    chr(34), chr(92) + chr(34)
-                )
-                exec_line = f'ExecStart="{watcher_value}"'
-                svc = re.sub(r"(?m)^ExecStart=.*$", exec_line, svc, count=1)
-                (dst_dir / "applypilot-watch.service").write_text(svc, encoding="utf-8")
-                tmr = (src_dir / WATCH_TIMER).read_text(encoding="utf-8")
-                mins = max(5, int(minutes or self._watch_interval(False)))
-                tmr = re.sub(r"OnUnitActiveSec\s*=\s*\S+", f"OnUnitActiveSec={mins}min", tmr)
-                (dst_dir / WATCH_TIMER).write_text(tmr, encoding="utf-8")
-                sc("daemon-reload")
-                out.append(f"units → {dst_dir}, интервал {mins} мин")
-            if action in ("install", "enable"):
-                rc, msg = sc("enable", "--now", WATCH_TIMER)
-                out.append(msg or ("включён" if rc == 0 else "не удалось включить"))
-            elif action == "interval":
-                sc("restart", WATCH_TIMER)
-                out.append("интервал обновлён")
-            elif action == "disable":
-                rc, msg = sc("disable", "--now", WATCH_TIMER)
-                out.append(msg or "выключен")
-        except OSError as exc:
-            return {"error": str(exc)[:200]}
-        return {"ok": True, "message": "; ".join(o for o in out if o) or "готово",
-                "status": self.watch_status()}
+        del action, minutes
+        return {"error": "Фоновый поиск отключён решением владельца. Запускай кампанию по команде."}
 
 
 def _track_queries(root: Path, track: str) -> set[str]:
@@ -1576,6 +1750,44 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             elif parsed.path == "/api/vacancies":
                 track = parse_qs(parsed.query).get("track", [next(iter(TRACKS), "")])[0]
                 self._send(200, app.vacancies(track))
+            elif parsed.path == "/api/campaign-queue":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [next(iter(TRACKS), "")])[0]
+                view = query.get("view", ["all"])[0]
+                try:
+                    limit = int(query.get("limit", ["100"])[0])
+                except ValueError:
+                    self._send(400, {"error": "limit must be an integer", "items": []})
+                    return
+                self._send(200, app.campaign_queue(track, view, limit))
+            elif parsed.path == "/api/campaign-history":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [""])[0]
+                try:
+                    limit = int(query.get("limit", ["20"])[0])
+                except ValueError:
+                    self._send(400, {"error": "limit must be an integer", "runs": []})
+                    return
+                self._send(200, app.campaign_history(track, limit))
+            elif parsed.path == "/api/workflow-tasks":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [""])[0]
+                task_type = query.get("type", [None])[0]
+                self._send(200, app.workflow_tasks(track, task_type))
+            elif parsed.path == "/api/workflow-task":
+                query = parse_qs(parsed.query)
+                self._send(200, app.workflow_task(
+                    query.get("task_id", [""])[0], query.get("track", [""])[0],
+                ))
+            elif parsed.path == "/api/inbox":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [""])[0]
+                try:
+                    limit = int(query.get("limit", ["100"])[0])
+                except ValueError:
+                    self._send(400, {"error": "limit must be an integer", "messages": []})
+                    return
+                self._send(200, app.inbox_messages(track, limit))
             elif parsed.path == "/api/job":
                 self._send(200, app.runner.status() or {})
             elif parsed.path == "/api/jobs":
@@ -1609,6 +1821,20 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/job":
                 ok, message = app.start_job(body)
                 self._send(200 if ok else 409, {"ok": ok, "message": message})
+            elif parsed.path == "/api/campaign-review":
+                result = app.set_campaign_review(
+                    str(body.get("track") or ""), str(body.get("id") or ""),
+                    str(body.get("state") or ""), str(body.get("reason") or ""),
+                    None if body.get("notes") is None else str(body.get("notes")),
+                )
+                self._send(200 if result.get("ok") else 400, result)
+            elif parsed.path == "/api/workflow-task":
+                result = app.update_workflow_task(
+                    str(body.get("task_id") or ""), str(body.get("action") or ""),
+                    None if body.get("draft_text") is None else str(body.get("draft_text")),
+                    str(body.get("track") or ""),
+                )
+                self._send(200 if result.get("ok") else 400, result)
             elif parsed.path == "/api/stop":
                 self._send(200, {"ok": app.runner.stop()})
             elif parsed.path == "/api/settings":
@@ -1721,7 +1947,7 @@ def serve(config: AppConfig, host: str = "127.0.0.1", port: int = 8765, open_bro
 
 
 
-INDEX_HTML = """<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ApplyPilot admin</title>
 <style>
@@ -1806,6 +2032,8 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <header><h1>ApplyPilot</h1>
 <div class="tabs" id="tabs">
 <div class="tab active" data-t="overview">Обзор</div>
+<div class="tab" data-t="campaign">Очередь</div>
+<div class="tab" data-t="inbox">Переписки</div>
 <div class="tab" data-t="vac">Вакансии</div>
 <div class="tab" data-t="apply">Отклики</div>
 <div class="tab" data-t="stats">Статистика</div>
@@ -1817,6 +2045,51 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 </header>
 <main>
 <section id="overview"></section>
+
+<section id="campaign" class="hide">
+  <div class="card">
+    <h3>Ручной поиск</h3>
+    <p class="muted">Каждый запуск создаёт snapshot и обновляет постоянную очередь SQLite. Фоновое расписание отключено.</p>
+    <div class="grid two">
+      <div class="field"><label>Трек</label><select id="ctrack"></select></div>
+      <div class="field"><label>Дней назад</label><input id="cdays" type="number" min="1" max="365" value="3"></div>
+      <div class="field"><label>Зарплата от, ₽</label><input id="csalary" type="number" min="0" placeholder="не менять критерий трека"></div>
+      <div class="field"><label>Регион HH (ID, пусто — из трека)</label><input id="carea" type="text" placeholder="113"></div>
+      <div class="field"><label>Лимит очереди, максимум 100</label><input id="climit" type="number" min="1" max="100" value="100"></div>
+      <div class="field"><label>Формат</label><select id="cremote"><option value="">как в настройках трека</option><option value="true">только удалённо</option><option value="false">без remote-фильтра</option></select></div>
+    </div>
+    <div class="field"><label>Запросы (по одному на строку; пусто — запросы трека)</label><textarea id="cqueries" rows="3"></textarea></div>
+    <div class="row"><button onclick="startCampaign()">Запустить поиск сейчас</button><span id="cmessage" class="muted"></span></div>
+  </div>
+  <div class="card" style="margin-top:12px">
+    <div class="row" style="margin:0"><label>Очередь</label><select id="cview">
+      <option value="all">все</option><option value="new">новые в последнем scan</option><option value="top">топ по score</option>
+      <option value="deferred">отложенные</option><option value="approved">одобренные</option><option value="ready">готовы к отклику</option>
+      <option value="needs_letter">нужно письмо</option><option value="needs_form">нужна анкета</option>
+      <option value="external_ats">внешняя ATS</option><option value="unknown">неясный исход</option>
+      <option value="applied">уже отправленные</option><option value="skip">пропущенные</option>
+    </select><button class="ghost mini" onclick="loadCampaignQueue()">Обновить</button><span id="cmeta" class="muted"></span></div>
+    <div class="tablewrap"><div id="ctable"></div></div>
+    <div class="row" style="margin-top:12px"><label>Лимит одобренного пакета</label><input id="capplylimit" type="number" min="1" max="100" value="5" style="width:80px">
+      <button class="ghost" onclick="campaignApply(false)">Dry-run одобренных</button>
+      <button class="danger" onclick="campaignApply(true)">Отправить одобренные</button></div>
+    <p class="muted">Реальный запуск дополнительно требует проверенного профиля, точного резюме трека и свежего успешного HH sync.</p>
+    <h3 style="margin-top:18px">Черновики и ручные действия</h3><div id="workflowtasks" class="muted">загрузка…</div>
+    <h3 style="margin-top:18px">История поисков</h3><div id="chistory" class="muted"></div>
+  </div>
+</section>
+
+<section id="inbox" class="hide">
+  <div class="card">
+    <h3>Чтение HH-переписок по команде</h3>
+    <p class="muted">Используется официальный OAuth API HH. Читаются только последние сообщения в ограниченном числе чатов. Синхронизация не помечает их прочитанными, не определяет бота по тексту и ничего не отправляет. Для запуска серверу нужен переменный среды HH_ACCESS_TOKEN.</p>
+    <div class="row"><label>Трек / аккаунт</label><select id="itrack"></select>
+      <label>Чатов максимум</label><input id="imaxchats" type="number" min="1" max="100" value="20" style="width:76px">
+      <label>Сообщений на чат</label><input id="imessages" type="number" min="1" max="50" value="20" style="width:76px">
+      <button onclick="syncInbox()">Прочитать сейчас</button><button class="ghost mini" onclick="loadInbox()">Обновить сохранённое</button></div>
+    <div id="inboxmeta" class="muted"></div><div id="inboxmessages"></div>
+  </div>
+</section>
 
 <section id="vac" class="hide">
   <div class="row"><label>Трек</label><select id="vtrack"></select>
@@ -1852,11 +2125,6 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <div class="tablewrap"><div id="trackstable"></div></div>
     <div id="trackmsg" class="muted" style="margin-top:8px"></div>
     <div id="unassigned"></div>
-  </div>
-  <div class="card" style="margin-top:12px"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Автопоиск свежих вакансий (таймер)</h3>
-    <button class="ghost mini" onclick="loadWatch()">Обновить статус</button></div>
-    <p class="muted">Регулярный скан свежих + скрининг для всех треков (systemd-таймер). Отклики остаются ручными. «Проверить свежие сейчас» доступно на вкладке «Обзор».</p>
-    <div id="watchbox" class="muted">загрузка…</div>
   </div>
   <div class="card" style="margin-top:12px;max-width:760px"><h3>Добавить трек</h3>
     <p class="muted">Можно скопировать профиль, резюме и правила поиска существующего трека, а затем задать свои запросы.</p>
@@ -1925,27 +2193,29 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <h3 id="lettertitle">Сопроводительное письмо</h3>
     <div class="muted" id="lettersub" style="margin-bottom:8px"></div>
     <textarea id="lettertext" style="min-height:280px"></textarea>
-    <div class="row"><button onclick="copyAndOpen()">Копировать и открыть на HH</button>
+    <div class="row"><button class="ghost" onclick="saveLetterDraft()">Сохранить черновик</button>
+      <button onclick="approveLetterDraft()">Одобрить этот текст</button>
+      <button onclick="copyAndOpen()">Копировать и открыть на HH</button>
       <button class="ghost" onclick="copyLetter()">Копировать</button>
       <button class="ghost" onclick="markApplied()">✓ Отметить: откликнулся</button>
       <button class="ghost" onclick="markLetterSent()">✓ Письмо отправлено на HH</button>
       <button class="ghost" onclick="closeModal()">Закрыть</button>
       <span id="letterhint" class="muted"></span></div>
-    <p class="muted">Проверь и при необходимости поправь письмо. Отклик и отправку письма делаешь на HH сам (ассистированный режим). «Отметить» уберёт вакансию из очереди откликов.</p>
+    <p class="muted">Сначала сохрани и одобри точный текст. Письмо и отклик отправляются вручную на HH; ApplyPilot ничего работодателю не отправляет. Для подтверждённой ручной отправки используй отдельную отметку.</p>
   </div>
 </div>
 
 <script>
 const $=s=>document.querySelector(s);
 const ADMIN_TOKEN="__APPLYPILOT_CSRF_TOKEN__";
-const SECTIONS=["overview","vac","apply","stats","tracks","log","settings"];
+const SECTIONS=["overview","campaign","inbox","vac","apply","stats","tracks","log","settings"];
 let tab="overview",TRACKS=[],VFILTER="";
 function setHdr(){document.documentElement.style.setProperty('--hdr',(document.querySelector('header').offsetHeight)+'px');}
 addEventListener('resize',setHdr);
 function show(t){tab=t;location.hash=t;
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
   SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));setHdr();
-  ({overview:loadOverview,vac:loadVac,apply:loadApply,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
+  ({overview:loadOverview,campaign:loadCampaign,inbox:loadInbox,vac:loadVac,apply:loadApply,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
 document.querySelectorAll(".tab").forEach(el=>el.onclick=()=>show(el.dataset.t));
 async function api(p,opt={}){const method=(opt.method||"GET").toUpperCase();
   if(method==="POST"){const headers=new Headers(opt.headers||{});headers.set("Content-Type","application/json");
@@ -1971,9 +2241,10 @@ function marks(){try{return new Set(JSON.parse(localStorage.getItem("ap_marks")|
 function saveMarks(s){try{localStorage.setItem("ap_marks",JSON.stringify([...s]))}catch(e){}}
 function toggleMark(id){const s=marks();s.has(id)?s.delete(id):s.add(id);saveMarks(s);loadVac();}
 function fillTrackSelects(tracks){TRACKS=tracks||[];
-  for(const id of ["#vtrack","#atrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
+  for(const id of ["#vtrack","#atrack","#ctrack","#itrack"]){const sel=$(id);if(!sel)continue;const cur=sel.value;
     sel.innerHTML=TRACKS.map(t=>`<option value="${escAttr(t.key)}">${esc(t.label)}</option>`).join("");
     if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
+  const campaignTrack=$("#ctrack");if(campaignTrack&&!campaignTrack.dataset.bound){campaignTrack.onchange=loadCampaignQueue;campaignTrack.dataset.bound="1";}
   const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
 
 /* ---- обзор ---- */
@@ -2018,6 +2289,69 @@ function gotoApply(track){pendingApplyTrack=track;show("apply");}
 async function job(action,track){const body={action,track:track||(TRACKS[0]&&TRACKS[0].key)||""};
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
+
+/* ---- ручная кампания и постоянная очередь ---- */
+async function loadCampaign(){
+  if(!TRACKS.length){try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}}
+  const sel=$("#ctrack");if(sel&&!sel.value&&TRACKS.length)sel.value=TRACKS[0].key;
+  await loadCampaignQueue();
+}
+async function startCampaign(){
+  const track=$("#ctrack").value,body={action:"campaign",track,days:+$("#cdays").value||3,limit:+$("#climit").value||100,
+    queries:$("#cqueries").value.split("\n").map(x=>x.trim()).filter(Boolean)};
+  const area=$("#carea").value.trim();if(area)body.areas=area.split(/[,\s]+/).filter(Boolean);
+  const salary=$("#csalary").value.trim();if(salary)body.salary_from=+salary;
+  if($("#cremote").value!=="")body.remote=$("#cremote").value==="true";
+  $("#cmessage").innerHTML='<span class="spin"></span> запускаю scan…';
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!r.ok){$("#cmessage").textContent="Не запущено: "+r.message;return;}
+  $("#cmessage").textContent="Запущено вручную; результат появится в журнале задач.";logFollow=true;logCache={};show("log");refreshJob();
+}
+async function loadCampaignQueue(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";if(!track)return;
+  const view=$("#cview").value||"all";
+  const d=await api("/api/campaign-queue?track="+encodeURIComponent(track)+"&view="+encodeURIComponent(view)+"&limit=100");
+  const rows=d.items||[];$("#cmeta").textContent=(d.error?"Ошибка: "+d.error:`${d.count||0} вакансий · фильтр ${view}`);
+  let h='<table><tr><th>#</th><th>Решение</th><th>Оценка</th><th>Вакансия</th><th>Причины и проверки</th><th>Отклик</th><th>Изменить решение</th></tr>';
+  rows.forEach((r,i)=>{
+    const title=hhLink(r.url,r.name,String(r.id));
+    const reasons=(r.reasons||[]).slice(0,6).join(", ");
+    const checks=[...(r.filter_reasons||[]),...(r.problems||[])].join(", ");
+    const salary=r.salary?`${rub(r.salary.from)}–${rub(r.salary.to)} ${esc(r.salary.currency||"")}`:"не опубликована";
+    const choice=`<select id="cdecision-${i}"><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>APPROVED</option><option>DEFERRED</option></select>`;
+    h+=`<tr><td>${i+1}</td><td><b>${esc(r.review_state||"UNREVIEWED")}</b><div class="muted">${esc(r.discovery_status||"")}</div></td>
+      <td>${safeInt(r.score)}<div class="muted">${esc(r.score_decision||"unknown")}</div></td>
+      <td>${title}<div class="muted">${esc(r.company||"")} · ${salary}</div><div class="muted">${esc(r.area||"")} · ${esc(r.experience||"")}</div></td>
+      <td class="reason"><div>${esc(reasons||"нет явных сигналов")}</div><div class="hl">${esc(checks)}</div>
+      ${r.review_reason?`<div class="muted">решение: ${esc(r.review_reason)}</div>`:""}${r.review_notes?`<div class="muted">заметки: ${esc(r.review_notes)}</div>`:""}</td>
+      <td>${esc(r.application_state||"NOT_STARTED")}${r.applied_before?'<div class="badge applied">уже есть отклик</div>':""}</td>
+      <td class="nowrap">${choice}<button class="ghost mini" onclick="saveCampaignReview(${jsArg(track)},${jsArg(r.id)},document.getElementById('cdecision-${i}').value)">Сохранить</button></td></tr>`;
+  });
+  $("#ctable").innerHTML=rows.length?h+"</table>":'<p class="muted">Очередь пока пуста. Запусти поиск по команде выше.</p>';
+  const history=await api("/api/campaign-history?track="+encodeURIComponent(track)+"&limit=10");
+  $("#chistory").innerHTML=(history.runs||[]).map(r=>`<div class="row" style="justify-content:space-between"><span><b>${esc(r.started_at)}</b> · ${esc(r.status)} · ${safeInt(r.item_count)} найдено · новых ${safeInt(r.first_seen_count)+safeInt(r.new_count)} · обновлено ${safeInt(r.updated_count)}</span><span class="muted">${esc(r.snapshot_path||"")}</span></div>`).join("")||"Запусков ещё нет.";
+  const tasks=await api("/api/workflow-tasks?track="+encodeURIComponent(track));
+  $("#workflowtasks").innerHTML=(tasks.tasks||[]).map(t=>{
+    const reason=(t.payload||{}).reason||"";
+    return `<div class="row" style="justify-content:space-between"><span><b>${esc(t.task_type)}</b> · ${esc(t.status)} · ${esc(t.vacancy_id)} · ${esc(reason)}</span>`+
+      (t.task_type==="letter"?`<button class="ghost mini" onclick="openWorkflowTask(${jsArg(t.task_id)},${jsArg(track)})">Открыть черновик</button>`:
+      '<span class="muted">Вопросы не сохранены автоматикой; нужен ручной ответ владельца</span>')+`</div>`;
+  }).join("")||"Сохранённых задач пока нет.";
+}
+async function saveCampaignReview(track,id,state){
+  const reason=prompt("Короткая причина решения (обязательна):","");if(reason===null||!reason.trim())return;
+  const notes=prompt("Заметки (необязательно):","");if(notes===null)return;
+  const r=await api("/api/campaign-review",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({track,id,state,reason:reason.trim(),notes:notes.trim()})});
+  if(!r.ok){alert("Не сохранено: "+(r.error||"ошибка"));return;}loadCampaignQueue();
+}
+async function campaignApply(real){
+  const track=$("#ctrack").value,limit=Math.max(1,Math.min(100,+$("#capplylimit").value||5));
+  if(real&&!confirm("Отправить только ранее одобренные вакансии? Нужны reviewed-профиль, точное резюме и свежая HH sync."))return;
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:real?"queue_apply_run":"queue_apply_dry",track,limit,confirm:real})});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();
+}
 
 /* ---- вакансии ---- */
 let VSTATUS="active";
@@ -2124,6 +2458,25 @@ async function runApply(action){const track=$("#atrack").value;
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();}
 
+/* ---- read-only inbox ---- */
+async function loadInbox(){
+  if(!TRACKS.length){const s=await api("/api/settings");fillTrackSelects(s.tracks);}
+  const track=$("#itrack").value||(TRACKS[0]&&TRACKS[0].key)||"";if(!track)return;
+  const d=await api("/api/inbox?track="+encodeURIComponent(track)+"&limit=100");
+  $("#inboxmeta").textContent=d.error?"Ошибка: "+d.error:(d.messages||[]).length+" сохранённых сообщений; источник отправителя берётся только из метаданных HH.";
+  const messages=d.messages||[];
+  $("#inboxmessages").innerHTML=messages.slice().reverse().map(m=>
+    `<div class="card" style="margin-top:8px"><div class="row" style="justify-content:space-between;margin:0"><b>${esc(m.sender_type)} · ${esc(m.sender_name||"без имени")}</b><span class="muted">${esc(m.sent_at)} · чат ${esc(m.thread_id)} · вакансия ${esc(m.vacancy_id||"—")}</span></div>`+
+    `<pre style="white-space:pre-wrap;max-height:220px;overflow:auto">${esc(m.body||"[нет текстового содержимого]")}</pre></div>`).join("")||'<p class="muted">Сохранённых сообщений ещё нет.</p>';
+}
+async function syncInbox(){const track=$("#itrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  const max_chats=Math.max(1,Math.min(100,+$("#imaxchats").value||20));
+  const messages_per_chat=Math.max(1,Math.min(50,+$("#imessages").value||20));
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"inbox_sync",track,max_chats,messages_per_chat})});
+  if(!r.ok){$("#inboxmeta").textContent="Не запущено: "+r.message;return;}
+  logFollow=true;logCache={};show("log");refreshJob();}
+
 /* ---- статистика ---- */
 async function loadStats(){const s=await api("/api/stats");const sp=s.spend||{};
   $("#spendcards").innerHTML=card("Баланс, ₽",rub(sp.balance),sp.balance_live?"aitunnel (live)":"из леджера")
@@ -2176,7 +2529,7 @@ async function showRunOutput(id,liveJob){const box=$("#logbox");
 function selectRun(id){logSel=id;logFollow=false;refreshJob();}
 async function stopJob(){await api("/api/stop",{method:"POST"});refreshJob();}
 
-/* ---- треки и watcher ---- */
+/* ---- треки ---- */
 async function loadTracks(refresh){if(refresh)$("#tracksmeta").innerHTML='<span class="spin"></span> читаю резюме с HH…';
   const d=await api("/api/resumes"+(refresh?"?refresh=1":""));
   fillTrackSelects((d.tracks||[]).map(t=>({key:t.key,label:t.label})));
@@ -2206,8 +2559,7 @@ async function loadTracks(refresh){if(refresh)$("#tracksmeta").innerHTML='<span 
   $("#unassigned").innerHTML=(d.error?`<div class="hl" style="margin-top:8px">${esc(d.error)}</div>`:"")
     +(un.length?`<div style="margin-top:10px" class="muted">Резюме на HH без трека: ${un.map(esc).join(", ")}. При необходимости добавь трек ниже.</div>`
     :(checked?'<div class="muted" style="margin-top:10px">Все активные резюме HH привязаны к трекам.</div>':""));
-  $("#tracksmeta").textContent="Управляй треками здесь. Удаление исключает трек из следующих запусков поиска, но сохраняет файлы профиля, отчёты и резюме на HH. «Обновить с HH» читает резюме через сессию (~10с).";
-  loadWatch();}
+  $("#tracksmeta").textContent="Управляй треками здесь. Удаление исключает трек из следующих запусков поиска, но сохраняет файлы профиля, отчёты и резюме на HH. «Обновить с HH» читает резюме через сессию (~10с).";}
 async function deleteTrack(key){const t=TRACKS.find(x=>x.key===key);if(!t)return;
   if(!confirm("Удалить трек «"+String(t.label||"")+"» из ApplyPilot?\\n\\nСледующие поиски по нему не запустятся. Файлы профиля, отчёты и резюме на HH останутся."))return;
   const msg=$("#trackmsg");msg.textContent="Удаляю трек…";
@@ -2215,23 +2567,6 @@ async function deleteTrack(key){const t=TRACKS.find(x=>x.key===key);if(!t)return
     if(r.error){msg.textContent="Ошибка: "+r.error;return;}
     await loadTracks(false);msg.textContent=`Трек «${t.label}» удалён из поиска.`;
   }catch(e){msg.textContent="Ошибка: "+e.message;}}
-async function loadWatch(){const w=await api("/api/watch");
-  if(!w.systemctl){$("#watchbox").innerHTML='<span class="hl">systemctl недоступен — используй cron (см. packaging/README).</span>';return;}
-  const active=w.active==="active";
-  let h=`<div class="row" style="margin:0">
-    <span class="chip">${w.installed?(active?'<b style="color:var(--fit)">включён</b>':'установлен, выключен'):'не установлен'}</span>
-    <label>Интервал, мин</label><input id="winterval" type="number" value="${Math.max(1,Math.min(1440,safeInt(w.interval_min,60)))}" style="width:80px">`;
-  if(!w.installed||!active)h+=`<button class="mini" onclick="watchCtl('install')">Установить и включить</button>`;
-  else h+=`<button class="ghost mini" onclick="watchCtl('interval')">Применить интервал</button><button class="danger mini" onclick="watchCtl('disable')">Выключить</button>`;
-  h+=`</div>`;
-  if(w.next)h+=`<div class="muted" style="margin-top:6px">следующий запуск: ${esc(w.next)}</div>`;
-  h+=w.log_tail?`<pre style="margin-top:8px;max-height:140px">${esc(w.log_tail)}</pre>`:'<div class="muted" style="margin-top:6px">лог автопоиска пуст</div>';
-  $("#watchbox").innerHTML=h;}
-async function watchCtl(action){const mins=+($("#winterval")&&$("#winterval").value)||60;
-  $("#watchbox").innerHTML='<span class="spin"></span> применяю…';
-  const r=await api("/api/watch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,minutes:mins})});
-  if(r.error)alert("Ошибка: "+r.error);loadWatch();}
-
 /* ---- настройки ---- */
 async function loadSettings(){const s=await api("/api/settings");fillTrackSelects(s.tracks);
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
@@ -2270,9 +2605,10 @@ async function saveTrack(){const body={key:$("#etrackkey").value,label:$("#etlab
   closeTrackEditor();await loadTracks(false);await loadSettings();$("#trackmsg").textContent="Изменения сохранены.";}
 
 /* ---- окно письма ---- */
-let modalCtx={track:"",id:""};
+let modalCtx={track:"",id:"",taskId:"",taskStatus:""};
 function closeModal(){$("#modal").classList.add("hide");}
-function openHH(){const u=safeHHUrl($("#modal").dataset.url||"");if(u)window.open(u,"_blank","noopener,noreferrer");
+function openHH(){if(modalCtx.taskStatus!=="APPROVED"){alert("Сначала одобри точный текст письма.");return;}
+  const u=safeHHUrl($("#modal").dataset.url||"");if(u)window.open(u,"_blank","noopener,noreferrer");
   if(u&&modalCtx.id)markViewed(modalCtx.id);}
 function copyLetter(){const t=$("#lettertext").value;if(navigator.clipboard)navigator.clipboard.writeText(t).then(()=>$("#letterhint").textContent="скопировано ✓").catch(()=>$("#letterhint").textContent="не удалось скопировать");}
 function copyAndOpen(){copyLetter();openHH();}
@@ -2281,27 +2617,42 @@ async function markApplied(){if(!modalCtx.id)return;
   await api("/api/applied",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:modalCtx.id,on:true,track:modalCtx.track,resume:selected.resume||""})});
   $("#letterhint").textContent="отмечено: откликнулся ✓";if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
 async function markLetterSent(){if(!modalCtx.id)return;
+  if(modalCtx.taskId&&modalCtx.taskStatus!=="APPROVED"){alert("Одобри письмо перед подтверждением отправки.");return;}
   const selected=TRACKS.find(t=>t.key===modalCtx.track)||{};
   await api("/api/letter-sent",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({id:modalCtx.id,track:modalCtx.track,resume:selected.resume||""})});
+  if(modalCtx.taskId){const done=await updateLetterTask("sent_confirmed");if(done.error){alert("Отметка старого журнала сохранена, но задача не обновлена: "+done.error);return;}}
   $("#letterhint").textContent="письмо отмечено отправленным ✓";
   if(tab==="vac")loadVac();if(tab==="overview")loadOverview();}
-async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("hide");modalCtx={track,id};
+async function updateLetterTask(action){return await api("/api/workflow-task",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({task_id:modalCtx.taskId,track:modalCtx.track,action,draft_text:$("#lettertext").value})});}
+async function saveLetterDraft(){if(!modalCtx.taskId)return;const r=await updateLetterTask("edit");
+  if(r.error){$("#letterhint").textContent="Не сохранено: "+r.error;return;}modalCtx.taskStatus="DRAFT";$("#letterhint").textContent="черновик сохранён";}
+async function approveLetterDraft(){if(!modalCtx.taskId)return;const r=await updateLetterTask("approve");
+  if(r.error){$("#letterhint").textContent="Не одобрено: "+r.error;return;}modalCtx.taskStatus="APPROVED";$("#letterhint").textContent="этот текст одобрен; отправка только вручную на HH";}
+async function openWorkflowTask(taskId,track){const r=await api("/api/workflow-task?task_id="+encodeURIComponent(taskId)+"&track="+encodeURIComponent(track));
+  if(r.error){alert(r.error);return;}const t=r.task,m=$("#modal");m.classList.remove("hide");modalCtx={track:t.track,id:t.vacancy_id,taskId:t.task_id,taskStatus:t.status};
+  const queue=await api("/api/campaign-queue?track="+encodeURIComponent(t.track)+"&view=all&limit=1000");
+  const item=(queue.items||[]).find(x=>String(x.id)===String(t.vacancy_id))||{};m.dataset.url=safeHHUrl(item.url||"");
+  $("#lettersub").textContent=(item.name||t.vacancy_id)+" · "+t.status;$("#lettertext").value=t.draft_text||"";
+  $("#letterhint").textContent="Загружен сохранённый черновик.";}
+async function genLetter(track,id,url){const m=$("#modal");m.classList.remove("hide");modalCtx={track,id,taskId:"",taskStatus:""};
   try{m.dataset.url=safeHHUrl(decodeURIComponent(url||""));}catch(e){m.dataset.url="";}
   $("#lettertitle").textContent="Сопроводительное письмо";$("#lettersub").textContent="";
   $("#letterhint").innerHTML='<span class="spin"></span> генерирую…';$("#lettertext").value="";
   const r=await api("/api/letter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({track,id})});
   if(r.error){$("#letterhint").textContent="";$("#lettertext").value="Ошибка: "+r.error;return;}
-  $("#lettersub").textContent=r.name||"";$("#lettertext").value=r.text||"";
+  modalCtx.taskId=r.task_id||"";modalCtx.taskStatus=r.task_status||"DRAFT";
+  $("#lettersub").textContent=(r.name||"")+(r.task_status?" · "+r.task_status:"");$("#lettertext").value=r.text||"";
   if(!m.dataset.url&&r.url)m.dataset.url=safeHHUrl(r.url);
   const ta=$("#lettertext");ta.style.height="auto";ta.style.height=Math.min(500,ta.scrollHeight+8)+"px";
-  $("#letterhint").textContent="готово — проверь и нажми «Копировать и открыть на HH»";}
+  $("#letterhint").textContent="черновик сохранён в SQLite; проверь, сохрани правки и одобри текст перед ручной отправкой";}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeModal();});
 
 /* ---- запуск UI ---- */
 let prevRunning=false;
 setInterval(async()=>{const running=await refreshJob();
-  if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();if(tab==="apply")refreshQueue();}
+  if(running||prevRunning){if(tab==="vac")loadVac();if(tab==="overview")loadOverview();if(tab==="apply")refreshQueue();if(tab==="campaign")loadCampaignQueue();if(tab==="inbox")loadInbox();}
   prevRunning=running;},3000);
 async function init(){setHdr();try{const s=await api("/api/settings");fillTrackSelects(s.tracks);}catch(e){}
   const h=(location.hash||"").replace("#","");show(SECTIONS.includes(h)?h:"overview");}

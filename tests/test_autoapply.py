@@ -1,4 +1,4 @@
-from applypilot.autoapply import apply_one
+from applypilot.autoapply import apply_one, verify_resume_visibility
 from applypilot.cli import _run_apply, _submission_preflight
 from applypilot.config import AppConfig
 from applypilot.session import SessionCheck
@@ -34,26 +34,47 @@ class _Locator:
         selector = self.selector
         if self.scope == "dialog_root":
             return 1 if self.page.dialog else 0
+        if selector in {"[role='dialog']", '[role="dialog"]'}:
+            return int(self.page.dialog)
         if "vacancy-response-link" in selector:
             return 1 if self.page.state == "initial" else 0
         if "vacancy-response-letter-input" in selector:
-            return 1 if self.page.dialog else 0
+            return 1 if self.page.dialog or (
+                self.page.full_page_response and self.page.state in {"after_response", "submitted"}
+            ) else 0
         if "vacancy-response-submit-popup" in selector:
-            return 1 if self.page.dialog else 0
+            return 1 if self.page.dialog or (
+                self.page.full_page_response and self.page.state in {"after_response", "submitted"}
+            ) else 0
         if "resume-title" in selector:
             if self.scope == "dialog":
                 return self.page.resume_count if self.page.dialog else 0
             return self.page.global_resume_count
         if "task-body" in selector or "vacancy-response-popup__screening" in selector:
-            return self.page.question_count if self.page.dialog else 0
+            return self.page.question_count if self.page.dialog or self.page.full_page_response else 0
         return 1
 
+    def wait_for(self, state=None, timeout=None):
+        assert state == "visible"
+        if "vacancy-response-submit-popup" in self.selector and self.page.delay_submit_until_wait:
+            self.page.waited_for_submit = True
+            return
+        assert self.is_visible()
+        self.page.waited_for_submit = True
+
     def is_visible(self, timeout=None):
+        if "vacancy-response-submit-popup" in self.selector and (
+            self.page.delay_submit_until_wait and not self.page.waited_for_submit
+        ):
+            return False
         if self.scope == "dialog_root":
             return self.page.dialog
         if "resume-title" in self.selector and self.page.resume_filter:
             return self.page.resume_visible
         return self.count() > 0
+
+    def is_enabled(self, timeout=None):
+        return self.page.submit_enabled
 
     def inner_text(self, timeout=None):
         if "resume-title" in self.selector:
@@ -75,6 +96,8 @@ class _Locator:
             self.page.state = "after_response"
             self.page.dialog = self.page.dialog_after_response
             self.page.body = self.page.body_after_response
+            if self.page.full_page_response:
+                self.page.url = "https://hh.ru/applicant/vacancy_response?vacancyId=1"
         elif "vacancy-response-submit-popup" in self.selector:
             self.page.state = "submitted"
             self.page.body = self.page.body_after_submit
@@ -90,6 +113,9 @@ class _Page:
         self.state = "initial"
         self.dialog = False
         self.dialog_after_response = dialog_after_response
+        self.full_page_response = False
+        self.delay_submit_until_wait = False
+        self.waited_for_submit = False
         self.body_after_response = body_after_response
         self.body_after_submit = "Pending"
         self.resume_count = 1
@@ -97,6 +123,7 @@ class _Page:
         self.resume_titles = ["Python", "Python", "Python"]
         self.resume_visible = True
         self.question_count = 0
+        self.submit_enabled = True
         self.resume_filter = ""
         self.response_href = ""
         self.clicks = []
@@ -476,7 +503,7 @@ def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, mo
     config = AppConfig(tmp_path, tmp_path / "data", tmp_path / "profile.toml")
     store = Store(config.db_path)
     selected = [
-        {"id": value, "url": f"https://hh.ru/vacancy/{value}", "resume": "Resume"}
+        {"id": value, "url": f"https://hh.ru/vacancy/{value}", "resume": "Resume", "track": "ai"}
         for value in ("manual", "one", "two", "unused")
     ]
     calls = []
@@ -498,6 +525,14 @@ def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, mo
 
     monkeypatch.setattr("applypilot.autoapply.apply_one", apply)
     monkeypatch.setattr("applypilot.cli.save_state", lambda *_args: None)
+
+    def final_sync(_state_path, sync_store, account="default", **_kwargs):
+        rows = [{"vacancy_id": vacancy_id, "status": "not_viewed"}
+                for vacancy_id in calls if vacancy_id in {"one", "two"}]
+        sync_store.replace_negotiation_statuses(rows, account, snapshot_status="ok")
+        return rows
+
+    monkeypatch.setattr("applypilot.negotiations.sync_statuses", final_sync)
     result = _run_apply(
         config, store, selected, "run", "account", tmp_path / "input.json", 4,
         target_success=2,
@@ -509,3 +544,104 @@ def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, mo
     assert summary is not None
     assert summary["run"]["status"] == "target_reached"
     assert summary["counts"] == {"needs_manual": 1, "success": 2, "prepared": 1}
+    assert store.negotiation_ids("account") == {"one", "two"}
+
+def test_stale_visibility_banner_requires_explicit_current_verification():
+    page = _Page(body_after_response="Чтобы откликнуться, поменяйте видимость резюме.")
+    result = apply_one(page, _item(), "Python")
+    assert result.status == "needs_manual"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
+def test_verified_public_visibility_allows_enabled_hh_submit():
+    page = _Page(body_after_response="Чтобы откликнуться, поменяйте видимость резюме.")
+    result = apply_one(page, _item(), "Python", visibility_verified=True)
+    assert result.status == "success"
+    assert sum("submit-popup" in selector for selector in page.clicks) == 1
+
+
+def test_verified_public_visibility_never_overrides_disabled_submit():
+    page = _Page(body_after_response="Чтобы откликнуться, поменяйте видимость резюме.")
+    page.submit_enabled = False
+    result = apply_one(page, _item(), "Python", visibility_verified=True)
+    assert result.status == "needs_manual"
+    assert result.note == "visibility warning and submit is disabled"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
+def test_live_resume_visibility_verification_checks_exact_resume_id_and_title():
+    resume_id = "a" * 40
+    title = "AI/LLM Engineer / AI Agent Engineer"
+
+    class ReadonlyPage:
+        url = ""
+
+        def __init__(self, body):
+            self.body = body
+            self.closed = False
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+
+        def locator(self, selector):
+            assert selector == "body"
+            return self
+
+        def inner_text(self, timeout=None):
+            return self.body
+
+        def close(self):
+            self.closed = True
+
+        def wait_for_timeout(self, _millis):
+            pass
+
+    class Context:
+        def __init__(self, body):
+            self.page = ReadonlyPage(body)
+
+        def new_page(self):
+            return self.page
+
+    good = Context(f"{title} Видимость резюме Видно всем работодателям, зарегистрированным на hh.ru")
+    assert verify_resume_visibility(good, resume_id, title)
+    assert good.page.closed
+    wrong_title = Context("Backend Developer Видимость резюме Видно всем работодателям, зарегистрированным на hh.ru")
+    assert not verify_resume_visibility(wrong_title, resume_id, title)
+    assert wrong_title.page.closed
+    assert not verify_resume_visibility(good, "bad-resume-id", title)
+
+def test_full_page_hh_response_waits_for_visible_submit_and_sends_one():
+    page = _Page(dialog_after_response=False, body_after_response="Full page response")
+    page.full_page_response = True
+    page.global_resume_count = 1
+    page.resume_titles = ["Python"]
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "success"
+    assert page.waited_for_submit
+    assert sum("submit-popup" in selector for selector in page.clicks) == 1
+
+
+def test_full_page_hh_screening_questions_require_manual_review():
+    page = _Page(dialog_after_response=False, body_after_response="Full page response")
+    page.full_page_response = True
+    page.global_resume_count = 1
+    page.question_count = 3
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "needs_manual"
+    assert result.note == "screening questions require manual review"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+def test_delayed_popup_submit_is_waited_for_before_unknown():
+    page = _Page()
+    page.delay_submit_until_wait = True
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "success"
+    assert page.waited_for_submit
+    assert sum("submit-popup" in selector for selector in page.clicks) == 1

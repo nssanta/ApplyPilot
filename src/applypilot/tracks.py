@@ -1,6 +1,6 @@
 """Конфигурация независимых поисковых треков.
 
-Модуль намеренно не зависит от UI: CLI и watcher загружают тот же набор треков,
+Модуль намеренно не зависит от UI: CLI и локальная панель загружают тот же набор треков,
 не импортируя реализацию web-admin.
 """
 
@@ -129,7 +129,7 @@ def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
 
     normalised = _normalise_entries(entries)
     lines = [
-        "# Треки поиска для ApplyPilot. Конфиг общий для CLI/watch/UI.",
+        "# Треки поиска для ApplyPilot. Конфиг общий для CLI/UI.",
         "# key/type(ai|infra|general)/profile/search/resume; пути только внутри private/.",
         "",
     ]

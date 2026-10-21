@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -32,6 +33,47 @@ def allowed_hh_url(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.hostname or ""
     return parsed.scheme == "https" and (host == "hh.ru" or host.endswith(".hh.ru"))
+
+
+def verify_resume_visibility(context, resume_id: str, resume_title: str) -> bool:
+    """Read the exact HH resume page before permitting a stale visibility banner.
+
+    This never changes resume settings. An unrecognized title, ID, URL, missing
+    visibility indicator or network error blocks the override.
+    """
+    if not re.fullmatch(r"[a-f0-9]{32,64}", resume_id, flags=re.IGNORECASE):
+        return False
+    if not str(resume_title).strip():
+        return False
+    verify_page = None
+    try:
+        verify_page = context.new_page()
+        verify_page.goto(
+            f"https://hh.ru/resume/{resume_id}", wait_until="domcontentloaded", timeout=30000
+        )
+        page_path = urlparse(str(verify_page.url)).path.rstrip("/")
+        if not allowed_hh_url(str(verify_page.url)) or not page_path.endswith(f"/resume/{resume_id}"):
+            return False
+        for check in range(5):
+            text = verify_page.locator("body").inner_text(timeout=5000)
+            flat = " ".join(text.split()).casefold()
+            if (
+                " ".join(str(resume_title).split()).casefold() in flat
+                and "видимость резюме видно всем работодателям, зарегистрированным на hh.ru" in flat
+            ):
+                return True
+            if check < 4:
+                verify_page.wait_for_timeout(700)
+        return False
+    except Exception:
+        LOGGER.debug("Could not independently verify HH resume visibility", exc_info=True)
+        return False
+    finally:
+        if verify_page is not None:
+            try:
+                verify_page.close()
+            except Exception:
+                LOGGER.debug("Could not close visibility verification page", exc_info=True)
 
 
 def _response_dialog(page, submit):
@@ -110,7 +152,8 @@ def _wait_for_confirmation(page, timeout_seconds: float) -> ApplyResult | None:
 
 
 def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bool = False,
-              confirmation_timeout_seconds: float = 15.0) -> ApplyResult:
+              confirmation_timeout_seconds: float = 15.0,
+              visibility_verified: bool = False) -> ApplyResult:
     if not allowed_hh_url(str(item.get("url", ""))):
         return ApplyResult("needs_manual", "URL is not an allowed HH hostname")
     if not resume.strip():
@@ -150,15 +193,55 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         if _contains_captcha(body):
             return ApplyResult("unknown", "CAPTCHA detected after first response action")
         submit = page.locator(SUBMIT_SELECTOR).first
+        # The first click may start a slow navigation while the URL still
+        # appears to be /vacancy/..., or an AJAX popup may render late.
+        # Wait for the one legitimate HH submit control before classifying
+        # absence of a follow-up form as ambiguous. Never click during wait.
+        if not submit.is_visible(timeout=1000):
+            try:
+                submit.wait_for(state="visible", timeout=8500)
+            except Exception:
+                LOGGER.debug("HH response control did not appear within the grace period", exc_info=True)
+            body = page.locator("body").inner_text(timeout=5000).lower()
+            if "отклик отправлен" in body or "вы откликнулись" in body:
+                return ApplyResult("success", "confirmed after delayed HH response")
+            if "вы уже откликались" in body or "уже откликались" in body:
+                return ApplyResult("already_applied", "HH reports an existing application")
+            if _contains_captcha(body):
+                return ApplyResult("unknown", "CAPTCHA detected while waiting for HH response")
+        # HH has two legitimate response interfaces: a popup and a separate
+        # /applicant/vacancy_response page. Playwright's is_visible() does not
+        # wait for loading, so the latter could previously become "unknown"
+        # before its submit control and screening questions had rendered.
+        if urlparse(str(page.url)).path.rstrip("/") == "/applicant/vacancy_response":
+            try:
+                submit.wait_for(state="visible", timeout=10000)
+            except Exception:
+                LOGGER.debug("HH full-page response form did not become ready", exc_info=True)
+            page.wait_for_timeout(600)
+            body = page.locator("body").inner_text(timeout=5000).lower()
+            if "отклик отправлен" in body or "вы откликнулись" in body:
+                return ApplyResult("success", "confirmed on HH full-page response")
+            if "вы уже откликались" in body or "уже откликались" in body:
+                return ApplyResult("already_applied", "HH reports an existing application")
+            if _contains_captcha(body):
+                return ApplyResult("unknown", "CAPTCHA detected in full-page response")
         dialog = _response_dialog(page, submit)
         if dialog is None and not submit.is_visible(timeout=2000):
+            if has_screening_form(page):
+                return ApplyResult("needs_manual", "screening questions require manual review")
             return ApplyResult("unknown", "first response action had no follow-up dialog")
         response_root = dialog or page
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
         if _contains_captcha(response_text):
             return ApplyResult("unknown", "CAPTCHA detected after first response action")
         if "поменяйте видимость резюме" in response_text:
-            return ApplyResult("needs_manual", "resume visibility must be changed manually")
+            if not visibility_verified:
+                return ApplyResult("needs_manual", "resume visibility must be changed manually")
+            # HH may display a stale warning after the exact resume is confirmed
+            # public on its own page. Do not override a disabled submit control.
+            if not submit.is_enabled(timeout=2000):
+                return ApplyResult("needs_manual", "visibility warning and submit is disabled")
         if "сопроводительное письмо обязательное" in response_text and not cover_letter.strip():
             return ApplyResult("needs_manual", "required cover letter is missing")
         if has_screening_form(response_root):

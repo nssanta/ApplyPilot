@@ -8,6 +8,7 @@ import random
 import sys
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,85 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--experience", action="append")
     scan_cmd.add_argument("--work-format", action="append")
 
+    run_cmd = sub.add_parser("run", help="запустить ручную операцию")
+    run_sub = run_cmd.add_subparsers(dest="run_action", required=True)
+    campaign = run_sub.add_parser("campaign", help="выполнить HH scan и сохранить очередь вакансий")
+    campaign.add_argument("--track", required=True, help="ключ трека из private/config/tracks.toml")
+    campaign.add_argument("--query", action="append", help="поисковая фраза; можно указать несколько раз")
+    campaign.add_argument("--area", type=int, action="append", help="регион HH; можно указать несколько раз")
+    campaign.add_argument("--days", type=int, default=3)
+    campaign.add_argument("--pages", type=int)
+    campaign.add_argument("--request-budget", type=int)
+    campaign.add_argument("--details-limit", type=int)
+    campaign.add_argument("--limit", type=int, default=100, help="верхняя граница очереди")
+    campaign.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
+    campaign.add_argument("--salary-from", type=int)
+    campaign.add_argument("--salary-currency")
+    campaign.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"), default="newest")
+    campaign.add_argument("--preset", choices=PRESET_CHOICES)
+
+    queue = sub.add_parser("queue", help="постоянная очередь вакансий")
+    queue_sub = queue.add_subparsers(dest="queue_action", required=True)
+    queue_list = queue_sub.add_parser("list", help="показать вакансии из SQLite")
+    queue_list.add_argument("--track")
+    queue_list.add_argument("--view", choices=(
+        "all", "new", "top", "deferred", "approved", "ready", "needs_letter", "needs_form",
+        "external_ats", "unknown", "applied", "skip",
+    ), default="all")
+    queue_list.add_argument("--limit", type=int, default=100)
+    queue_list.add_argument("--json", action="store_true")
+    queue_set = queue_sub.add_parser("set", help="сохранить решение владельца по вакансии")
+    queue_set.add_argument("--track", required=True)
+    queue_set.add_argument("--id", required=True)
+    queue_set.add_argument("--state", required=True,
+                           choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
+    queue_set.add_argument("--reason", default="")
+    queue_set.add_argument("--notes")
+    queue_history = queue_sub.add_parser("history", help="история запусков поиска")
+    queue_history.add_argument("--track")
+    queue_history.add_argument("--limit", type=int, default=20)
+    queue_history.add_argument("--json", action="store_true")
+    queue_apply = queue_sub.add_parser("apply", help="dry-run или явный запуск по APPROVED из очереди")
+    queue_apply.add_argument("--track", required=True)
+    queue_apply.add_argument("--limit", type=int, default=10)
+    apply_mode = queue_apply.add_mutually_exclusive_group(required=True)
+    apply_mode.add_argument("--dry-run", action="store_true")
+    apply_mode.add_argument("--run", action="store_true")
+    queue_apply.add_argument("--target-success", type=int)
+
+    workflow = sub.add_parser("workflow", help="сохранённые письма и ручные формы")
+    workflow_sub = workflow.add_subparsers(dest="workflow_action", required=True)
+    workflow_list = workflow_sub.add_parser("list", help="показать постоянные задачи")
+    workflow_list.add_argument("--track")
+    workflow_list.add_argument("--type", choices=("letter", "form"))
+    workflow_list.add_argument("--json", action="store_true")
+    workflow_show = workflow_sub.add_parser("show", help="открыть сохранённую задачу")
+    workflow_show.add_argument("--track")
+    workflow_show.add_argument("--id", required=True)
+    letter_preview = workflow_sub.add_parser("letter-preview", help="создать постоянный черновик письма")
+    letter_preview.add_argument("--track", required=True)
+    letter_preview.add_argument("--id", required=True)
+    workflow_edit = workflow_sub.add_parser("edit", help="заменить текст черновика")
+    workflow_edit.add_argument("--track", required=True)
+    workflow_edit.add_argument("--id", required=True, dest="task_id")
+    workflow_edit.add_argument("--text", required=True)
+    workflow_approve = workflow_sub.add_parser("approve", help="одобрить точный сохранённый текст")
+    workflow_approve.add_argument("--track", required=True)
+    workflow_approve.add_argument("--id", required=True, dest="task_id")
+    workflow_sent = workflow_sub.add_parser("sent-confirmed", help="отметить ручную отправку письма")
+    workflow_sent.add_argument("--track", required=True)
+    workflow_sent.add_argument("--id", required=True, dest="task_id")
+
+    inbox = sub.add_parser("inbox", help="только вручную запущенное чтение HH-переписок")
+    inbox_sub = inbox.add_subparsers(dest="inbox_action", required=True)
+    inbox_sync = inbox_sub.add_parser("sync", help="прочитать ограниченную порцию чатов HH")
+    inbox_sync.add_argument("--max-chats", type=int, default=20)
+    inbox_sync.add_argument("--messages-per-chat", type=int, default=20)
+    inbox_list = inbox_sub.add_parser("list", help="показать сохранённые сообщения")
+    inbox_list.add_argument("--thread")
+    inbox_list.add_argument("--limit", type=int, default=100)
+    inbox_list.add_argument("--json", action="store_true")
+
     for name, help_text in (("plan", "офлайн-отбор кандидатов"), ("apply", "подготовить или отправить отклики")):
         cmd = sub.add_parser(name, help=help_text)
         cmd.add_argument("--input", required=True, type=Path)
@@ -153,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--source", required=True, type=Path)
     history_sub.add_parser("reconcile").add_argument("--input", required=True, type=Path)
     sync_cmd = sub.add_parser("sync", help="прочитать статусы откликов без сообщений")
+    sync_cmd.add_argument("--track", help="использовать профиль и SQLite-контекст трека")
     sync_cmd.add_argument("--pages", type=int,
                           help="максимум страниц откликов; без значения читаются страницы до пустого ответа HH")
     sync_cmd.add_argument("--output", type=Path, help="приватный JSON-отчёт синхронизации")
@@ -222,6 +303,32 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
             if key in search:
                 profile[key] = search[key]
     return profile
+
+
+def _track_config(config: AppConfig, track: str, *, profile_override: bool = False,
+                  search_override: bool = False) -> tuple[AppConfig, dict[str, Any]]:
+    """Возвращает конфигурацию выбранного трека с путями, ограниченными tracks.py."""
+    from .tracks import load_tracks
+
+    tracks = load_tracks(config.root)
+    if track not in tracks:
+        raise ConfigError(f"unknown track: {track}")
+    item = tracks[track]
+    profile_path = config.profile_path if profile_override else config.root / item["profile"]
+    search_path = config.search_path if search_override else config.root / item["search"]
+    return replace(config, profile_path=profile_path.resolve(), search_path=search_path.resolve()), item
+
+
+def _campaign_view(config: AppConfig, track: str | None, *, profile_override: bool,
+                   search_override: bool) -> tuple[Store, str, str | None]:
+    if track:
+        selected, _ = _track_config(config, track, profile_override=profile_override,
+                                    search_override=search_override)
+        profile = _profile(selected, effective_search(selected.load_search()))
+        account = _account(profile)
+        return Store(selected.db_path), account, track
+    profile = _profile(config)
+    return Store(config.db_path), _account(profile), None
 
 
 def _account(profile: dict) -> str:
@@ -324,6 +431,304 @@ def main(argv: list[str] | None = None) -> int:
         result = check_session(session_path)
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
+    if args.command == "run" and args.run_action == "campaign":
+        try:
+            selected_config, track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search(), args.preset)
+            profile = _profile(selected_config, search)
+            from .campaigns import run_campaign
+
+            result = run_campaign(
+                selected_config, args.track, profile, search, queries=args.query, areas=args.area,
+                days=args.days, pages=args.pages, request_budget=args.request_budget,
+                details_limit=args.details_limit, limit=args.limit, only_remote=args.remote,
+                salary_from=args.salary_from, salary_currency=args.salary_currency,
+                sort_mode=args.sort_mode, track_resume=str(track_info.get("resume") or ""),
+                preset=args.preset,
+            )
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"campaign: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            LOGGER.exception("Manual campaign failed")
+            print(f"campaign: error ({type(exc).__name__}: {str(exc)[:200]})", file=sys.stderr)
+            return 3
+        counts = result["summary"]
+        print(f"campaign: {result['campaign_id']} · track={result['track']} · status={result['status']}")
+        print(f"Найдено: {counts['items']} · впервые: {counts['first_seen']} · "
+              f"новые после предыдущего scan: {counts['new_since_previous']} · "
+              f"обновлены: {counts['updated']} · уже известны: {counts['known']}")
+        print(f"FIT: {result['score_counts']['fit']} · MAYBE/не хватает данных: {result['score_counts']['maybe']} · "
+              f"SKIP по критериям: {result['score_counts']['skip']} · "
+              f"уже есть в истории откликов/HH: {counts['applied_before']} · ошибки/неполнота: {counts['errors']}")
+        print(f"snapshot: {result['snapshot']}")
+        if result["segment_errors"]:
+            print("scan_notes:")
+            for error in result["segment_errors"][:12]:
+                print(f"  - {error[:240]}")
+        print(f"\nТоп очереди (эвристическая сортировка; это не вероятность оффера): {len(result['top'])}")
+        for index, item in enumerate(result["top"], 1):
+            problems = ", ".join(item.get("problems") or [])
+            reasons = ", ".join(item.get("reasons") or [])
+            print(f"{index:>3}. [{item.get('score_decision','?')}/{item.get('filter_status','?')}] "
+                  f"{item.get('score',0):>3} · {item.get('id')} · {item.get('name','')}")
+            print(f"     {item.get('company','')} · зарплата: {item.get('salary') or 'не опубликована'} · "
+                  f"решение: {item.get('review_state','UNREVIEWED')} · "
+                  f"отклик: {item.get('application_state','NOT_STARTED')}")
+            if reasons:
+                print(f"     за: {reasons[:260]}")
+            if problems or item.get("filter_reasons"):
+                print(f"     проверить: {', '.join([*item.get('filter_reasons', []), *item.get('problems', [])])[:300]}")
+            if item.get("url"):
+                print(f"     {item['url']}")
+        return 2 if result["status"] == "partial" else 0
+    if args.command == "queue":
+        try:
+            if args.queue_action == "list":
+                store, account, track = _campaign_view(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                rows = store.list_campaign_vacancies(account, track, args.view, args.limit)
+                if args.json:
+                    print(json.dumps({"account": account, "track": track, "view": args.view,
+                                      "count": len(rows), "items": rows}, ensure_ascii=False, indent=2))
+                    return 0
+                print(f"queue: {args.view}; track={track or 'all'}; items={len(rows)}")
+                for index, item in enumerate(rows, 1):
+                    print(f"{index:>3}. {item.get('id')} · {item.get('review_state')} · "
+                          f"{item.get('application_state')} · score={item.get('score')} · "
+                          f"{item.get('name','')} — {item.get('company','')}")
+                    print(f"     обнаружена: {item.get('discovery_status')} · "
+                          f"фильтр: {item.get('filter_status')} · причины: "
+                          f"{', '.join(item.get('reasons') or [])[:220]}")
+                    if item.get("problems") or item.get("filter_reasons"):
+                        print(f"     проверить: {', '.join([*item.get('filter_reasons', []), *item.get('problems', [])])[:260]}")
+                    if item.get("url"):
+                        print(f"     {item['url']}")
+                return 0
+            if args.queue_action == "history":
+                store, account, track = _campaign_view(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                rows = store.campaign_history(account, track, args.limit)
+                if args.json:
+                    print(json.dumps(rows, ensure_ascii=False, indent=2))
+                else:
+                    for row in rows:
+                        print(f"{row['campaign_id']} · {row['track']} · {row['status']} · "
+                              f"{row['started_at']} · items={row['item_count']} · "
+                              f"new={row['first_seen_count'] + row['new_count']} · "
+                              f"updated={row['updated_count']} · errors={row['error_count']}")
+                        print(f"     {row['snapshot_path']}")
+                return 0
+            if args.queue_action == "set":
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search())
+                account = _account(_profile(selected_config, search))
+                Store(selected_config.db_path).set_review_state(
+                    account, "hh.ru", args.id, args.state, reason=args.reason, notes=args.notes,
+                    track=args.track,
+                )
+                print(f"queue: {args.id} -> {args.state.upper()} (track={args.track})")
+                return 0
+            if args.queue_action == "apply":
+                if args.limit < 1 or args.limit > 100:
+                    print("--limit must be between 1 and 100", file=sys.stderr)
+                    return 2
+                if args.target_success is not None and (args.target_success < 1 or args.target_success > args.limit):
+                    print("--target-success must be positive and no greater than --limit", file=sys.stderr)
+                    return 2
+                selected_config, track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search())
+                profile = _profile(selected_config, search)
+                account = _account(profile)
+                store = Store(selected_config.db_path)
+                from .campaigns import write_approved_input
+
+                input_path, selected = write_approved_input(selected_config, args.track, account, args.limit)
+                if input_path is None or not selected:
+                    print("approved queue is empty or every approved vacancy is blocked", file=sys.stderr)
+                    return 2
+                expected_resume = str(track_info.get("resume") or "").strip()
+                if not expected_resume:
+                    print("track has no exact HH resume configured; apply is blocked", file=sys.stderr)
+                    return 2
+                mismatches = [str(item.get("id")) for item in selected
+                              if str(item.get("resume") or "").strip() != expected_resume]
+                if mismatches:
+                    print(f"resume mismatch; expected {expected_resume!r}; blocked IDs: {', '.join(mismatches)}",
+                          file=sys.stderr)
+                    return 2
+                run_id = uuid.uuid4().hex
+                if args.dry_run:
+                    print(f"approved items: {len(selected)}; sync_status="
+                          f"{(store.latest_sync(account) or {}).get('status','missing')} (dry-run)")
+                    return _run_dry(store, selected, run_id, account, input_path, args.limit)
+                sync = store.latest_sync(account)
+                max_age_hours = max(1, int((profile.get("apply") or {}).get("sync_max_age_hours", 24)))
+                fresh = False
+                if sync and sync.get("status") == "ok":
+                    try:
+                        fetched_at = datetime.fromisoformat(str(sync["created_at"]))
+                        if fetched_at.tzinfo is None:
+                            fetched_at = fetched_at.replace(tzinfo=UTC)
+                        fresh = datetime.now(UTC) - fetched_at.astimezone(UTC) <= timedelta(hours=max_age_hours)
+                    except (KeyError, ValueError):
+                        fresh = False
+                if not fresh:
+                    print(f"sync_stale: run `applypilot sync --track {args.track}` successfully before --run "
+                          f"(max age {max_age_hours}h)", file=sys.stderr)
+                    return 2
+                print(f"explicit apply run: {len(selected)} approved vacancy/vacancies; sync age <= {max_age_hours}h")
+                return _run_apply(selected_config, store, selected, run_id, account,
+                                  input_path, args.limit, args.target_success)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"queue: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+    if args.command == "workflow":
+        try:
+            if args.workflow_action == "list":
+                store, account, track = _campaign_view(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                tasks = store.workflow_tasks(account, args.type)
+                if track:
+                    tasks = [task for task in tasks if task.get("track") == track]
+                if args.json:
+                    print(json.dumps(tasks, ensure_ascii=False, indent=2))
+                else:
+                    for task in tasks:
+                        print(f"{task['task_id']} · {task['task_type']} · {task['status']} · "
+                              f"track={task['track']} vacancy={task['vacancy_id']} · {task['updated_at']}")
+                        reason = str((task.get("payload") or {}).get("reason") or "")
+                        if reason:
+                            print(f"     причина: {reason[:240]}")
+                return 0
+            if args.workflow_action == "show":
+                store, account, track = _campaign_view(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                task = store.workflow_task(args.id, account)
+                if task is None or (track and task.get("track") != track):
+                    print(f"workflow task not found: {args.id}", file=sys.stderr)
+                    return 1
+                print(json.dumps(task, ensure_ascii=False, indent=2))
+                return 0
+            selected_config, track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search())
+            profile = _profile(selected_config, search)
+            account = _account(profile)
+            store = Store(selected_config.db_path)
+            if args.workflow_action == "letter-preview":
+                item = next((row for row in store.list_campaign_vacancies(
+                    account, args.track, "all", limit=1000, source="hh.ru"
+                ) if str(row.get("id")) == str(args.id)), None)
+                if item is None:
+                    print(f"vacancy not found in persistent queue: {args.id}", file=sys.stderr)
+                    return 1
+                existing = next((task for task in store.workflow_tasks(account, "letter")
+                                 if task.get("track") == args.track
+                                 and str(task.get("vacancy_id")) == str(args.id)), None)
+                if existing and str(existing.get("draft_text") or "").strip():
+                    print(f"task_id: {existing['task_id']}; status: {existing['status']}; source: saved")
+                    print(existing["draft_text"])
+                    return 0
+                try:
+                    draft, source = _prepare_cover_letter(selected_config, item, profile)
+                except (ConfigError, RuntimeError) as exc:
+                    print(f"cover letter unavailable: {exc}", file=sys.stderr)
+                    return 2 if isinstance(exc, ConfigError) else 3
+                if not draft.strip():
+                    print("cover letter mode is off or returned an empty draft", file=sys.stderr)
+                    return 2
+                task_id = store.create_workflow_task(
+                    account, "hh.ru", str(args.id), args.track, "letter", "DRAFT",
+                    payload={"source": source, "resume": str(item.get("resume") or track_info.get("resume") or ""),
+                             "manual_send_required": True},
+                    draft_text=draft,
+                )
+                task = store.workflow_task(task_id, account) or {}
+                print(f"task_id: {task_id}; status: {task.get('status', 'DRAFT')}; source: {source}")
+                print(task.get("draft_text", draft))
+                return 0
+            existing = store.workflow_task(args.task_id, account)
+            if existing is None or existing.get("track") != args.track:
+                print("workflow task not found for this track", file=sys.stderr)
+                return 1
+            try:
+                task = store.update_workflow_task(
+                    args.task_id, account,
+                    draft_text=args.text if args.workflow_action == "edit" else None,
+                    action="edit" if args.workflow_action == "edit" else
+                    "approve" if args.workflow_action == "approve" else "sent_confirmed",
+                )
+            except ValueError as exc:
+                print(f"workflow: error ({exc})", file=sys.stderr)
+                return 2
+            if task.get("track") != args.track:
+                print("workflow task belongs to a different track", file=sys.stderr)
+                return 2
+            print(f"workflow: {task['task_id']} · {task['status']}")
+            return 0
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"workflow: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+    if args.command == "inbox":
+        try:
+            profile = _profile(config, effective_search(config.load_search()))
+            account = _account(profile)
+            store = Store(config.db_path)
+            if args.inbox_action == "sync":
+                from .inbox import InboxSyncError, sync_hh_inbox
+
+                token = os.getenv("HH_ACCESS_TOKEN", "")
+                try:
+                    result = sync_hh_inbox(
+                        store, token, account, max_chats=args.max_chats,
+                        messages_per_chat=args.messages_per_chat,
+                    )
+                except InboxSyncError as exc:
+                    print(f"inbox sync: {exc}", file=sys.stderr)
+                    return 2
+                print(f"inbox sync: {result['status']}; chats={result['chats_checked']} · "
+                      f"received={result['messages_received']} · new={result['messages_saved']} · "
+                      f"truncated={result['truncated']}")
+                for error in result["errors"][:10]:
+                    print(f"  note: {error}")
+                return 2 if result["status"] == "partial" else 0
+            if not 1 <= args.limit <= 1000:
+                print("--limit must be between 1 and 1000", file=sys.stderr)
+                return 2
+            messages = store.inbox_messages(account, args.thread)[-args.limit:]
+            if args.json:
+                print(json.dumps(messages, ensure_ascii=False, indent=2))
+            else:
+                for message in messages:
+                    print(f"{message['sent_at']} · {message['sender_type']} · "
+                          f"{message['sender_name']} · thread={message['thread_id']} "
+                          f"vacancy={message['vacancy_id']}")
+                    if message["body"]:
+                        print(f"     {message['body']}")
+            return 0
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"inbox: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
     if args.command == "scan":
         raw_search = config.load_search()
         try:
@@ -634,26 +1039,39 @@ def main(argv: list[str] | None = None) -> int:
             print(f"reconciled: {changed}; unknown attempts were not retried")
         return 0
     if args.command == "sync":
-        ok, detail = validate_state(session_path)
+        sync_config = config
+        try:
+            if args.track:
+                sync_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+            sync_search = effective_search(sync_config.load_search())
+            sync_profile = _profile(sync_config, sync_search)
+        except (ConfigError, ValueError) as exc:
+            print(f"sync: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+        sync_session_path = sync_config.data_dir / "hh_session.json"
+        ok, detail = validate_state(sync_session_path)
         if not ok:
             print(f"session unavailable: {detail}; run `applypilot login` first", file=sys.stderr)
             return 2
         from .negotiations import SyncError, sync_statuses
         try:
-            account = _account(_profile(config))
+            account = _account(sync_profile)
             if args.pages is not None and args.pages < 1:
                 print("--pages must be positive", file=sys.stderr)
                 return 2
-            sync_store = Store(config.db_path)
+            sync_store = Store(sync_config.db_path)
             with sync_store.run_lock():
                 sync_store.recover_interrupted_runs(account)
-                rows = sync_statuses(session_path, sync_store, account=account, max_pages=args.pages)
+                rows = sync_statuses(sync_session_path, sync_store, account=account, max_pages=args.pages)
                 reconciled = sync_store.reconcile_unknowns_from_negotiations(account)
                 snapshot = sync_store.latest_sync(account)
         except SyncError as exc:
             print(f"sync: error ({exc})", file=sys.stderr)
             return 3
-        output = args.output or _default_artifact(config, "reports", "json")
+        output = args.output or _default_artifact(sync_config, "reports", "json")
         status = snapshot["status"] if snapshot else "unknown"
         _write_private_json(output, {"account": account, "status": status, "rows": rows,
                                     "reconciled_unknown": reconciled})
@@ -854,7 +1272,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     try:
         from playwright.sync_api import sync_playwright
 
-        from .autoapply import apply_one
+        from .autoapply import apply_one, verify_resume_visibility
         from .negotiations import SyncError, sync_statuses
     except ImportError:
         print("browser support missing; install with: pip install -e '.[browser]'", file=sys.stderr)
@@ -866,6 +1284,14 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         print("profile limits must be positive", file=sys.stderr)
         return 2
     timing = profile.get("apply", {}) or {}
+    visibility_resume_id = str(timing.get("visibility_resume_id") or "").strip()
+    visibility_resume_title = str(timing.get("visibility_resume_title") or "").strip()
+    if visibility_resume_id and (
+        not visibility_resume_title
+        or any(str(item.get("resume", "")).strip() != visibility_resume_title for item in selected)
+    ):
+        print("visibility verification configuration does not match selected resume", file=sys.stderr)
+        return 2
     delay_min = max(0.0, float(timing.get("delay_min_seconds", 1)))
     delay_max = max(delay_min, float(timing.get("delay_max_seconds", delay_min)))
     # Плавный темп: иногда добавляем длинные паузы, чтобы не создавать чрезмерную частоту действий.
@@ -891,6 +1317,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                 storage_state=str(state_path), viewport={"width": 1280, "height": 900}
             )
             page = context.new_page()
+            # Some HH popups retain a visibility warning even while the exact
+            # resume page confirms public access. Verify it again in this same
+            # browser context before allowing any attempt past the banner.
+            visibility_verified = False
+            if visibility_resume_id:
+                visibility_verified = verify_resume_visibility(
+                    context, visibility_resume_id, visibility_resume_title
+                )
+                if not visibility_verified:
+                    raise RuntimeError("HH resume visibility could not be independently verified")
             for index, item in enumerate(selected, 1):
                 vacancy_id = str(item.get("id", ""))
                 if vacancy_id in _operator_excluded_ids(config.data_dir):
@@ -898,7 +1334,19 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     store.mark_run_item(run_id, vacancy_id, "skipped", reason)
                     print(f"{vacancy_id}: skipped — {reason}")
                     continue
-                preflight_error = _submission_preflight(item, letter_enabled)
+                approved_letter = str(item.get("approved_cover_letter") or "").strip()
+                campaign_queue_item = bool(item.get("track"))
+                requires_letter = any(item.get(key) for key in (
+                    "cover_letter_required", "requires_cover_letter", "letter_required",
+                ))
+                if campaign_queue_item and requires_letter and not approved_letter:
+                    note = "required cover letter needs an owner-approved saved draft"
+                    store.record(item, "needs_manual", note, run_id, account)
+                    print(f"{item.get('id')}: needs_manual — {note}")
+                    continue
+                item_letter_enabled = (bool(approved_letter) if campaign_queue_item
+                                       else letter_enabled or bool(approved_letter))
+                preflight_error = _submission_preflight(item, item_letter_enabled)
                 if preflight_error:
                     store.record(item, "needs_manual", preflight_error, run_id, account)
                     print(f"{item.get('id')}: needs_manual — {preflight_error}")
@@ -912,8 +1360,10 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         stop_reason = reason
                         break
                     continue
-                cover_letter = ""
-                if letter_enabled:
+                cover_letter = approved_letter
+                if approved_letter:
+                    item["cover_letter_source"] = "owner_approved"
+                elif letter_enabled and not campaign_queue_item:
                     try:
                         cover_letter, source = _prepare_cover_letter(config, item, profile)
                     except (Exception, KeyboardInterrupt):
@@ -923,9 +1373,14 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     item["cover_letter_source"] = source
                     if source in {"generated", "cache"}:
                         item["llm_source"] = source
+                if cover_letter:
+                    # Store.record не сохраняет тело письма в журнал попыток; оно уже
+                    # хранится в приватной workflow_tasks вместе с версией/одобрением.
+                    item["cover_letter"] = cover_letter
                 result = apply_one(
                     page, item, str(item.get("resume", "")).strip(), cover_letter,
                     confirmation_timeout_seconds=confirmation_timeout,
+                    visibility_verified=visibility_verified,
                 )
                 if result.status == "unknown":
                     store.record(item, result.status, result.note, run_id, account)
@@ -961,6 +1416,20 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         long_pause_every=long_pause_every,
                         long_pause_min=long_pause_min, long_pause_max=long_pause_max,
                     ))
+            if confirmed_successes and any(item.get("track") for item in selected):
+                try:
+                    save_state(state_path, context.storage_state())
+                    synced = sync_statuses(state_path, store, account=account)
+                    selected_ids = {str(item.get("id") or "") for item in selected}
+                    negotiation_ids = {
+                        str(row.get("vacancy_id") or row.get("id") or "") for row in synced
+                    } & selected_ids
+                    print(f"post-apply HH negotiation sync: {len(negotiation_ids)} of "
+                          f"{confirmed_successes} confirmed success(es) found")
+                except Exception as exc:  # noqa: BLE001 — UI confirmation remains auditable if sync is unavailable
+                    LOGGER.warning("Post-apply HH negotiation sync failed (%s)", type(exc).__name__)
+                    print(f"post-apply HH negotiation sync unavailable ({type(exc).__name__})",
+                          file=sys.stderr)
         except KeyboardInterrupt:
             run_status = "interrupted"
             stop_reason = "run interrupted"

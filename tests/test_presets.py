@@ -31,3 +31,51 @@ def test_ai_agents_llmops_preset_is_narrower_than_the_general_ai_preset():
     assert "LLMOps Engineer" in result["queries"]
     assert "qa" in result["exclude_titles"]
     assert "security" in result["exclude_titles"]
+
+
+def test_ai_agents_llmops_excludes_adjacent_non_agent_roles_but_keeps_llm_engineering():
+    from applypilot.scoring import score_vacancy
+
+    preset = resolve_search({}, "ai-agents-llmops")
+    profile = {"search": preset}
+    description = "Python FastAPI LLM agents RAG MCP Docker tools OpenAI integration."
+
+    for title in (
+        "DevOps-engineer в GenAI",
+        "Site Reliability Engineer (SRE) in AI platform",
+        "Ведущий Java Backend-разработчик AI / LLM Platform",
+        "Старший разработчик на Java (AI агент)",
+        "Senior .NET Developer (LLM / RAG)",
+        "AI Engineer (Computer Vision / Bioinformatics)",
+        "AI Marketing Engineer / Growth Engineer",
+    ):
+        item = {"id": title, "name": title, "description": description}
+        result = score_vacancy(item, profile)
+        assert result.decision == "reject", title
+        assert any("preset_noise:" in reason for reason in result.hard_killers)
+
+    result = score_vacancy({
+        "id": "true-llm",
+        "name": "AI/LLM Engineer — Python и AI Agents",
+        "description": description,
+    }, profile)
+    assert result.decision == "pass"
+
+
+def test_python_backend_excludes_rust_cpp_as_primary_title_stack():
+    from applypilot.scoring import score_vacancy
+
+    preset = resolve_search({}, "python-backend")
+    profile = {"search": preset}
+    description = "Backend API Python FastAPI Docker PostgreSQL integration."
+    for title in ("Middle Backend разработчик (Rust/С++)", "Rust Backend Engineer", "C++ Backend Developer"):
+        result = score_vacancy({"id": title, "name": title, "description": description}, profile)
+        assert result.decision == "reject", title
+        assert "stack:title_incompatible" in result.hard_killers or "role:title_not_target" in result.hard_killers
+
+    correct = score_vacancy({
+        "id": "python-role",
+        "name": "Python Backend Developer (FastAPI)",
+        "description": description,
+    }, profile)
+    assert correct.decision == "pass"

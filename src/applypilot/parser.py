@@ -364,7 +364,8 @@ def enrich_items(items: list[dict[str, Any]], limit: int = 0,
 def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
                   status: str = "ok", error: str = "",
                   segments: list[ScanSegment] | None = None,
-                  preset: str | None = None) -> Path:
+                  preset: str | None = None,
+                  metadata: dict[str, Any] | None = None) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     path = directory / f"hh_vacancies_{stamp}_{time.time_ns()}.json"
@@ -373,6 +374,8 @@ def save_snapshot(items: list[dict[str, Any]], directory: Path, query: str,
                "segments": [segment.__dict__ for segment in (segments or [])]}
     if preset:
         payload["preset"] = preset
+    if metadata:
+        payload.update(metadata)
     fd, temp_name = tempfile.mkstemp(prefix=".snapshot-", dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
