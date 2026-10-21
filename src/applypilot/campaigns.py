@@ -13,7 +13,7 @@ from .config import AppConfig, search_groups, validate_search
 from .parser import ScanSegment, enrich_items, save_snapshot, stamp_first_seen
 from .scoring import evaluate_search_filter, prioritize_for_enrichment, score_vacancy
 from .sources import HhSearchAdapter
-from .storage import Store
+from .storage import Store, campaign_fit_bucket
 
 
 def _published_status(value: Any, cutoff: datetime) -> str:
@@ -349,14 +349,13 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             snapshot_path=str(snapshot_path), error="\n".join(errors),
             error_count=len(failed_segments) + len(detail_errors),
         )
-        score_counts = {
-            "fit": sum(1 for item in campaign_items
-                       if item.get("filter_status") == "pass" and item.get("score_decision") == "pass"),
-            "maybe": sum(1 for item in campaign_items
-                         if item.get("filter_status") == "unknown" or item.get("score_decision") == "unknown"),
-            "skip": sum(1 for item in campaign_items
-                        if item.get("filter_status") == "reject" or item.get("score_decision") == "reject"),
-        }
+        score_counts = {"fit": 0, "maybe": 0, "skip": 0}
+        for item in campaign_items:
+            bucket = campaign_fit_bucket(
+                str(item.get("filter_status") or "unknown"),
+                str(item.get("score_decision") or "unknown"),
+            )
+            score_counts[bucket] += 1
         return {
             "campaign_id": campaign_id, "previous_campaign_id": previous_campaign_id,
             "account": account, "track": track, "status": status, "snapshot": str(snapshot_path),

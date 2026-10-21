@@ -196,6 +196,15 @@ class ImportReport:
     already_imported: bool
 
 
+def campaign_fit_bucket(filter_status: str, score_decision: str) -> str:
+    """Разделяет FIT / MAYBE / SKIP без пересекающихся счётчиков."""
+    if "reject" in {str(filter_status), str(score_decision)}:
+        return "skip"
+    if filter_status == "pass" and score_decision == "pass":
+        return "fit"
+    return "maybe"
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -889,7 +898,9 @@ class Store:
                 if prior is None:
                     legacy_first_seen = str(item.get("first_seen") or "").strip()
                     if legacy_first_seen and item.get("is_new") is False:
-                        change = "new_since_previous"
+                        # На самом первом campaign не было предыдущего campaign:
+                        # известные из старых scan вакансии не становятся "новыми после него".
+                        change = "new_since_previous" if previous_campaign_id else "known"
                     else:
                         change = "first_seen"
                 elif ((previous_campaign_id and previous_observation is None)
@@ -927,7 +938,11 @@ class Store:
                 except (TypeError, ValueError):
                     score = 0
                 reasons = item.get("reasons") or item.get("score_reasons") or []
-                problems = [*_json_list(item.get("hard_killers")), *_json_list(item.get("soft_killers"))]
+                problems = list(dict.fromkeys([
+                    *_json_list(item.get("hard_killers")),
+                    *_json_list(item.get("soft_killers")),
+                    *_json_list(item.get("problems")),
+                ]))
                 filter_reasons = item.get("filter_reasons") or []
                 conn.execute(
                     """INSERT INTO vacancy_track_scores
@@ -953,9 +968,13 @@ class Store:
                     VALUES(?,?,?,?,?,?,?,?,?)""",
                     (campaign_id, account, source, vacancy_id, track, change, content_hash, payload, observed_at),
                 )
-                if item.get("filter_status") == "pass" and item.get("score_decision", item.get("decision")) == "pass":
+                bucket = campaign_fit_bucket(
+                    str(item.get("filter_status") or "unknown"),
+                    str(item.get("score_decision") or item.get("decision") or "unknown"),
+                )
+                if bucket == "fit":
                     matched_count += 1
-                elif item.get("filter_status") == "unknown" or item.get("score_decision", item.get("decision")) == "unknown":
+                elif bucket == "maybe":
                     maybe_count += 1
                 else:
                     rejected_count += 1
@@ -1072,8 +1091,10 @@ class Store:
                     continue
                 if view == "skip" and review_state != "SKIP":
                     continue
-                if view == "top" and not (
-                    row["filter_status"] == "pass" and row["score_decision"] == "pass"
+                if view == "top" and (
+                    row["filter_status"] != "pass" or row["score_decision"] != "pass"
+                    or review_state == "SKIP"
+                    or row["application_state"] in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
                 ):
                     continue
                 try:

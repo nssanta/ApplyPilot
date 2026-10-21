@@ -404,3 +404,59 @@ def test_legacy_global_review_state_migrates_to_existing_track_rows(tmp_path):
         vacancy = migrated.execute("SELECT review_state FROM vacancies WHERE vacancy_id='one'").fetchone()
     assert tuple(score) == ("APPROVED", "reviewed", "notes")
     assert vacancy[0] == "UNREVIEWED"
+
+
+def test_first_campaign_distinguishes_previously_seen_registry_items_from_new_campaign_hits(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("first", "account", "ai", {"query": "AI"})
+    older = {
+        "id": "legacy", "name": "AI Engineer", "first_seen": "2026-09-01",
+        "is_new": False, "score_decision": "reject", "filter_status": "unknown",
+        "description": "AI work", "problems": ["salary:unpublished"],
+    }
+    recent = {
+        "id": "recent", "name": "LLM Engineer", "first_seen": "2026-10-21",
+        "is_new": True, "score_decision": "pass", "filter_status": "pass",
+        "description": "RAG and agents", "problems": ["salary:lower_bound_meets_threshold"],
+    }
+    summary = store.save_campaign_items(
+        "first", "account", "ai", [older, recent], status="ok", snapshot_path="first.json",
+    )
+    assert summary["items"] == 2
+    assert summary["known"] == 1
+    assert summary["first_seen"] == 1
+    assert summary["new_since_previous"] == 0
+    assert summary["matched"] == 1
+    assert summary["maybe"] == 0
+    assert summary["rejected"] == 1
+    rows = {x["id"]: x for x in store.list_campaign_vacancies("account", "ai")}
+    assert "salary:unpublished" in rows["legacy"]["problems"]
+
+
+def test_campaign_fit_buckets_are_exclusive_even_when_filter_is_unknown():
+    from applypilot.storage import campaign_fit_bucket
+
+    assert campaign_fit_bucket("pass", "pass") == "fit"
+    assert campaign_fit_bucket("unknown", "pass") == "maybe"
+    assert campaign_fit_bucket("pass", "unknown") == "maybe"
+    assert campaign_fit_bucket("unknown", "reject") == "skip"
+    assert campaign_fit_bucket("reject", "unknown") == "skip"
+
+
+def test_top_review_queue_excludes_confirmed_or_unknown_application_states(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    account = "account"
+    store.start_campaign("batch", account, "ai", {"query": "AI"})
+    rows = [
+        {"id": label, "name": f"{label} AI Engineer", "score": 80,
+         "score_decision": "pass", "filter_status": "pass",
+         "url": f"https://hh.ru/vacancy/{label}"}
+        for label in ("available", "sent", "unknown")
+    ]
+    store.save_campaign_items("batch", account, "ai", rows, status="ok", snapshot_path="one.json")
+    store.record(rows[1], "success", account=account)
+    store.record(rows[2], "unknown", account=account)
+    top = store.list_campaign_vacancies(account, "ai", view="top")
+    assert [row["id"] for row in top] == ["available"]
+    # Их история не теряется, меняется только рабочий вид для выбора откликов.
+    assert len(store.list_campaign_vacancies(account, "ai", view="all")) == 3
