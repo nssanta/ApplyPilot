@@ -8,11 +8,13 @@ ApplyPilot — локальный инструмент для поиска ва�
 - несколько поисковых направлений через треки;
 - объяснимый офлайн-скоринг и HTML-review;
 - LLM-скрининг `FIT / MAYBE / SKIP / ERROR`;
+- ручной запуск campaign с постоянной SQLite-очередью и историей снимков;
+- раздельные для каждого трека решения FIT/MAYBE/SKIP/APPROVED/DEFERRED;
 - локальная веб-панель для поиска, просмотра, скрининга, треков, статистики и очереди откликов;
-- сопроводительные письма: выключено / шаблон / LLM;
+- сохраняемые черновики писем и ручных анкет;
+- ограниченное read-only чтение HH-переписок через официальный OAuth API;
 - безопасный `dry-run` и явный `apply --run`;
 - защита от повторных откликов через SQLite-журнал и синхронизацию HH negotiations;
-- периодический поиск свежих вакансий через systemd timer или cron;
 - сборка wheel/sdist и экспериментального Debian-пакета.
 
 CLI остаётся самостоятельным интерфейсом. Веб-панель — опциональная оболочка над теми же командами и приватными артефактами.
@@ -48,6 +50,35 @@ CLI остаётся самостоятельным интерфейсом. Ве
 .venv/bin/python -m applypilot doctor
 .venv/bin/python -m applypilot scan --preset ai-agents-llmops --area 113 --remote --days 7
 ```
+
+Для постоянной очереди укажите трек из `private/config/tracks.toml`:
+
+```bash
+.venv/bin/python -m applypilot run campaign --track ai --days 3 \
+  --query 'AI Engineer' --area 113 --remote --salary-from 100000 --limit 100
+.venv/bin/python -m applypilot queue list --track ai --view top --limit 100
+.venv/bin/python -m applypilot queue set --track ai --id VACANCY_ID \
+  --state FIT --reason 'Python, LLM и нужный уровень'
+.venv/bin/python -m applypilot queue set --track ai --id VACANCY_ID \
+  --state APPROVED --reason 'Проверил вакансию и зарплату'
+```
+
+`--limit` — верхняя граница. Поиск не добавляет слабые совпадения ради заполнения списка. Каждый запуск сохраняется в SQLite и в JSON snapshot. Просмотры `new`, `top`, `deferred`, `approved`, `needs_letter`, `needs_form`, `unknown`, `applied` доступны через `queue list`; история — через `queue history --track ai`.
+
+Очередь одобренных откликов сначала можно проверить без сети:
+
+```bash
+.venv/bin/python -m applypilot queue apply --track ai --limit 3 --dry-run
+```
+
+Перед реальной отправкой требуется актуальный `sync`, проверенный профиль трека (`reviewed = true`), точное резюме HH и отдельный `--run`:
+
+```bash
+.venv/bin/python -m applypilot sync --track ai
+.venv/bin/python -m applypilot queue apply --track ai --limit 3 --run
+```
+
+Неоднозначный результат блокирует повтор; CAPTCHA, вопросы, отключённая кнопка и неподдерживаемый внешний ATS требуют ручной обработки.
 
 Глобальные параметры `--data-dir`, `--profile`, `--search` указываются **до** подкоманды:
 
@@ -155,7 +186,7 @@ private/
 - `newest` — поиск по дате публикации;
 - `balanced` — делит общий HTTP-бюджет между свежестью и релевантностью.
 
-Обычный UI-скан использует `balanced`, а watcher свежих вакансий — `newest`.
+Обычный UI-скан использует `balanced`; ручная кампания по умолчанию использует `newest`.
 
 ### Бюджет и снимки
 
@@ -239,7 +270,6 @@ export AITUNNEL_API_KEY="..."
 - статистику FIT/MAYBE/SKIP/ERROR по трекам;
 - новые и свежие вакансии;
 - текущую фоновую задачу;
-- последние строки watcher;
 - баланс провайдера при доступном ключе.
 
 ### Вакансии
@@ -270,6 +300,32 @@ export AITUNNEL_API_KEY="..."
 1. `reviewed = true` в профиле трека;
 2. явного подтверждения в UI;
 3. отдельного запуска apply-процесса.
+
+Вкладка **Очередь** показывает ту же SQLite-очередь кампаний, что и CLI, включая историю запусков, причины оценки, проблемы и состояние отклика. Решение владельца привязано к треку; фактический статус попытки и решение владельца хранятся отдельно.
+
+### Письма и анкеты
+
+Черновик письма создаётся шаблонным или подключённым LLM-режимом, сохраняется в SQLite, может быть отредактирован и одобрен. Одобренное письмо попадёт в apply только вместе с одобренной вакансией и отдельным явным запуском. Отправка письма работодателю отдельно от HH-отклика не реализована.
+
+Если HH показывает вопросы, ApplyPilot сохраняет задачу `form` со статусом `NEEDS_MANUAL`. Захват текста/вариантов вопросов и их безопасная автозапись в этой версии не поддерживаются; задача не превращается в обычный отклик.
+
+```bash
+.venv/bin/python -m applypilot workflow list --track ai
+.venv/bin/python -m applypilot workflow letter-preview --track ai --id VACANCY_ID
+.venv/bin/python -m applypilot workflow edit --track ai --id TASK_ID --text 'Проверенный текст письма'
+.venv/bin/python -m applypilot workflow approve --track ai --id TASK_ID
+.venv/bin/python -m applypilot queue list --track ai --view needs_form
+```
+
+### Переписки HH
+
+`inbox sync` вручную читает ограниченную страницу чатов через официальный OAuth API. Нужен `HH_ACCESS_TOKEN`; cookie Playwright не подменяет OAuth. Сохраняются тексты и метаданные отправителя, без URL вложений. Не вызываются методы отправки сообщения или отметки прочитанным. Роль «рекрутер/бот» берётся только из метаданных HH; черновики ответов и отправка сообщений пока не реализованы.
+
+```bash
+export HH_ACCESS_TOKEN='…'
+.venv/bin/python -m applypilot inbox sync --max-chats 20 --messages-per-chat 20
+.venv/bin/python -m applypilot inbox list --limit 100
+```
 
 ### Резюме и треки
 
@@ -434,7 +490,11 @@ SQLite `private/data/applypilot.sqlite3` — источник истины дл�
 - events;
 - reservations;
 - HH negotiation statuses;
-- sync snapshots;
+- campaign runs и сохранённых observations;
+- vacancy cards и scores/review decisions по каждому треку;
+- application/conversation state;
+- задач писем/форм и прочитанных inbox сообщений;
+- sync snapshots.
 - импорта старой истории.
 
 Дедупликация ведётся по `account + vacancy_id`. Кроме локальных завершённых/неопределённых попыток, блокируются vacancy ID, уже найденные в HH negotiations.
@@ -448,21 +508,9 @@ SQLite `private/data/applypilot.sqlite3` — источник истины дл�
 
 Они также исключаются из action-очереди.
 
-## Автопоиск свежих вакансий
+## Фоновый поиск
 
-Watcher находится в `packaging/applypilot-watch.sh`.
-
-Для каждого трека он:
-
-1. запускает `scan --days 1 --sort-mode newest`;
-2. берёт созданный snapshot;
-3. запускает `screen`;
-4. сохраняет report и accepted snapshot;
-5. пишет лог в `private/data/watch.log`.
-
-Watcher **никогда не запускает apply**.
-
-Подробности: [packaging/README.md](packaging/README.md).
+Текущий workflow работает только по явной команде. ApplyPilot не включает timer, cron или watcher. В `packaging/` остались экспериментальные legacy-файлы планировщика; они не нужны для ручной кампании и не устанавливаются запуском `./run.sh`.
 
 ## Debian-пакет
 
@@ -476,7 +524,7 @@ bash packaging/build-deb.sh
 
 ## Архитектура
 
-Техническая схема модулей, потоков данных, циклов `scan/screen/apply/watch`, SQLite-состояний и границ безопасности находится в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Техническая схема модулей, потоков данных, циклов campaign/apply/inbox, SQLite-состояний и границ безопасности находится в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Проверки перед публикацией
 

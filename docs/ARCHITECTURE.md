@@ -8,28 +8,32 @@
 2. **Поиск не равен отклику.** `scan`, `plan`, `review`, `screen`, `inspect`, `sync` не отправляют отклик.
 3. **Реальная отправка всегда явная.** Нужен `apply --run` или подтверждённое действие в локальном UI.
 4. **Снимки поиска неизменяемы как вход выполнения.** Новый scan создаёт новый JSON-файл; неуспешный проход не затирает последний успешный.
-5. **SQLite — источник истины для истории отправок.** JSON-снимки отвечают за входные данные; журнал SQLite — за dedupe, попытки и неоднозначные исходы.
+5. **SQLite — источник истины для очереди и истории откликов.** JSON-снимки сохраняют вход campaign; SQLite хранит карточки, решения по трекам, задачи, dedupe, попытки и неоднозначные исходы.
 6. **Приватные данные не входят в Git.** Профили, cookies/storage state, ключи, отчёты, SQLite и snapshots живут в `private/`.
 7. **Неоднозначность не означает повтор.** После потенциальной отправки неизвестный результат становится `unknown` и блокирует автоматический повтор до подтверждения.
-8. **Треки независимы от UI.** Их конфигурация вынесена в `tracks.py` и используется CLI/watch/admin.
+8. **Треки независимы от UI.** Их конфигурация вынесена в `tracks.py`; решение о пригодности вакансии хранится для каждого трека отдельно.
+9. **Работа только по команде.** Поиск, синхронизация HH и чтение inbox запускаются явно. Legacy watcher не устанавливается и не активируется.
 
 ## Модули
 
 | Модуль | Ответственность |
 | --- | --- |
-| `cli.py` | argparse, оркестрация команд, scan/plan/apply/sync/screen, dry-run |
+| `cli.py` | argparse, оркестрация команд, campaign/queue/workflow/inbox и прежних scan/plan/apply/sync/screen |
 | `config.py` | пути, TOML-конфиги, валидация search/profile, allowlist профессионального контекста |
 | `presets.py` | публичные поисковые пресеты |
 | `parser.py` | публичный поиск HH, нормализация, enrichment, snapshots, `first_seen` |
+| `campaigns.py` | bounded ручной запуск, exact-time фильтр, score, snapshot и сохранение постоянной очереди |
+| `sources.py` | минимальные capability-протоколы адаптеров и фасад существующего HH search |
 | `scoring.py` | чистый детерминированный скоринг и фильтры |
 | `screen.py` | opt-in LLM-скрининг FIT/MAYBE/SKIP/ERROR |
 | `tracks.py` | независимый реестр поисковых треков |
 | `admin.py` | localhost UI, API, запуск CLI subprocess, очередь/статистика/operator-state |
-| `storage.py` | SQLite-журнал, dedupe, reservations, runs, negotiations, recovery |
+| `storage.py` | SQLite-журнал, дедупликация, кампании, карточки, решения по трекам, workflow и recovery |
 | `session.py` | login/check приватной HH-сессии |
 | `inspection.py` | read-only Playwright inspect вакансий и названий резюме |
 | `autoapply.py` | браузерная отправка одного отклика и классификация результата |
 | `negotiations.py` | read-only синхронизация статусов откликов HH |
+| `inbox.py` | bounded read-only чтение HH chats/messages через OAuth API; без отправки и read-mark |
 | `cover_letters.py` | выбор режима off/template/llm и строгий локальный шаблон |
 | `letters.py` | генератор индивидуального письма через OpenAI-compatible API |
 | `llm.py` | совместимый OpenRouter-путь писем и bounded rerank |
@@ -75,7 +79,7 @@ HTTP-бюджет списывается непосредственно пере
 - `newest`: весь budget на `publication_time`;
 - `balanced`: половина budget на свежесть, половина на релевантность.
 
-CLI по умолчанию сохраняет `relevance`. UI явно выбирает `balanced`; watcher — `newest`.
+CLI `scan` по умолчанию сохраняет `relevance`. UI явно выбирает `balanced`; ручная campaign — `newest`.
 
 ### Snapshot
 
@@ -85,6 +89,23 @@ Snapshot сохраняет весь найденный набор, даже е�
 
 - `first_seen`;
 - признак новой вакансии для UI.
+
+## Кампания и постоянная очередь
+
+`run campaign` вызывает существующий scanner через `HhSearchAdapter`, затем оценивает вакансии и сохраняет JSON snapshot и транзакционные записи SQLite. Верхняя граница выдачи не заполняется искусственно. Фактический count относится только к полученному ограниченному проходу.
+
+SQLite разделяет:
+
+- `vacancies` — одну нормализованную карточку на `account + source + vacancy_id`, payload, даты обнаружения и общие состояния попытки/переписки;
+- `vacancy_track_scores` — оценку, фильтр, резюме и отдельные `FIT/MAYBE/SKIP/APPROVED/DEFERRED` для каждой пары вакансия/трек;
+- `campaign_runs` — запрос, ограничения, snapshot, статус и сводку каждого запуска;
+- `vacancy_observations` — наблюдения по каждому snapshot.
+
+Новизна: `first_seen` для первого знания базы; `new_since_previous` для ранее известной вакансии, отсутствовавшей в предыдущем полном успешном запуске трека; `updated` для изменившегося содержимого; `known` для неизменившейся. Частичный или усечённый запуск не становится базой сравнения и не удаляет старые карточки. Решение владельца не затирается новым score.
+
+`unknown` зарплаты при положительном пороге не считается подтверждённым совпадением и остаётся видимой для ручной проверки. Трековое `APPROVED` с обязательной причиной может подтвердить такую неопределённость; отклонённый фильтр или неизвестный score по-прежнему блокирует apply.
+
+CLI и localhost UI читают одну очередь. `queue apply --dry-run` не требует HH sync. Реальный запуск требует свежий успешный sync статусов HH, `reviewed = true`, точное резюме трека, явный `--run`, штатные лимиты, атомарный reservation и прежние safety checks. `UNKNOWN` автоматически не повторяется.
 
 ## Цикл LLM-скрининга
 
@@ -300,33 +321,19 @@ Allowlist профессионального контекста валидиру
 
 PDF/DOCX автоматически не парсятся.
 
-## Watcher
+Черновики писем сохраняются в `workflow_tasks`, оттуда их можно продолжить, отредактировать и одобрить. В apply входит только одобренный текст для отдельно одобренной вакансии при явном `queue apply --run`. Независимой отправки письма работодателю нет.
 
-`packaging/applypilot-watch.sh` загружает тот же roster из `tracks.py`.
+Если HH показывает screening questions, создаётся задача формы `NEEDS_MANUAL`. Текущий код не извлекает структурированные вопросы и варианты ответов; анкета не одобряется и не пропускается как обычный отклик.
 
-Для каждого трека:
+## HH Inbox (read-only slice)
 
-```text
-scan --days 1 --sort-mode newest
-        │
-        ▼
-new snapshot
-        │
-        ▼
-screen
-        │
-        ▼
-report + accepted snapshot + watch.log
-```
+`inbox sync` требует OAuth access token в `HH_ACCESS_TOKEN` и вызывает только `GET /common/chats` и `GET /common/chats/{chat_id}/messages`. Число чатов и сообщений ограничено. Тела сообщений хранятся локально; URL вложений не копируются; роль берётся только из metadata HH. Синхронизация не отмечает прочитанным, не определяет бота по содержимому и не отправляет ответы. `negotiations.py` отдельно синхронизирует статусы откликов.
 
-Watcher никогда не вызывает `apply`.
+Для ответов работодателям ещё нужны доступный владельцу OAuth token, проверенный read-only вызов, UX классификации и черновика, явное approval каждого ответа, idempotency и подтверждение результата. Отправка сообщений не входит в этот read-only slice.
 
-systemd user timer находится в:
+## Legacy watcher
 
-- `packaging/applypilot-watch.service`;
-- `packaging/applypilot-watch.timer`.
-
-При установке из web-admin unit переписывается на фактический checkout.
+`packaging/applypilot-watch.*` сохранены для истории. Они не устанавливаются web-admin и не используются в текущем workflow. Поиск начинается только при явном `run campaign` или запуске из вкладки «Очередь».
 
 ## Хранилища
 
@@ -346,7 +353,6 @@ systemd user timer находится в:
 | `admin-settings.json` | локальные LLM-настройки web-admin |
 | `jobs.jsonl` | журнал admin subprocess |
 | `spend.jsonl` | расходы LLM |
-| `watch.log` | watcher |
 
 ### SQLite
 
@@ -359,6 +365,12 @@ systemd user timer находится в:
 - reservations;
 - negotiation_statuses;
 - sync_snapshots;
+- campaign_runs;
+- vacancies;
+- vacancy_track_scores;
+- vacancy_observations;
+- workflow_tasks;
+- inbox_messages;
 - информацию об импортированной legacy-истории.
 
 ## Границы сети
@@ -369,12 +381,16 @@ systemd user timer находится в:
 | `review` | нет | нет | нет |
 | `analytics` | нет | нет | нет |
 | `scan` | публичный HH | нет | нет |
+| `run campaign` | публичный HH | нет | нет |
 | `screen` | LLM provider | нет | нет |
 | `letter preview` | зависит от режима | нет | нет |
 | `inspect` | HH через Playwright | да | нет |
 | `sync` | HH | да | нет |
+| `inbox sync` | HH API, GET only | OAuth bearer token | нет |
 | `apply --dry-run` | нет | нет | нет |
 | `apply --run` | HH через Playwright | да | **да** |
+| `queue apply --dry-run` | нет | нет | нет |
+| `queue apply --run` | HH через Playwright | да | **да** |
 
 ## Проверки архитектурных границ
 
@@ -393,6 +409,8 @@ systemd user timer находится в:
 - CLI independence from admin;
 - cover-letter grounding/cache;
 - LLM screening/cache/retry;
-- watcher/track behavior.
+- ручная campaign/queue и track-scoped review state;
+- read-only inbox request bounds and dedupe;
+- блокировка включения legacy watcher из admin.
 
 Перед публикацией дополнительно запускаются Ruff, build, public leak-check и `git diff --check`.

@@ -1,6 +1,6 @@
 # Пакетирование ApplyPilot
 
-Каталог `packaging/` содержит экспериментальную сборку Debian-пакета и watcher свежих вакансий.
+Каталог `packaging/` содержит экспериментальную сборку Debian-пакета и legacy-файлы watcher.
 
 ## Debian `.deb`
 
@@ -85,106 +85,6 @@ sudo dpkg -r applypilot
 /opt/applypilot/venv/bin/python -m playwright install chromium
 ```
 
-## Watcher свежих вакансий
+## Legacy watcher
 
-`applypilot-watch.sh` выполняет периодический read/search + LLM-screen цикл для всех активных треков.
-
-Для каждого трека:
-
-1. `scan --days 1 --sort-mode newest`;
-2. извлечение созданного snapshot;
-3. `screen`;
-4. запись screen report и accepted snapshot;
-5. запись результата в `private/data/watch.log`.
-
-**Watcher никогда не запускает `apply`.**
-
-Треки загружаются через `applypilot.tracks.load_tracks`, то есть watcher и web-admin используют один источник конфигурации.
-
-### Корень репозитория
-
-Задаётся через:
-
-```bash
-APPLYPILOT_HOME=/path/to/ApplyPilot
-```
-
-Если переменная отсутствует, shell-скрипт определяет корень относительно своего каталога.
-
-### API-ключ
-
-Приоритет:
-
-1. `AITUNNEL_API_KEY`;
-2. `api_key` из `private/data/admin-settings.json`;
-3. `private/config/aitunnel.key`.
-
-Если ключа нет, watcher пишет предупреждение и не сможет выполнить LLM-screen.
-
-## systemd user timer
-
-Установка вручную:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp packaging/applypilot-watch.service packaging/applypilot-watch.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now applypilot-watch.timer
-```
-
-По умолчанию:
-
-- первый запуск — через 5 минут;
-- затем — раз в час;
-- `Persistent=true`.
-
-Проверить:
-
-```bash
-systemctl --user list-timers applypilot-watch.timer
-systemctl --user status applypilot-watch.timer
-```
-
-Разовый прогон:
-
-```bash
-systemctl --user start applypilot-watch.service
-```
-
-Логи:
-
-```bash
-journalctl --user -u applypilot-watch.service
-tail -f private/data/watch.log
-```
-
-### Путь к checkout
-
-При ручной установке отредактируйте `APPLYPILOT_HOME` в service-файле.
-
-При установке из web-admin текущий путь к checkout автоматически подставляется и в `Environment`, и в `ExecStart`.
-
-### Изменение интервала
-
-Отредактируйте `OnUnitActiveSec` в timer:
-
-```ini
-OnUnitActiveSec=30min
-```
-
-После изменения:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart applypilot-watch.timer
-```
-
-## cron
-
-Если systemd user недоступен:
-
-```cron
-0 * * * * APPLYPILOT_HOME=/path/to/ApplyPilot /path/to/ApplyPilot/packaging/applypilot-watch.sh
-```
-
-Не храните API-ключ прямо в общей crontab, если можно передать его через защищённое окружение или локальные admin settings.
+`applypilot-watch.sh` и systemd unit-файлы сохранены для истории, но не входят в актуальный рабочий процесс. ApplyPilot запускает поиск только по явной команде пользователя; не устанавливайте и не включайте watcher, timer или cron. Ручной поиск и постоянная очередь доступны через `applypilot run campaign` и локальную вкладку «Очередь».
