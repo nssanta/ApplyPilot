@@ -460,3 +460,60 @@ def test_top_review_queue_excludes_confirmed_or_unknown_application_states(tmp_p
     assert [row["id"] for row in top] == ["available"]
     # Их история не теряется, меняется только рабочий вид для выбора откликов.
     assert len(store.list_campaign_vacancies(account, "ai", view="all")) == 3
+
+
+def test_batch_review_is_atomic_and_blocks_already_applied(tmp_path):
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("bulk1", "account", "ai", {"query": "AI"})
+    items = [
+        {"id": str(i), "name": "AI Agent Engineer", "score": 75,
+         "score_decision": "pass", "filter_status": "pass", "resume": "AI Engineer",
+         "url": f"https://hh.ru/vacancy/{i}"}
+        for i in (101, 102, 103)
+    ]
+    store.save_campaign_items("bulk1", "account", "ai", items, status="ok", snapshot_path="x.json")
+    store.record(items[-1], "success", account="account")
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot batch approve"):
+        store.set_review_state_batch(
+            "account", "hh.ru", ["101", "103"], "APPROVED", reason="operator batch", track="ai",
+        )
+    rows = {x["id"]: x for x in store.list_campaign_vacancies("account", "ai")}
+    assert rows["101"]["review_state"] == "UNREVIEWED"
+    assert rows["102"]["review_state"] == "UNREVIEWED"
+    assert rows["103"]["application_state"] == "APPLIED_CONFIRMED"
+
+    assert store.set_review_state_batch(
+        "account", "hh.ru", ["101", "102", "101"], "APPROVED",
+        reason="operator batch", track="ai",
+    ) == 2
+    rows = {x["id"]: x for x in store.list_campaign_vacancies("account", "ai")}
+    assert rows["101"]["review_state"] == "APPROVED"
+    assert rows["102"]["application_state"] == "READY_TO_APPLY"
+    assert [x["id"] for x in store.approved_campaign_items("account", "ai")] == ["101", "102"]
+
+
+def test_batch_review_rejects_bad_fit_and_wrong_track(tmp_path):
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("bulk2", "account", "ai", {"query": "LLM"})
+    store.save_campaign_items(
+        "bulk2", "account", "ai",
+        [{"id": "bad", "name": "Java Backend", "score": 91, "score_decision": "reject",
+          "filter_status": "pass", "resume": "AI Engineer"}],
+        status="ok", snapshot_path="x.json",
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="screening"):
+        store.set_review_state_batch(
+            "account", "hh.ru", ["bad"], "APPROVED", reason="mistaken", track="ai",
+        )
+    with pytest.raises(ValueError, match="not present"):
+        store.set_review_state_batch(
+            "account", "hh.ru", ["bad"], "APPROVED", reason="mistaken", track="backend",
+        )

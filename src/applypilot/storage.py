@@ -1190,6 +1190,64 @@ class Store:
                 (application_state, timestamp, account, source, str(vacancy_id)),
             )
 
+    def set_review_state_batch(self, account: str, source: str, vacancy_ids: list[str],
+                               state: str, *, reason: str, track: str) -> int:
+        """Атомарно применяет одно явное решение к пакету ID без частичного подтверждения."""
+        normalized = str(state).strip().upper()
+        if normalized not in REVIEW_STATES:
+            raise ValueError("invalid review state")
+        reason = str(reason or "").strip()
+        if normalized != "UNREVIEWED" and not reason:
+            raise ValueError("a reason is required")
+        ids = list(dict.fromkeys(str(value).strip() for value in vacancy_ids if str(value).strip()))
+        if not ids or len(ids) > 100:
+            raise ValueError("batch must contain between 1 and 100 nonempty vacancy IDs")
+        if not str(track).strip():
+            raise ValueError("track must be specified")
+        timestamp = now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for vacancy_id in ids:
+                row = conn.execute(
+                    """SELECT v.application_state,s.score_decision,s.filter_status
+                    FROM vacancies v JOIN vacancy_track_scores s
+                      ON s.account=v.account AND s.source=v.source AND s.vacancy_id=v.vacancy_id
+                    WHERE v.account=? AND v.source=? AND v.vacancy_id=? AND s.track=?""",
+                    (account, source, vacancy_id, track),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"vacancy {vacancy_id} is not present in track {track}")
+                app_state = str(row["application_state"])
+                if normalized == "APPROVED":
+                    if app_state not in {"NOT_STARTED", "FAILED_BEFORE_SUBMIT", "READY_TO_APPLY"}:
+                        raise ValueError(f"cannot batch approve {vacancy_id} in {app_state}")
+                    if row["score_decision"] != "pass" or row["filter_status"] not in {"pass", "unknown"}:
+                        raise ValueError(f"vacancy {vacancy_id} did not pass screening rules")
+                    blocked = conn.execute(
+                        "SELECT status FROM attempts WHERE account=? AND vacancy_id=?",
+                        (account, vacancy_id),
+                    ).fetchone()
+                    hh = conn.execute(
+                        "SELECT 1 FROM negotiation_statuses WHERE account=? AND vacancy_id=?",
+                        (account, vacancy_id),
+                    ).fetchone()
+                    if hh or (blocked and blocked["status"] in BLOCKED_STATUSES):
+                        raise ValueError(f"vacancy {vacancy_id} has an existing HH application/uncertain attempt")
+            for vacancy_id in ids:
+                conn.execute(
+                    """UPDATE vacancy_track_scores SET review_state=?,review_reason=?
+                    WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
+                    (normalized, reason, account, source, vacancy_id, track),
+                )
+                if normalized == "APPROVED":
+                    conn.execute(
+                        """UPDATE vacancies SET application_state='READY_TO_APPLY',updated_at=?
+                        WHERE account=? AND source=? AND vacancy_id=?
+                          AND application_state IN ('NOT_STARTED','FAILED_BEFORE_SUBMIT')""",
+                        (timestamp, account, source, vacancy_id),
+                    )
+        return len(ids)
+
     def record_manual_application(self, account: str, source: str, vacancy_id: str,
                                   reason: str = "owner marked as applied") -> bool:
         """Записывает явное подтверждение владельца отдельно от HH negotiation sync."""

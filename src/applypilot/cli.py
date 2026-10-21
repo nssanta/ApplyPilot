@@ -120,6 +120,23 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"), default="newest")
     campaign.add_argument("--preset", choices=PRESET_CHOICES)
 
+    bundle = run_sub.add_parser("bundle", help="собрать до 100 кандидатов из нескольких треков")
+    bundle.add_argument("--track", action="append", choices=("ai", "backend", "ml"),
+                        help="направление, повторить при необходимости; default: все три")
+    bundle.add_argument("--days", type=int, default=3)
+    bundle.add_argument("--pages", type=int, default=2)
+    bundle.add_argument("--request-budget", type=int, default=32,
+                        help="число поисковых HTTP-запросов на каждый трек")
+    bundle.add_argument("--details-limit", type=int, default=65,
+                        help="число полных описаний на каждый трек")
+    bundle.add_argument("--limit", type=int, default=100)
+    bundle.add_argument("--remote", action=argparse.BooleanOptionalAction, default=True)
+    bundle.add_argument("--salary-from", type=int, default=140000)
+    bundle.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"),
+                        default="balanced")
+    bundle.add_argument("--wide-ai", action=argparse.BooleanOptionalAction, default=True,
+                        help="использовать private/config/search-ai-broad.toml, если он есть")
+
     queue = sub.add_parser("queue", help="постоянная очередь вакансий")
     queue_sub = queue.add_subparsers(dest="queue_action", required=True)
     queue_list = queue_sub.add_parser("list", help="показать вакансии из SQLite")
@@ -137,6 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
                            choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
     queue_set.add_argument("--reason", default="")
     queue_set.add_argument("--notes")
+    queue_batch = queue_sub.add_parser("batch-set", help="атомарно пометить пакет вакансий")
+    queue_batch.add_argument("--track", required=True)
+    queue_batch.add_argument("--id", action="append", required=True,
+                             help="ID вакансии; повторить до 100 раз")
+    queue_batch.add_argument("--state", required=True,
+                             choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
+    queue_batch.add_argument("--reason", default="")
     queue_history = queue_sub.add_parser("history", help="история запусков поиска")
     queue_history.add_argument("--track")
     queue_history.add_argument("--limit", type=int, default=20)
@@ -431,6 +455,67 @@ def main(argv: list[str] | None = None) -> int:
         result = check_session(session_path)
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
+    if args.command == "run" and args.run_action == "bundle":
+        from .bundles import compile_bundle
+        from .campaigns import run_campaign
+
+        if not 1 <= args.limit <= 100 or not 1 <= args.days <= 365:
+            print("bundle: --limit must be 1-100 and --days 1-365", file=sys.stderr)
+            return 2
+        tracks = list(dict.fromkeys(args.track or ["ai", "backend", "ml"]))
+        reports: dict[str, dict[str, Any]] = {}
+        failures: dict[str, str] = {}
+        account = ""
+        for track in tracks:
+            try:
+                selected_config, track_info = _track_config(
+                    config, track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                if track == "ai" and args.wide_ai and not args.search:
+                    broad = config.root / "private" / "config" / "search-ai-broad.toml"
+                    if broad.is_file():
+                        selected_config = replace(selected_config, search_path=broad.resolve())
+                search = effective_search(selected_config.load_search())
+                profile = _profile(selected_config, search)
+                current_account = _account(profile)
+                if account and current_account != account:
+                    raise ValueError("all tracks must share the same HH account")
+                account = current_account
+                print(f"bundle: scanning {track}", flush=True)
+                reports[track] = run_campaign(
+                    selected_config, track, profile, search,
+                    days=args.days, pages=args.pages,
+                    request_budget=args.request_budget, details_limit=args.details_limit,
+                    limit=args.limit, only_remote=args.remote,
+                    salary_from=args.salary_from, salary_currency="RUR",
+                    sort_mode=args.sort_mode, track_resume=str(track_info.get("resume") or ""),
+                )
+                print(f"bundle: {track} found={reports[track]['summary']['items']}"
+                      f" status={reports[track]['status']}", flush=True)
+            except (Exception, KeyboardInterrupt) as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                failures[track] = f"{type(exc).__name__}: {str(exc)[:180]}"
+                print(f"bundle: {track} FAILED ({failures[track]})", file=sys.stderr, flush=True)
+        if not reports:
+            print("bundle: no tracks completed", file=sys.stderr)
+            return 3
+        result = compile_bundle(Store(config.db_path), account, reports, limit=args.limit)
+        result["failed_tracks"] = failures
+        result["created_utc"] = datetime.now(UTC).isoformat()
+        output_dir = config.data_dir / "bundles"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / f"bundle-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"bundle: unique_candidates={result['unique_candidates']}"
+              f" review={result['review_count']} failures={len(failures)}")
+        print(f"bundle_report: {output}")
+        for index, item in enumerate(result["items"][:20], 1):
+            print(f"{index:>2}. [{item['track']}] {item['id']} score={item['score']}"
+                  f" rank={item['review_rank']} {item['name'][:85]} · {item['company'][:32]}")
+        print("No applications submitted. Use batch-set and queue apply after selecting good fits.")
+        return 2 if failures else 0
     if args.command == "run" and args.run_action == "campaign":
         try:
             selected_config, track_info = _track_config(
@@ -538,6 +623,18 @@ def main(argv: list[str] | None = None) -> int:
                     track=args.track,
                 )
                 print(f"queue: {args.id} -> {args.state.upper()} (track={args.track})")
+                return 0
+            if args.queue_action == "batch-set":
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search())
+                account = _account(_profile(selected_config, search))
+                changed = Store(selected_config.db_path).set_review_state_batch(
+                    account, "hh.ru", args.id, args.state, reason=args.reason, track=args.track,
+                )
+                print(f"queue: batch={changed} -> {args.state.upper()} (track={args.track})")
                 return 0
             if args.queue_action == "apply":
                 if args.limit < 1 or args.limit > 100:
