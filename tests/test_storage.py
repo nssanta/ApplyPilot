@@ -517,3 +517,23 @@ def test_batch_review_rejects_bad_fit_and_wrong_track(tmp_path):
         store.set_review_state_batch(
             "account", "hh.ru", ["bad"], "APPROVED", reason="mistaken", track="backend",
         )
+
+
+def test_hh_reconciliation_updates_persistent_campaign_card(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    item = {"id": "hh-confirmed", "name": "AI Engineer", "resume": "AI", "score": 80,
+            "score_decision": "pass", "filter_status": "pass"}
+    store.start_campaign("case", "account", "ai", {"query": "AI"})
+    store.save_campaign_items("case", "account", "ai", [item], status="ok",
+                              snapshot_path="case.json")
+    store.record(item, "unknown", "HH response not proven", account="account")
+    before = store.list_campaign_vacancies("account", "ai", "unknown", 10)
+    assert [x["id"] for x in before] == ["hh-confirmed"]
+    store.replace_negotiation_statuses(
+        [{"vacancy_id": "hh-confirmed", "status": "not_viewed"}], "account"
+    )
+    assert store.reconcile_unknowns_from_negotiations("account") == ["hh-confirmed"]
+    after = store.list_campaign_vacancies("account", "ai", "applied", 10)
+    assert [x["id"] for x in after] == ["hh-confirmed"]
+    assert after[0]["application_state"] == "APPLIED_CONFIRMED"
+    assert store.list_campaign_vacancies("account", "ai", "unknown", 10) == []

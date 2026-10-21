@@ -698,6 +698,16 @@ class Store:
                     "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) VALUES(?,?,?,?,?,?)",
                     (account, vacancy_id, "success", note, run_id, timestamp),
                 )
+                # HH evidence resolved the ambiguity: the persistent vacancy
+                # must be marked confirmed, not left in an UNKNOWN quarantine.
+                conn.execute(
+                    """UPDATE vacancies
+                    SET application_state='APPLIED_CONFIRMED', application_note=?,
+                        last_checked_at=?,updated_at=?
+                    WHERE account=? AND source='hh.ru' AND vacancy_id=?
+                      AND application_state='UNKNOWN'""",
+                    (note, timestamp, timestamp, account, vacancy_id),
+                )
                 if run_id:
                     conn.execute(
                         """UPDATE run_items SET status='success',note=?,updated_at=?
