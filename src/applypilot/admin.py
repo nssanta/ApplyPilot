@@ -1318,7 +1318,7 @@ class AdminApp:
             '# Укажи точное название резюме на HH; реальные отклики выключены до reviewed=true.\n'
             'name = ""\nlocation = ""\nenglish_level = ""\n'
             'reviewed = false\n\n'
-            '[limits]\nper_run = 15\nper_day = 40\n\n'
+            '[limits]\nper_run = 100\nper_day = 300\n\n'
             '[apply]\ndelay_min_seconds = 20\ndelay_max_seconds = 45\n'
             'long_pause_every = 8\nlong_pause_min_seconds = 60\nlong_pause_max_seconds = 150\n\n'
             '[screen]\nmodel = "gpt-5-mini"\n'

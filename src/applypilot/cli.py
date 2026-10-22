@@ -167,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_history.add_argument("--json", action="store_true")
     queue_apply = queue_sub.add_parser("apply", help="dry-run или явный запуск по APPROVED из очереди")
     queue_apply.add_argument("--track", required=True)
-    queue_apply.add_argument("--limit", type=int, default=10)
+    queue_apply.add_argument("--limit", type=int, default=100)
     apply_mode = queue_apply.add_mutually_exclusive_group(required=True)
     apply_mode.add_argument("--dry-run", action="store_true")
     apply_mode.add_argument("--run", action="store_true")
@@ -384,7 +384,7 @@ def _operator_excluded_ids(data_dir: Path) -> set[str]:
 
 
 def _default_limit(profile: dict) -> int:
-    return int((profile.get("limits") or {}).get("per_run", 5))
+    return int((profile.get("limits") or {}).get("per_run", 100))
 
 
 def _write_private_json(path: Path, payload: object) -> Path:
@@ -1407,8 +1407,8 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         print("browser support missing; install with: pip install -e '.[browser]'", file=sys.stderr)
         return 2
     limits = profile.get("limits", {})
-    per_run = int(limits.get("per_run", 5))
-    per_day = int(limits.get("per_day", 20))
+    per_run = int(limits.get("per_run", 100))
+    per_day = int(limits.get("per_day", 300))
     if per_run < 1 or per_day < 1:
         print("profile limits must be positive", file=sys.stderr)
         return 2

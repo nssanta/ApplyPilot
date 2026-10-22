@@ -9,8 +9,8 @@ reviewed = false
 # account = "my-hh-account"
 
 [limits]
-per_run = 5
-per_day = 20
+per_run = 100
+per_day = 300
 
 [apply]
 delay_min_seconds = 5

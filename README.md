@@ -19,32 +19,6 @@ ApplyPilot — локальный инструмент для поиска ва�
 
 CLI остаётся самостоятельным интерфейсом. Веб-панель — опциональная оболочка над теми же командами и приватными артефактами.
 
-### Ручная групповая кампания (без фонового расписания)
-
-`run bundle` выполняет существующий `run_campaign` по AI, Python Backend и ML, сохраняет трековые SQLite-кампании и единый отчёт с дедупликацией vacancy ID. Публичный поиск не отправляет отклики:
-
-```bash
-.venv/bin/python -m applypilot run bundle --days 3 --limit 100 --remote --salary-from 100000
-```
-
-Для обычного запуска `run bundle` используется приоритет свежих публикаций (`newest`), первая страница каждой поисковой фразы, до 90 поисковых HTTP-запросов и до 90 новых полных описаний **на трек**. Приватный широкий AI-шаблон `private/config/search.toml`, если существует, расширяет поиск до AI Agents, LLM, AI-native и vibe-coding. `--no-wide-ai` возвращает трековый пресет. Для более глубокого недельного поиска используйте явно `--days 7 --pages 2 --request-budget 160 --details-limit 160 --sort-mode balanced`. Это больше запросов, но всё равно не гарантирует исчерпывающей выдачи HH.
-
-`run bundle` сохраняет SQLite/JSON snapshots и отчёт `private/data/bundles/bundle-*.json` с `raw_rows_by_track`, `unique_raw_vacancies`, `first_seen_sqlite_unique` (впервые в нашей SQLite), `new_since_previous_unique` (не было в предыдущей кампании этого трека) и `published_last_24h_unique` (дата публикации, а не дата нахождения). Кэширует ранее скачанные описания, в отчёте указывает охват фраз, загруженные новые описания, дедуп одинаковой роли одного работодателя, FIT и `needs_enrichment`.
-
-**FIT означает лишь совпадение по правилам, не разрешение на отправку.** Вакансии без полного описания уходят в `needs_enrichment`; по обнаруженным в реальных HH описаниях рискам проживание только в Москве, повышенный коммерческий стаж и узкие CV/image-training роли отмечаются `manual_*_check` и имеют `auto_apply_eligible=false`. Режим `truncated` возможен при ограничении глубины страниц даже при полном охвате поисковых фраз. Уже отправленные/неясные отклики не повторяются, письма/анкеты остаются в своих очередях. Ручной аудит топ-40 и отдельных отвергнутых вакансий хранится в приватных `private/reports/`, не в Git.
-
-После проверки отобранного набора можно атомарно одобрить несколько HH vacancy ID одним вызовом; одна ошибочная/уже отправленная вакансия отклоняет **весь пакет**, без частичного изменения состояний:
-
-```bash
-.venv/bin/python -m applypilot queue batch-set --track ai \
-  --id 123456 --id 123457 --state APPROVED --reason 'Проверено по стеку, условиям и резюме'
-.venv/bin/python -m applypilot queue apply --track ai --dry-run --limit 10
-```
-
-Для реальных откликов по-прежнему требуется явный `queue apply --run`, актуальная HH-синхронизация, проверенный профиль и индивидуальные лимиты; чтение/заполнение форм и отправка писем остаются в соответствующих рабочих очередях. Команда `run bundle` никогда не запускает `apply --run` и не включает таймер.
-
-**Поиск только одним резюме (без других треков):** `run campaign --track ai` читает отдельный приватный AI-search TOML, позволяя искать широкие Python/Go/TypeScript и AI-native роли. При проверке зарплаты в другой валюте (USD при пороге RUR) или открытой вилке «от 100k» ниже желаемого порога статус `unknown`, не автоматический `reject`: нужна проверка реальных условий. Рейтинг `bundles.py` даёт бонус явным AI-агентным ролям и технологиям AI-assisted coding, учитывает зарплату и отправляет несовпадающий основной стек/сложный грейд/географию на manual-check. Это сигналы для review, а не разрешение на отправку.
-
 ## Быстрый старт
 
 ### Веб-панель
@@ -77,34 +51,17 @@ CLI остаётся самостоятельным интерфейсом. Ве
 .venv/bin/python -m applypilot scan --preset ai-agents-llmops --area 113 --remote --days 7
 ```
 
-Для постоянной очереди укажите трек из `private/config/tracks.toml`:
+Для постоянной очереди используйте **`default`** из `private/config/tracks.toml` (или другой явно выбранный трек). Пример выше — основная команда полного AI-only цикла; здесь команды просмотра и статусов:
 
 ```bash
-.venv/bin/python -m applypilot run campaign --track ai --days 3 \
-  --query 'AI Engineer' --area 113 --remote --salary-from 100000 --limit 100
-.venv/bin/python -m applypilot queue list --track ai --view top --limit 100
-.venv/bin/python -m applypilot queue set --track ai --id VACANCY_ID \
-  --state FIT --reason 'Python, LLM и нужный уровень'
-.venv/bin/python -m applypilot queue set --track ai --id VACANCY_ID \
-  --state APPROVED --reason 'Проверил вакансию и зарплату'
+.venv/bin/python -m applypilot queue list --track default --view top --limit 100
+.venv/bin/python -m applypilot queue list --track default --view needs_letter --limit 100
+.venv/bin/python -m applypilot queue list --track default --view needs_form --limit 100
+.venv/bin/python -m applypilot queue list --track default --view unknown --limit 100
+.venv/bin/python -m applypilot queue history --track default --limit 100
 ```
 
-`--limit` — верхняя граница. Поиск не добавляет слабые совпадения ради заполнения списка. Каждый запуск сохраняется в SQLite и в JSON snapshot. Просмотры `new`, `top`, `deferred`, `approved`, `needs_letter`, `needs_form`, `unknown`, `applied` доступны через `queue list`; история — через `queue history --track ai`.
-
-Очередь одобренных откликов сначала можно проверить без сети:
-
-```bash
-.venv/bin/python -m applypilot queue apply --track ai --limit 3 --dry-run
-```
-
-Перед реальной отправкой требуется актуальный `sync`, проверенный профиль трека (`reviewed = true`), точное резюме HH и отдельный `--run`:
-
-```bash
-.venv/bin/python -m applypilot sync --track ai
-.venv/bin/python -m applypilot queue apply --track ai --limit 3 --run
-```
-
-Неоднозначный результат блокирует повтор; CAPTCHA, вопросы, отключённая кнопка и неподдерживаемый внешний ATS требуют ручной обработки.
+`--limit` — верхняя граница партии, не обязанность добирать её нерелевантными вакансиями. Активный профиль bulk одобрен владельцем; массовая отправка разрешена по команде пользователя, без согласования каждой вакансии. Привязка к правильному резюме, учёт успешных HH-откликов и блокировка повторной отправки `UNKNOWN` сохраняются как технические гарантии.
 
 Глобальные параметры `--data-dir`, `--profile`, `--search` указываются **до** подкоманды:
 
@@ -237,7 +194,7 @@ private/
 .venv/bin/python -m applypilot plan \
   --preset ai-agents-llmops \
   --input private/data/snapshots/FILE.json \
-  --limit 30 \
+  --limit 100 \
   --min-score 30 \
   --rescore \
   --output private/reports/plan.json
@@ -251,7 +208,7 @@ private/
 .venv/bin/python -m applypilot review \
   --input private/data/snapshots/FILE.json \
   --preset ai-agents-llmops \
-  --top 30
+  --top 100
 ```
 
 ## LLM-скрининг
@@ -262,11 +219,11 @@ private/
 export AITUNNEL_API_KEY="..."
 .venv/bin/python -m applypilot screen \
   --input private/data/snapshots/FILE.json \
-  --track ai \
+  --track default \
   --model gpt-5-mini \
   --accept fit+maybe \
-  --output private/reports/screen-ai.json \
-  --emit-snapshot private/data/snapshots/accepted-ai.json
+  --output private/reports/screen-ai-core.json \
+  --emit-snapshot private/data/snapshots/accepted-ai-core.json
 ```
 
 Вердикты:
@@ -336,11 +293,11 @@ export AITUNNEL_API_KEY="..."
 Если HH показывает вопросы, ApplyPilot сохраняет задачу `form` со статусом `NEEDS_MANUAL`. Захват текста/вариантов вопросов и их безопасная автозапись в этой версии не поддерживаются; задача не превращается в обычный отклик.
 
 ```bash
-.venv/bin/python -m applypilot workflow list --track ai
-.venv/bin/python -m applypilot workflow letter-preview --track ai --id VACANCY_ID
-.venv/bin/python -m applypilot workflow edit --track ai --id TASK_ID --text 'Проверенный текст письма'
-.venv/bin/python -m applypilot workflow approve --track ai --id TASK_ID
-.venv/bin/python -m applypilot queue list --track ai --view needs_form
+.venv/bin/python -m applypilot workflow list --track default
+.venv/bin/python -m applypilot workflow letter-preview --track default --id VACANCY_ID
+.venv/bin/python -m applypilot workflow edit --track default --id TASK_ID --text 'Проверенный текст письма'
+.venv/bin/python -m applypilot workflow approve --track default --id TASK_ID
+.venv/bin/python -m applypilot queue list --track default --view needs_form
 ```
 
 ### Переписки HH
@@ -416,17 +373,14 @@ Chrome, и при CAPTCHA его можно пройти руками. Проц�
 # без окна: быстрее, но CAPTCHA пройти нельзя
 .venv/bin/python -m applypilot apply --input FILE.json --run --headless
 
-# то же для постоянной очереди
-.venv/bin/python -m applypilot queue apply --track ai --run --visible
-.venv/bin/python -m applypilot queue apply --track ai --run --headless
+# то же для постоянной AI-only очереди (100/run, 300/day в bulk-профиле)
+APPLYPILOT_INTERACTIVE=1 .venv/bin/python -m applypilot --profile private/config/profile.toml queue apply --track default --limit 100 --run --visible
+.venv/bin/python -m applypilot --profile private/config/profile.toml queue apply --track default --limit 100 --run --headless
 ```
 
 `headless` использует настоящий Chrome 156 с тем же UA/Client Hints, locale
 `ru-RU`, зоной `Europe/Moscow` и экраном 1366×768, без `HeadlessChrome` в UA.
-Если HH показывает CAPTCHA в headless, запуск безопасно останавливается
-(`stopped_captcha`), очередь сохраняется; для прохождения проверки нужно
-повторить с `--visible`. Переключение режима не выполняется на лету: смена
-браузерного контекста сбрасывает доверие к сессии.
+Если HH показывает CAPTCHA до финальной отправки, запуск останавливается с сохранением очереди; после submit исход может быть `UNKNOWN`. Перед следующей попыткой сверять HH и не повторять тот же vacancy ID с неопределённым исходом. В visible-режиме при наличии интерактивного входа или `APPLYPILOT_INTERACTIVE=1` Chrome может ждать ручного решения CAPTCHA. Переключение headless/visible выполняется отдельным запуском и не превращает `UNKNOWN` в повторяемую заявку.
 
 Сессия сохраняется в:
 
@@ -446,7 +400,7 @@ private/data/hh_session.json
 .venv/bin/python -m applypilot inspect \
   --input private/data/snapshots/FILE.json \
   --selected \
-  --limit 10 \
+  --limit 100 \
   --preset ai-agents-llmops
 ```
 
@@ -472,10 +426,10 @@ private/data/hh_session.json
 
 ```bash
 .venv/bin/python -m applypilot apply \
-  --input private/data/snapshots/accepted-ai.json \
+  --input private/data/snapshots/accepted-ai-core.json \
   --preset ai-agents-llmops \
   --dry-run \
-  --limit 10
+  --limit 100
 ```
 
 Dry-run не открывает браузер и не отправляет отклики, но создаёт auditable run и фиксирует выбранный список кандидатов.
@@ -484,7 +438,7 @@ Dry-run не открывает браузер и не отправляет от
 
 ```bash
 .venv/bin/python -m applypilot apply \
-  --input private/data/snapshots/accepted-ai.json \
+  --input private/data/snapshots/accepted-ai-core.json \
   --preset ai-agents-llmops \
   --run \
   --limit 20 \
