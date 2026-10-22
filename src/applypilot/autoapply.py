@@ -97,35 +97,41 @@ def verify_resume_visibility(context, resume_id: str, resume_title: str) -> bool
         return False
     if not str(resume_title).strip():
         return False
-    verify_page = None
-    try:
-        verify_page = context.new_page()
-        verify_page.goto(
-            f"https://hh.ru/resume/{resume_id}", wait_until="domcontentloaded", timeout=30000
-        )
-        page_path = urlparse(str(verify_page.url)).path.rstrip("/")
-        if not allowed_hh_url(str(verify_page.url)) or not page_path.endswith(f"/resume/{resume_id}"):
-            return False
-        for check in range(5):
-            text = verify_page.locator("body").inner_text(timeout=5000)
-            flat = " ".join(text.split()).casefold()
-            if (
-                " ".join(str(resume_title).split()).casefold() in flat
-                and "видимость резюме видно всем работодателям, зарегистрированным на hh.ru" in flat
-            ):
-                return True
-            if check < 4:
-                verify_page.wait_for_timeout(700)
-        return False
-    except Exception:
-        LOGGER.debug("Could not independently verify HH resume visibility", exc_info=True)
-        return False
-    finally:
-        if verify_page is not None:
-            try:
-                verify_page.close()
-            except Exception:
-                LOGGER.debug("Could not close visibility verification page", exc_info=True)
+    # HH sometimes returns a half-loaded body in the first Chrome tab.
+    # Only a positive read from the exact public resume can authorize sending.
+    for attempt in range(3):
+        verify_page = None
+        try:
+            verify_page = context.new_page()
+            verify_page.goto(
+                f"https://hh.ru/resume/{resume_id}", wait_until="domcontentloaded", timeout=30000
+            )
+            page_path = urlparse(str(verify_page.url)).path.rstrip("/")
+            if not allowed_hh_url(str(verify_page.url)) or not page_path.endswith(f"/resume/{resume_id}"):
+                return False
+            for check in range(5):
+                try:
+                    text = verify_page.locator("body").inner_text(timeout=5000)
+                except Exception:
+                    LOGGER.debug("HH resume body still loading", exc_info=True)
+                    text = ""
+                flat = " ".join(text.split()).casefold()
+                if (
+                    " ".join(str(resume_title).split()).casefold() in flat
+                    and "видимость резюме видно всем работодателям, зарегистрированным на hh.ru" in flat
+                ):
+                    return True
+                if check < 4:
+                    verify_page.wait_for_timeout(800)
+        except Exception:
+            LOGGER.debug("HH visibility check attempt %s failed", attempt + 1, exc_info=True)
+        finally:
+            if verify_page is not None:
+                try:
+                    verify_page.close()
+                except Exception:
+                    LOGGER.debug("Could not close HH visibility page", exc_info=True)
+    return False
 
 
 def _response_dialog(page, submit):
