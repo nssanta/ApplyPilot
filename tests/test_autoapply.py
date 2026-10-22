@@ -228,14 +228,15 @@ def test_missing_resume_option_is_manual_even_when_hh_preselected_one():
     assert not any("submit-popup" in selector for selector in page.clicks)
 
 
-def test_mismatched_single_visible_resume_uses_hh_preselection():
+def test_mismatched_single_visible_resume_is_manual_instead_of_wrong_send():
     page = _Page()
     page.resume_titles = ["AI Agent Engineer"]
 
     result = apply_one(page, _item(), "Backend Developer")
 
-    assert result.status == "success"
-    assert sum("submit-popup" in selector for selector in page.clicks) == 1
+    assert result.status == "needs_manual"
+    assert "different resume" in result.note
+    assert not any("submit-popup" in selector for selector in page.clicks)
 
 
 def test_resume_title_matching_normalizes_whitespace_and_case():
@@ -265,17 +266,17 @@ def test_initial_russian_captcha_stops_before_first_action():
     result = apply_one(page, _item(), "Python")
 
     assert result.status == "needs_manual"
-    assert result.note == "CAPTCHA detected"
+    assert result.note.startswith("CAPTCHA")
     assert page.clicks == []
 
 
-def test_russian_captcha_after_first_action_stops_before_submit():
+def test_russian_captcha_after_first_action_is_manual_before_submit():
     page = _Page(dialog_after_response=False, body_after_response="Требуется капча")
 
     result = apply_one(page, _item(), "Python")
 
-    assert result.status == "unknown"
-    assert "captcha" in result.note.lower()
+    assert result.status == "needs_manual"
+    assert result.note.startswith("CAPTCHA")
     assert sum("vacancy-response-link" in selector for selector in page.clicks) == 1
     assert not any("submit-popup" in selector for selector in page.clicks)
 
@@ -322,7 +323,7 @@ def test_disabled_popup_requirements_are_manual_before_submit():
     result = apply_one(page, _item(), "Python")
 
     assert result.status == "needs_manual"
-    assert result.note == "resume visibility must be changed manually"
+    assert result.note == "required cover letter is missing"
     assert not any("submit-popup" in selector for selector in page.clicks)
 
 
@@ -401,7 +402,7 @@ def test_unknown_result_stops_the_entire_run_before_the_next_vacancy(tmp_path, m
         "reviewed": True, "account": "account", "limits": {"per_run": 10, "per_day": 10},
         "apply": {"delay_min_seconds": 0, "delay_max_seconds": 0}, "llm": {"enabled": False},
     })
-    monkeypatch.setattr("applypilot.cli.check_session", lambda _path: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: type("_Starter", (), {
         "start": staticmethod(lambda: _Playwright()),
     })())
@@ -461,7 +462,7 @@ def test_negotiation_confirmation_turns_unknown_into_success_and_continues(tmp_p
         "reviewed": True, "account": "account", "limits": {"per_run": 10, "per_day": 10},
         "apply": {"delay_min_seconds": 0, "delay_max_seconds": 0}, "llm": {"enabled": False},
     })
-    monkeypatch.setattr("applypilot.cli.check_session", lambda _path: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: type("_Starter", (), {
         "start": staticmethod(lambda: _Playwright()),
     })())
@@ -516,7 +517,7 @@ def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, mo
         "reviewed": True, "account": "account", "limits": {"per_run": 10, "per_day": 10},
         "apply": {"delay_min_seconds": 0, "delay_max_seconds": 0}, "llm": {"enabled": False},
     })
-    monkeypatch.setattr("applypilot.cli.check_session", lambda _path: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: type("_Starter", (), {
         "start": staticmethod(lambda: _Playwright()),
     })())
@@ -549,11 +550,11 @@ def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, mo
     assert summary["counts"] == {"needs_manual": 1, "success": 2, "prepared": 1}
     assert store.negotiation_ids("account") == {"one", "two"}
 
-def test_stale_visibility_banner_requires_explicit_current_verification():
+def test_stale_visibility_banner_is_not_a_blocker_when_submit_is_enabled():
     page = _Page(body_after_response="Чтобы откликнуться, поменяйте видимость резюме.")
     result = apply_one(page, _item(), "Python")
-    assert result.status == "needs_manual"
-    assert not any("submit-popup" in selector for selector in page.clicks)
+    assert result.status == "success"
+    assert sum("submit-popup" in selector for selector in page.clicks) == 1
 
 
 def test_verified_public_visibility_allows_enabled_hh_submit():
@@ -580,7 +581,7 @@ def test_verified_public_visibility_never_overrides_disabled_submit():
     page.submit_enabled = False
     result = apply_one(page, _item(), "Python", visibility_verified=True)
     assert result.status == "needs_manual"
-    assert result.note == "visibility warning and submit is disabled"
+    assert result.note == "HH visibility warning and submit is disabled (resume is public on HH page)"
     assert not any("submit-popup" in selector for selector in page.clicks)
 
 

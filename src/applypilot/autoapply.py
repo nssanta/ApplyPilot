@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
+import sys
+import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -12,15 +15,64 @@ LETTER_SELECTOR = (
     '[data-qa="vacancy-response-letter-input"], '
     '[data-qa="vacancy-response-popup-form-letter-input"]'
 )
+CAPTCHA_NOTE_PREFIX = "CAPTCHA"
 
 
 def _contains_captcha(text: str) -> bool:
     lowered = text.casefold()
-    return "captcha" in lowered or "капч" in lowered
+    return "captcha" in lowered or "капч" in lowered or "подтвердите, что вы не робот" in lowered
 
 
 def _normalize_resume_title(value: str) -> str:
     return " ".join(str(value).split()).casefold()
+
+
+def _captcha_page(page) -> bool:
+    """Detects an actual HH challenge, not a FAQ mention of the word CAPTCHA."""
+    try:
+        url = str(page.url).casefold()
+        if "/captcha" in url or "captcha" in url:
+            return True
+        body = page.locator("body").inner_text(timeout=5000)
+        return _contains_captcha(body)
+    except Exception:
+        LOGGER.debug("Could not inspect page for CAPTCHA", exc_info=True)
+        return False
+
+
+def _manual_captcha(page, timeout_seconds: float, interactive: bool) -> bool:
+    """Keeps the real Chrome window open for the owner to pass HH's challenge.
+
+    Returns True only when the challenge page has actually gone away. The
+    caller must never retry a final submit just because this timed out.
+    """
+    if not _captcha_page(page):
+        return True
+    if not interactive or timeout_seconds <= 0:
+        return False
+    print(
+        "HH CAPTCHA: решите проверку в открытом окне Chrome. "
+        f"Ожидание до {int(timeout_seconds)} с; финальная кнопка не нажимается повторно.",
+        file=sys.stderr,
+        flush=True,
+    )
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(1000)
+        if not _captcha_page(page):
+            print("HH CAPTCHA passed; продолжаю текущую вакансию.", file=sys.stderr, flush=True)
+            return True
+    print("HH CAPTCHA not passed within timeout.", file=sys.stderr, flush=True)
+    return False
+
+
+def _letter_required(text: str) -> bool:
+    lowered = " ".join(str(text).split()).casefold()
+    return (
+        "сопроводительное письмо обязательное" in lowered
+        or "сопроводительное письмо обязательно" in lowered
+        or ("письмо" in lowered and "обязательн" in lowered)
+    )
 
 
 @dataclass(frozen=True)
@@ -112,11 +164,12 @@ def has_screening_form(page_or_dialog) -> bool:
 
 
 def _select_resume(page, dialog, resume: str) -> str:
-    """Принимает единственное видимое резюме HH; иначе требует одно точное совпадение названия."""
+    """Выбирает точное резюме; единственное видимое резюме принимает только при совпадении."""
     root = dialog or page
     options = root.locator(RESUME_SELECTOR)
     visible = []
     exact = []
+    titles = []
     for index in range(options.count()):
         option = options.nth(index)
         try:
@@ -124,6 +177,7 @@ def _select_resume(page, dialog, resume: str) -> str:
                 continue
             lines = [" ".join(line.split()) for line in option.inner_text(timeout=1000).splitlines() if line.strip()]
             visible.append(option)
+            titles.append(lines[0] if lines else "")
             if lines and _normalize_resume_title(lines[0]) == _normalize_resume_title(resume):
                 exact.append(option)
         except Exception:
@@ -131,9 +185,17 @@ def _select_resume(page, dialog, resume: str) -> str:
     if len(exact) == 1:
         exact[0].click(timeout=8000)
         return ""
+    if len(exact) > 1:
+        return "resume selection is ambiguous: duplicate exact titles"
     if len(visible) == 1:
-        return ""  # HH уже выбрал единственное резюме, доступное в этом popup отклика.
-    return "resume selection is missing or ambiguous"
+        # HH may preselect the only applicable resume. Accept it only when the
+        # title is the configured one; never silently send with another resume.
+        return "" if _normalize_resume_title(titles[0]) == _normalize_resume_title(resume) else (
+            f"HH preselected a different resume: {titles[0]!r}"
+        )
+    if not visible:
+        return "resume selection is missing"
+    return f"configured resume is not available in HH popup: {titles!r}"
 
 
 def _wait_for_confirmation(page, timeout_seconds: float) -> ApplyResult | None:
@@ -151,9 +213,29 @@ def _wait_for_confirmation(page, timeout_seconds: float) -> ApplyResult | None:
     return None
 
 
+def _classify_after_submit(page, item: dict, cover_letter: str, confirmation_timeout_seconds: float,
+                           manual_captcha_timeout: float, interactive: bool) -> ApplyResult:
+    page.wait_for_timeout(1500)
+    if not allowed_hh_url(str(page.url)):
+        return ApplyResult("needs_manual", "submission navigated to external ATS")
+    body = page.locator("body").inner_text(timeout=5000).lower()
+    if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+        if _manual_captcha(page, manual_captcha_timeout, interactive):
+            confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
+            if confirmed is not None:
+                return confirmed
+        return ApplyResult("unknown", "CAPTCHA detected after submission")
+    confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
+    if confirmed is not None:
+        return confirmed
+    return ApplyResult("unknown", "submission not confirmed by HH page")
+
+
 def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bool = False,
               confirmation_timeout_seconds: float = 15.0,
-              visibility_verified: bool = False) -> ApplyResult:
+              visibility_verified: bool = False,
+              manual_captcha_timeout: float = 0.0,
+              interactive: bool = False) -> ApplyResult:
     if not allowed_hh_url(str(item.get("url", ""))):
         return ApplyResult("needs_manual", "URL is not an allowed HH hostname")
     if not resume.strip():
@@ -165,13 +247,19 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         return ApplyResult("prepared", f"would apply with resume={resume}")
     try:
         page.goto(item["url"], wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(random.randint(700, 1600))
         if not allowed_hh_url(str(page.url)):
             return ApplyResult("needs_manual", "initial navigation left HH hostname")
         body = page.locator("body").inner_text().lower()
         if "вы откликнулись" in body or "отклик отправлен" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if _contains_captcha(body):
-            return ApplyResult("needs_manual", "CAPTCHA detected")
+        if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+            if not _manual_captcha(page, manual_captcha_timeout, interactive):
+                return ApplyResult("needs_manual",
+                                   f"{CAPTCHA_NOTE_PREFIX} before submission; manual pass required")
+            body = page.locator("body").inner_text().lower()
+            if "вы откликнулись" in body or "отклик отправлен" in body:
+                return ApplyResult("already_applied", "HH reports an existing application")
         links = page.locator('[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link"]')
         if links.count() == 0:
             return ApplyResult("needs_manual", "application button not found")
@@ -182,7 +270,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         if href and not allowed_hh_url(urljoin(str(page.url), href)):
             return ApplyResult("needs_manual", "application action points to an external ATS")
         links.first.click(timeout=15000)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(random.randint(1200, 2600))
         if not allowed_hh_url(str(page.url)):
             return ApplyResult("needs_manual", "external ATS")
         body = page.locator("body").inner_text().lower()
@@ -190,8 +278,15 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("success", "confirmed after first response action")
         if "вы уже откликались" in body or "уже откликались" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if _contains_captcha(body):
-            return ApplyResult("unknown", "CAPTCHA detected after first response action")
+        if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+            # No final submit has happened yet. Solving the challenge can
+            # continue this vacancy; timing out is manual, never UNKNOWN.
+            if not _manual_captcha(page, manual_captcha_timeout, interactive):
+                return ApplyResult("needs_manual",
+                                   f"{CAPTCHA_NOTE_PREFIX} before final submission; no submit attempted")
+            body = page.locator("body").inner_text().lower()
+            if "отклик отправлен" in body or "вы откликнулись" in body:
+                return ApplyResult("success", "confirmed after manual CAPTCHA pass")
         submit = page.locator(SUBMIT_SELECTOR).first
         # The first click may start a slow navigation while the URL still
         # appears to be /vacancy/..., or an AJAX popup may render late.
@@ -207,8 +302,11 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("success", "confirmed after delayed HH response")
             if "вы уже откликались" in body or "уже откликались" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
-            if _contains_captcha(body):
-                return ApplyResult("unknown", "CAPTCHA detected while waiting for HH response")
+            if (_contains_captcha(body) or "/captcha" in str(page.url).casefold()) and not _manual_captcha(
+                page, manual_captcha_timeout, interactive
+            ):
+                return ApplyResult("needs_manual",
+                                   f"{CAPTCHA_NOTE_PREFIX} while waiting for HH response; no submit attempted")
         # HH has two legitimate response interfaces: a popup and a separate
         # /applicant/vacancy_response page. Playwright's is_visible() does not
         # wait for loading, so the latter could previously become "unknown"
@@ -224,8 +322,11 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("success", "confirmed on HH full-page response")
             if "вы уже откликались" in body or "уже откликались" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
-            if _contains_captcha(body):
-                return ApplyResult("unknown", "CAPTCHA detected in full-page response")
+            if (_contains_captcha(body) or "/captcha" in str(page.url).casefold()) and not _manual_captcha(
+                page, manual_captcha_timeout, interactive
+            ):
+                return ApplyResult("needs_manual",
+                                   f"{CAPTCHA_NOTE_PREFIX} in full-page response; no submit attempted")
         dialog = _response_dialog(page, submit)
         if dialog is None and not submit.is_visible(timeout=2000):
             if has_screening_form(page):
@@ -234,38 +335,26 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         response_root = dialog or page
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
         if _contains_captcha(response_text):
-            return ApplyResult("unknown", "CAPTCHA detected after first response action")
-        resume_selected = False
-        if "поменяйте видимость резюме" in response_text:
-            if not visibility_verified:
-                return ApplyResult("needs_manual", "resume visibility must be changed manually")
-            # The exact public resume may not be selected in HH's response popup.
-            # Select it before deciding that the visible warning blocks submission.
-            resume_error = _select_resume(page, dialog, resume)
-            if resume_error:
-                return ApplyResult("needs_manual", resume_error)
-            resume_selected = True
-            # Even after selection, never force a disabled HH submit control.
-            if not submit.is_enabled(timeout=2000):
-                return ApplyResult("needs_manual", "visibility warning and submit is disabled")
-        if "сопроводительное письмо обязательное" in response_text and not cover_letter.strip():
+            if not _manual_captcha(page, manual_captcha_timeout, interactive):
+                return ApplyResult("needs_manual",
+                                   f"{CAPTCHA_NOTE_PREFIX} in response form; no submit attempted")
+            response_text = response_root.inner_text(timeout=2000).lower()
+        letter_required = _letter_required(response_text)
+        if letter_required and not cover_letter.strip():
+            # The visibility banner is frequently stale on HH. The actual
+            # blocker in this state is the mandatory empty cover letter.
             return ApplyResult("needs_manual", "required cover letter is missing")
+        resume_error = _select_resume(page, dialog, resume)
+        if resume_error:
+            return ApplyResult("needs_manual", resume_error)
         if has_screening_form(response_root):
             return ApplyResult("needs_manual", "screening questions require manual review")
-        dialog_controls = response_root.locator(
-            f"{RESUME_SELECTOR}, {LETTER_SELECTOR}, {SUBMIT_SELECTOR}"
-        )
-        if dialog_controls.count() == 0:
-            return ApplyResult("unknown", "first response action had no follow-up dialog")
-        if not resume_selected:
-            resume_error = _select_resume(page, dialog, resume)
-            if resume_error:
-                return ApplyResult("needs_manual", resume_error)
         if cover_letter:
             field = response_root.locator(LETTER_SELECTOR).first
-            if field.count() != 1 or not field.is_visible(timeout=2000):
+            if field.count() == 0 or not field.is_visible(timeout=2000):
                 return ApplyResult("needs_manual", "cover letter field is missing")
             field.fill(cover_letter)
+            page.wait_for_timeout(random.randint(500, 1200))
         if has_screening_form(response_root):
             return ApplyResult("needs_manual", "screening questions require manual review")
         if not submit.is_visible(timeout=8000):
@@ -274,14 +363,43 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         # attempting a click, rather than misclassifying a click timeout as an
         # uncertain submission. Never force-click or retry a submitted action.
         if not submit.is_enabled(timeout=3000):
+            if "поменяйте видимость резюме" in response_text:
+                return ApplyResult(
+                    "needs_manual",
+                    "HH visibility warning and submit is disabled (resume is public on HH page)",
+                )
             return ApplyResult("needs_manual", "HH confirmation button is disabled")
+        if "поменяйте видимость резюме" in response_text:
+            # Live HH evidence: the banner can remain after the exact resume
+            # page confirms public visibility, while submit is already enabled.
+            # An enabled button is the authoritative UI state; log the stale
+            # warning but never block a valid response on it.
+            LOGGER.info("HH stale visibility banner ignored because submit is enabled")
         # HH может ненадолго оставлять кнопку popup неактивной, пока стабилизируется состояние формы.
         # Ожидание здесь остаётся одной попыткой клика: не используем force-click и не повторяем действие.
-        submit.click(timeout=15000)
-        page.wait_for_timeout(1500)
-        if not allowed_hh_url(str(page.url)):
-            return ApplyResult("needs_manual", "submission navigated to external ATS")
-        confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
-        return confirmed or ApplyResult("unknown", "submission not confirmed by HH page")
+        page.wait_for_timeout(random.randint(1200, 2800))
+        if not submit.is_enabled(timeout=2000):
+            return ApplyResult("needs_manual", "HH confirmation button became disabled")
+        try:
+            submit.click(timeout=15000)
+        except Exception as exc:  # noqa: BLE001 — клик мог уйти; повторять нельзя
+            page.wait_for_timeout(1000)
+            body = page.locator("body").inner_text(timeout=5000).lower()
+            if "отклик отправлен" in body or "вы откликнулись" in body:
+                return ApplyResult("success", "confirmed after ambiguous submit click")
+            if "вы уже откликались" in body or "уже откликались" in body:
+                return ApplyResult("already_applied", "HH reports an existing application")
+            if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+                if _manual_captcha(page, manual_captcha_timeout, interactive):
+                    confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
+                    if confirmed is not None:
+                        return confirmed
+                return ApplyResult("unknown", "CAPTCHA detected after ambiguous submit click")
+            return ApplyResult("unknown",
+                               f"final submit click was ambiguous ({str(exc)[:120]}); not retried")
+        return _classify_after_submit(
+            page, item, cover_letter, confirmation_timeout_seconds,
+            manual_captcha_timeout, interactive,
+        )
     except Exception as exc:  # noqa: BLE001 — неоднозначный браузерный исход всегда классифицируется как unknown
         return ApplyResult("unknown", f"browser operation ended ambiguously: {str(exc)[:160]}")

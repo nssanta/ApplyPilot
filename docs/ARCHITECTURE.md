@@ -40,6 +40,7 @@
 | `tracks.py` | независимый реестр поисковых треков |
 | `admin.py` | localhost UI, API, запуск CLI subprocess, очередь/статистика/operator-state |
 | `storage.py` | SQLite-журнал, дедупликация, кампании, карточки, решения по трекам, workflow и recovery |
+| `browser.py` | реальный Chrome, persistent-профиль, visible/headless режимы и согласованный fingerprint |
 | `session.py` | login/check приватной HH-сессии |
 | `inspection.py` | read-only Playwright inspect вакансий и названий резюме |
 | `autoapply.py` | браузерная отправка одного отклика и классификация результата |

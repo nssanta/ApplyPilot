@@ -8,6 +8,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
+from .browser import real_user_agent
 from .storage import Store
 
 
@@ -94,8 +95,16 @@ def sync_statuses(state_path: Path, store: Store, account: str = "default",
         page_rows: list[dict[str, Any]] = []
         seen_pages: set[tuple[str, ...]] = set()
         while max_pages is None or page < max_pages:
-            response = client.get("https://hh.ru/applicant/negotiations", params={"page": page},
-                                  timeout=timeout, headers={"User-Agent": "ApplyPilot/0.1"})
+            response = client.get(
+                "https://hh.ru/applicant/negotiations",
+                params={"page": page},
+                timeout=timeout,
+                headers={
+                    "User-Agent": real_user_agent(),
+                    "Accept-Language": "ru-RU,ru;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
             if response.status_code in {403, 429}:
                 raise SyncError(f"HTTP {response.status_code}: access limited")
             if response.status_code != 200:

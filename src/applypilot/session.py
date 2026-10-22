@@ -67,55 +67,70 @@ def save_state(path: Path, data: dict) -> None:
             os.unlink(temp_name)
 
 
-def login(path: Path) -> None:
+def login(path: Path, *, data_dir: Path | None = None, profile: dict | None = None) -> None:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
+
+    from .browser import launch_context
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False)
-        context = None
+        session = launch_context(
+            pw,
+            data_dir=data_dir or path.parent,
+            state_path=path,
+            profile=profile,
+            headless=False,
+        )
         try:
-            context = browser.new_context()
-            page = context.new_page()
+            page = session.context.new_page()
             page.goto("https://hh.ru/account/login", wait_until="domcontentloaded", timeout=60000)
-            input("Log in in the browser, then press Enter here: ")
-            save_state(path, context.storage_state())
+            input("Log in in the Chrome window, then press Enter here: ")
+            save_state(path, session.context.storage_state())
         finally:
-            if context is not None:
-                context.close()
-            browser.close()
+            session.close()
 
 
-def check_session(path: Path) -> SessionCheck:
-    """Проверяет реальную HH-сессию без использования текущего браузера пользователя."""
-    ok, detail = validate_state(path)
-    if not ok:
-        return SessionCheck("missing" if detail == "missing" else "invalid", detail)
+def check_session(path: Path, *, data_dir: Path | None = None,
+                  profile: dict | None = None) -> SessionCheck:
+    """Проверяет реальную HH-сессию в том же persistent Chrome-профиле, что и apply."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return SessionCheck("valid-format", f"{detail}; Playwright is not installed")
-    browser = None
-    context = None
+        ok, detail = validate_state(path)
+        if ok:
+            return SessionCheck("valid-format", f"{detail}; Playwright is not installed")
+        return SessionCheck("missing" if detail == "missing" else "invalid", detail)
+
+    from .browser import launch_context
+
+    session = None
+    page = None
     try:
+        ok, state_detail = validate_state(path)
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(path))
-            page = context.new_page()
+            session = launch_context(
+                pw,
+                data_dir=data_dir or path.parent,
+                state_path=path,
+                profile=profile,
+                headless=True,
+            )
+            page = session.context.new_page()
             page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
             body = page.locator("body").inner_text(timeout=5000)
             return classify_session_page(page.url, body)
     except Exception as exc:  # noqa: BLE001 — ошибки браузера и сети классифицируются вместе
-        return SessionCheck("network_error", str(exc))
+        message = str(exc)
+        if "ProcessSingleton" in message or "profile" in message.lower() and "lock" in message.lower():
+            return SessionCheck("busy", "HH Chrome profile is already open; close it and retry")
+        if not ok:
+            return SessionCheck("missing" if state_detail == "missing" else "invalid", state_detail)
+        return SessionCheck("network_error", message[:240])
     finally:
-        if context is not None:
+        if session is not None:
             try:
-                context.close()
-            except Exception:
-                LOGGER.debug("failed to close session context", exc_info=True)
-        if browser is not None:
-            try:
-                browser.close()
+                session.close()
             except Exception:
                 LOGGER.debug("failed to close session browser", exc_info=True)

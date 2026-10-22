@@ -114,7 +114,7 @@ def test_apply_inserts_required_template_letter_without_llm(tmp_path, monkeypatc
     store = Store(config.db_path)
     received = []
     monkeypatch.setattr("applypilot.cli._profile", lambda *args: profile)
-    monkeypatch.setattr("applypilot.cli.check_session", lambda _: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
     monkeypatch.setattr("applypilot.cli.save_state", lambda *args: None)
     monkeypatch.setattr("applypilot.cli.generate", lambda *a, **kw: pytest.fail("LLM called"))
     monkeypatch.setattr("playwright.sync_api.sync_playwright", Playwright)

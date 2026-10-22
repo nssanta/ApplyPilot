@@ -392,13 +392,41 @@ export HH_ACCESS_TOKEN='…'
 
 Публичному `scan` cookies не нужны.
 
-Для `inspect`, `sync` и реального `apply` используется приватный Playwright state:
+Для `inspect`, `sync` и реального `apply` используется установленный Google Chrome
+с постоянным приватным профилем `private/data/hh_chrome_profile/`. Куки, localStorage
+и браузерная идентичность живут в одном профиле и обновляются сами. Экспорт
+`private/data/hh_session.json` остаётся для read-only `sync`/`inspect`.
 
 ```bash
-export PLAYWRIGHT_BROWSERS_PATH="$PWD/private/browsers"
 .venv/bin/python -m applypilot login
 .venv/bin/python -m applypilot session check
 ```
+
+### Режимы браузера
+
+Реальный `apply` по умолчанию идёт в **visible**-режиме: открывается обычное окно
+Chrome, и при CAPTCHA его можно пройти руками. Процесс ждёт до
+`[browser] manual_captcha_timeout_seconds` (по умолчанию 300 с), не повторяя
+финальный клик.
+
+```bash
+# видимое окно, ручная CAPTCHA (по умолчанию)
+.venv/bin/python -m applypilot apply --input FILE.json --run --visible
+
+# без окна: быстрее, но CAPTCHA пройти нельзя
+.venv/bin/python -m applypilot apply --input FILE.json --run --headless
+
+# то же для постоянной очереди
+.venv/bin/python -m applypilot queue apply --track ai --run --visible
+.venv/bin/python -m applypilot queue apply --track ai --run --headless
+```
+
+`headless` использует настоящий Chrome 156 с тем же UA/Client Hints, locale
+`ru-RU`, зоной `Europe/Moscow` и экраном 1366×768, без `HeadlessChrome` в UA.
+Если HH показывает CAPTCHA в headless, запуск безопасно останавливается
+(`stopped_captcha`), очередь сохраняется; для прохождения проверки нужно
+повторить с `--visible`. Переключение режима не выполняется на лету: смена
+браузерного контекста сбрасывает доверие к сессии.
 
 Сессия сохраняется в:
 

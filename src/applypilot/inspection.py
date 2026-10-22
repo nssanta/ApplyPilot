@@ -110,18 +110,24 @@ def _resume_titles(page: Any) -> list[str]:
     return list(dict.fromkeys(titles))
 
 
-def inspect_resumes(state_path: Path, timeout_ms: int = 10_000) -> dict[str, Any]:
+def inspect_resumes(state_path: Path, timeout_ms: int = 10_000,
+                    *, data_dir: Path | None = None,
+                    profile: dict[str, Any] | None = None) -> dict[str, Any]:
     """Проверяет сессию и доступные названия резюме HH в изолированном read-only контексте."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
-    browser = None
-    context = None
+    from .browser import launch_context
+
+    browser_session = None
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(state_path))
+            browser_session = launch_context(
+                pw, data_dir=data_dir or state_path.parent, state_path=state_path,
+                profile=profile, headless=True,
+            )
+            context = browser_session.context
             page = context.new_page()
             page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=timeout_ms)
             body = page.locator("body").inner_text(timeout=5000)
@@ -132,32 +138,32 @@ def inspect_resumes(state_path: Path, timeout_ms: int = 10_000) -> dict[str, Any
                 "resume_titles": _resume_titles(page) if auth.status == "confirmed" else [],
             }
     finally:
-        if context is not None:
+        if browser_session is not None:
             try:
-                context.close()
-            except Exception:
-                LOGGER.debug("failed to close resume inspection context", exc_info=True)
-        if browser is not None:
-            try:
-                browser.close()
+                browser_session.close()
             except Exception:
                 LOGGER.debug("failed to close resume inspection browser", exc_info=True)
 
 
 def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3,
-                  timeout_ms: int = 10_000) -> list[str]:
+                  timeout_ms: int = 10_000, *, data_dir: Path | None = None,
+                  profile: dict[str, Any] | None = None) -> list[str]:
     """Проверяет страницу резюме и заданные вакансии в приватном read-only контексте."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("Установите поддержку браузера: pip install -e '.[browser]'") from exc
+    from .browser import launch_context
+
     results: list[dict[str, Any]] = []
-    browser = None
-    context = None
+    browser_session = None
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(storage_state=str(state_path))
+            browser_session = launch_context(
+                pw, data_dir=data_dir or state_path.parent, state_path=state_path,
+                profile=profile, headless=True,
+            )
+            context = browser_session.context
             auth_page = context.new_page()
             try:
                 auth_page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=timeout_ms)
@@ -177,14 +183,9 @@ def inspect_items(state_path: Path, items: list[dict[str, Any]], limit: int = 3,
                 finally:
                     vacancy_page.close()
     finally:
-        if context is not None:
+        if browser_session is not None:
             try:
-                context.close()
-            except Exception:
-                LOGGER.debug("failed to close inspection context", exc_info=True)
-        if browser is not None:
-            try:
-                browser.close()
+                browser_session.close()
             except Exception:
                 LOGGER.debug("failed to close inspection browser", exc_info=True)
     return [json.dumps(result, ensure_ascii=False, sort_keys=True) for result in results]

@@ -48,7 +48,7 @@ def runner(tmp_path, monkeypatch):
                "limits": {"per_run": 10, "per_day": 10}}
     monkeypatch.setattr("applypilot.cli._profile", lambda *_args: profile)
     monkeypatch.setattr("applypilot.cli.effective_search", lambda *_args: {})
-    monkeypatch.setattr("applypilot.cli.check_session", lambda _: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
     monkeypatch.setattr("applypilot.cli.save_state", lambda *_args: None)
     monkeypatch.setattr("playwright.sync_api.sync_playwright", Playwright)
     return config, store, profile

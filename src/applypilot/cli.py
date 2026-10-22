@@ -172,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
     apply_mode.add_argument("--dry-run", action="store_true")
     apply_mode.add_argument("--run", action="store_true")
     queue_apply.add_argument("--target-success", type=int)
+    queue_mode = queue_apply.add_mutually_exclusive_group()
+    queue_mode.add_argument("--visible", dest="visible", action="store_true",
+                            help="открыть реальное окно Chrome (ручная CAPTCHA)")
+    queue_mode.add_argument("--headless", dest="headless", action="store_true",
+                            help="без окна; CAPTCHA нельзя пройти вручную")
 
     workflow = sub.add_parser("workflow", help="сохранённые письма и ручные формы")
     workflow_sub = workflow.add_subparsers(dest="workflow_action", required=True)
@@ -221,6 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
                 "--target-success", type=int,
                 help="остановиться после указанного числа подтверждённых откликов; --limit задаёт потолок кандидатов",
             )
+            mode = cmd.add_mutually_exclusive_group()
+            mode.add_argument("--visible", dest="visible", action="store_true",
+                              help="открыть реальное окно Chrome (ручная CAPTCHA)")
+            mode.add_argument("--headless", dest="headless", action="store_true",
+                              help="без окна; CAPTCHA нельзя пройти вручную")
         else:
             cmd.add_argument("--output", type=Path, help="путь к приватному JSON-плану")
         cmd.add_argument("--preset", choices=PRESET_CHOICES)
@@ -447,12 +457,13 @@ def main(argv: list[str] | None = None) -> int:
 
     session_path = config.data_dir / "hh_session.json"
     if args.command == "login":
-        login(session_path)
+        login(session_path, data_dir=config.data_dir, profile=config.load_profile())
         print(f"saved: {session_path}")
         return 0
     if args.command == "session":
         from .session import check_session
-        result = check_session(session_path)
+        result = check_session(session_path, data_dir=config.data_dir,
+                               profile=config.load_profile())
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
     if args.command == "run" and args.run_action == "bundle":
@@ -699,8 +710,11 @@ def main(argv: list[str] | None = None) -> int:
                           f"(max age {max_age_hours}h)", file=sys.stderr)
                     return 2
                 print(f"explicit apply run: {len(selected)} approved vacancy/vacancies; sync age <= {max_age_hours}h")
-                return _run_apply(selected_config, store, selected, run_id, account,
-                                  input_path, args.limit, args.target_success)
+                return _run_apply(
+                    selected_config, store, selected, run_id, account,
+                    input_path, args.limit, args.target_success,
+                    headless_override=(True if args.headless else (False if args.visible else None)),
+                )
         except (ConfigError, ValueError, OSError) as exc:
             print(f"queue: error ({str(exc)[:240]})", file=sys.stderr)
             return 2
@@ -1048,6 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
             return _run_dry(store, selected, run_id, account, args.input, limit)
         return _run_apply(
             config, store, selected, run_id, account, args.input, limit, args.target_success,
+            headless_override=(True if args.headless else (False if args.visible else None)),
         )
     if args.command == "inspect":
         ok, detail = validate_state(session_path)
@@ -1061,7 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
                     print("--page-timeout must be positive", file=sys.stderr)
                     return 2
                 print(json.dumps(inspect_resumes(
-                    session_path, timeout_ms=round(args.page_timeout * 1000)
+                    session_path, timeout_ms=round(args.page_timeout * 1000),
+                    data_dir=config.data_dir, profile=config.load_profile(),
                 ), ensure_ascii=False, sort_keys=True))
                 if args.input is None:
                     return 0
@@ -1084,7 +1100,10 @@ def main(argv: list[str] | None = None) -> int:
                     items, profile, args.limit, min_score,
                     blocked_ids=Store(config.db_path).blocked_ids(_account(profile)),
                 )]
-            results = inspect_items(session_path, items, args.limit, round(args.page_timeout * 1000))
+            results = inspect_items(
+                session_path, items, args.limit, round(args.page_timeout * 1000),
+                data_dir=config.data_dir, profile=config.load_profile(),
+            )
         except Exception as exc:  # noqa: BLE001 — read-only ошибка браузера отображается, но не повторяется автоматически
             print(f"inspect: error ({str(exc)[:240]})", file=sys.stderr)
             return 3
@@ -1357,7 +1376,8 @@ def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
 
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
                account: str, input_path: Path, requested_limit: int,
-               target_success: int | None = None) -> int:
+               target_success: int | None = None,
+               headless_override: bool | None = None) -> int:
     """Выполняет явно запрошенные браузерные отклики с аудируемыми условиями остановки."""
     try:
         profile = _profile(config, effective_search(config.load_search(), None))
@@ -1372,7 +1392,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         print("profile account changed after candidate selection; rerun dry-run", file=sys.stderr)
         return 2
     state_path = config.data_dir / "hh_session.json"
-    session = check_session(state_path)
+    session = check_session(state_path, data_dir=config.data_dir, profile=profile)
     if session.status != "confirmed":
         print(f"session unavailable: {session.status} ({session.detail}); run `applypilot login` first",
               file=sys.stderr)
@@ -1380,7 +1400,8 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     try:
         from playwright.sync_api import sync_playwright
 
-        from .autoapply import apply_one, verify_resume_visibility
+        from .autoapply import CAPTCHA_NOTE_PREFIX, apply_one, verify_resume_visibility
+        from .browser import browser_settings, launch_context
         from .negotiations import SyncError, sync_statuses
     except ImportError:
         print("browser support missing; install with: pip install -e '.[browser]'", file=sys.stderr)
@@ -1408,6 +1429,15 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     long_pause_max = max(long_pause_min, float(timing.get("long_pause_max_seconds", long_pause_min)))
     pacing_rng = random.Random()
     confirmation_timeout = max(0.0, float(timing.get("confirmation_timeout_seconds", 15)))
+    browser_options = browser_settings(profile)
+    if headless_override is not None:
+        browser_options["headless"] = headless_override
+    run_headless = bool(browser_options["headless"])
+    manual_captcha_timeout = float(browser_options["manual_captcha_timeout_seconds"])
+    interactive_captcha = (
+        not run_headless
+        and (sys.stdin.isatty() or os.getenv("APPLYPILOT_INTERACTIVE", "") == "1")
+    )
     run_status = "completed"
     stop_reason = ""
     exit_code = 0
@@ -1415,15 +1445,19 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     with store.run_lock():
         store.recover_interrupted_runs(account)
         store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
-        browser = None
+        browser_session = None
         context = None
         playwright = None
         try:
             playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(
-                storage_state=str(state_path), viewport={"width": 1280, "height": 900}
+            browser_session = launch_context(
+                playwright,
+                data_dir=config.data_dir,
+                state_path=state_path,
+                profile=profile,
+                headless=run_headless,
             )
+            context = browser_session.context
             page = context.new_page()
             # Some HH popups retain a visibility warning even while the exact
             # resume page confirms public access. Verify it again in this same
@@ -1489,9 +1523,17 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     page, item, str(item.get("resume", "")).strip(), cover_letter,
                     confirmation_timeout_seconds=confirmation_timeout,
                     visibility_verified=visibility_verified,
+                    manual_captcha_timeout=manual_captcha_timeout,
+                    interactive=interactive_captcha,
                 )
                 if result.status == "unknown":
                     store.record(item, result.status, result.note, run_id, account)
+                    if run_headless and "CAPTCHA" in result.note:
+                        print(
+                            "CAPTCHA in headless mode: solve it in visible Chrome, then run "
+                            "`sync`; do not repeat this vacancy automatically",
+                            file=sys.stderr,
+                        )
                     try:
                         save_state(state_path, context.storage_state())
                         sync_statuses(state_path, store, account=account)
@@ -1514,6 +1556,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     print(f"{item.get('id')}: {result.status} — {result.note}")
                     if result.status == "success":
                         confirmed_successes += 1
+                    if result.status == "needs_manual" and result.note.startswith(CAPTCHA_NOTE_PREFIX):
+                        run_status = "stopped_captcha"
+                        stop_reason = (
+                            f"manual HH CAPTCHA required before submission for {item.get('id')}; "
+                            "queue preserved"
+                        )
+                        if run_headless:
+                            stop_reason += "; rerun with --visible to solve it in Chrome"
+                        exit_code = 5
+                        break
                 if target_success is not None and confirmed_successes >= target_success:
                     run_status = "target_reached"
                     stop_reason = f"confirmed success target reached ({confirmed_successes})"
@@ -1558,16 +1610,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     exit_code = 3
                     print(stop_reason, file=sys.stderr)
             finally:
-                if context is not None:
+                if browser_session is not None:
+                    try:
+                        browser_session.close()
+                    except Exception:
+                        LOGGER.debug("Could not close browser session", exc_info=True)
+                elif context is not None:
                     try:
                         context.close()
                     except Exception:
                         LOGGER.debug("Could not close browser context", exc_info=True)
-                if browser is not None:
-                    try:
-                        browser.close()
-                    except Exception:
-                        LOGGER.debug("Could not close browser", exc_info=True)
                 if playwright is not None:
                     try:
                         playwright.stop()
