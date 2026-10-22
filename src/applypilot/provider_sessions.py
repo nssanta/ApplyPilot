@@ -236,6 +236,7 @@ _SOURCE_ALIASES = {
     "geekjob.ru": "geekjob",
     "yandex": "yandex",
     "yandex.ru": "yandex",
+    "yandex.ru/jobs": "yandex",
     "yandex_jobs": "yandex",
     "dreamjob": "dreamjob",
     "dreamjob.ru": "dreamjob",

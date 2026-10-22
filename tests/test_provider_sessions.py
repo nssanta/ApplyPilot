@@ -396,3 +396,14 @@ def test_unsafe_account_is_rejected(tmp_path):
 
     with pytest.raises(ValueError):
         manager.profile_dir("habr", "../escape")
+
+
+def test_all_registry_source_ids_have_browser_session_mapping(tmp_path: Path) -> None:
+    """Source keys accepted by the scanner must also work in login/check CLI."""
+    from applypilot.providers import default_registry
+
+    manager = ProviderSessionManager(tmp_path)
+    for source in default_registry().sources():
+        config = manager.source_config(source)
+        assert config.login_url or config.source == "dreamjob"
+    assert manager.source_config("yandex.ru/jobs").source == "yandex"
