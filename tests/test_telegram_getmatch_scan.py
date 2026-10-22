@@ -1,0 +1,72 @@
+"""Getmatch scanner can enrich public vacancies linked from saved Telegram messages."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from applypilot.config import AppConfig
+from applypilot.multisource import scan_source
+from applypilot.providers.getmatch import GetMatchProvider
+from applypilot.providers.registry import ProviderRegistry
+from applypilot.storage import Store
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests/fixtures/public"
+
+
+class SpyGetmatch(GetMatchProvider):
+    def __init__(self) -> None:
+        self.detail_urls: list[str] = []
+
+    def discover(self, filters):
+        self.detail_urls = list(filters.get("detail_urls") or [])
+        # Simulate a successful authenticated transport-independent detail scan
+        # using a public synthetic HTML fixture, with no network or bot clicks.
+        return super().discover({"fixture_path": str(FIXTURES / "getmatch_active_llm.html")})
+
+
+def test_telegram_hints_use_saved_public_ids_and_restore_bot_links(tmp_path: Path) -> None:
+    config = AppConfig(
+        tmp_path, tmp_path / "data", FIXTURES / "profile.toml",
+        FIXTURES / "search.toml",
+    )
+    store = Store(config.db_path)
+    store.save_telegram_messages("default", [{
+        "message_id": 101,
+        "chat": "@g_jobbot",
+        "sent_at": "2026-10-22T10:00:00+00:00",
+        "text": "Example synthetic LLM Engineer",
+        "vacancy_refs": [{"source": "getmatch.ru", "id": "36887"}],
+        "buttons": [{"text": "Откликнуться в боте", "kind": "callback", "url": ""}],
+        "application_likely": True,
+        "has_callback": True,
+    }])
+    provider = SpyGetmatch()
+    registry = ProviderRegistry([provider])
+    result = scan_source(
+        config, "ai_core", config.load_profile(), config.load_search(),
+        "getmatch.ru", registry=registry, telegram_hints=True,
+        request_budget=3, details_limit=3,
+    )
+    assert provider.detail_urls == ["https://getmatch.ru/vacancies/36887"]
+    assert result["items"] == 1
+    assert result["telegram_links"] == 1
+    rows = store.list_campaign_vacancies("default", "ai_core", "all", 10, source="getmatch.ru")
+    assert len(rows) == 1
+    assert rows[0]["telegram_message_id"] == 101
+    assert rows[0]["telegram_buttons"][0]["kind"] == "callback"
+    assert store.source_attempts("default", "getmatch.ru") == []
+
+
+def test_telegram_hints_require_explicit_opt_in(tmp_path: Path) -> None:
+    config = AppConfig(
+        tmp_path, tmp_path / "data", FIXTURES / "profile.toml",
+        FIXTURES / "search.toml",
+    )
+    provider = SpyGetmatch()
+    result = scan_source(
+        config, "ai_core", config.load_profile(), config.load_search(),
+        "getmatch.ru", registry=ProviderRegistry([provider]),
+    )
+    assert provider.detail_urls == []
+    assert result["telegram_links"] == 0

@@ -41,6 +41,11 @@ cp examples/sources.toml private/config/sources.toml
 # 4. Живой поиск всех включённых источников (без откликов).
 .venv/bin/python -m applypilot sources scan --track default --limit 100
 
+# При необходимости обогатить вакансии из сохранённых сообщений Getmatch
+# (публичные страницы, без нажатия кнопок @g_jobbot):
+.venv/bin/python -m applypilot sources scan --track default \
+  --source getmatch.ru --telegram-hints --request-budget 40 --details-limit 40
+
 # 5. Вход и проверка конкретного источника.
 .venv/bin/python -m applypilot sources login --source career.habr.com
 .venv/bin/python -m applypilot sources check --source career.habr.com

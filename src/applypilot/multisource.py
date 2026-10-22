@@ -323,6 +323,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 fixture_dir: str | Path | None = None,
                 fixture_path: str | Path | None = None,
                 detail_fixture_path: str | Path | None = None,
+                telegram_hints: bool = False,
                 registry: ProviderRegistry | None = None) -> dict[str, Any]:
     """Runs one provider and persists its normalized/scored observations.
 
@@ -409,6 +410,21 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             detail_fixture_path=detail_fixture_path,
             remote=group.get("only_remote"), date_from=cutoff.date().isoformat(),
         )
+        # The user already owns these messages. Extract public job IDs only:
+        # no bot commands are interpreted, no callbacks are executed.
+        if telegram_hints and source == "getmatch.ru" and not fixture_mode:
+            candidate_urls: list[str] = []
+            seen_ids: set[str] = set()
+            for message in store.telegram_messages(account, 1000):
+                for ref in message.get("vacancy_refs", []):
+                    native_id = str(ref.get("id") or "").strip()
+                    if (ref.get("source") != source or not native_id.isdecimal()
+                            or native_id in seen_ids):
+                        continue
+                    seen_ids.add(native_id)
+                    candidate_urls.append(f"https://getmatch.ru/vacancies/{native_id}")
+            if candidate_urls:
+                filters["detail_urls"] = candidate_urls
         discovered = provider.discover(filters)
         if hasattr(discovered, "items"):
             raw_items = list(discovered.items)
@@ -451,12 +467,23 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             snapshot_path=str(snapshot), error="\n".join(errors), error_count=len(errors),
             source=source,
         )
+        telegram_linked = 0
+        if telegram_hints and source == "getmatch.ru" and not fixture_mode:
+            # Re-attach the saved bot message metadata after scanner enrichment.
+            from .telegram_import import import_telegram_vacancies
+
+            imported = import_telegram_vacancies(
+                store, account=account, ledger_account=account,
+                track=track, limit=1000, create_missing=False,
+            )
+            telegram_linked = imported["linked_count"]
         top = store.list_campaign_vacancies(account, track, "top", min(10, max(1, limit)), source=source)
         return {
             "campaign_id": campaign_id, "source": source, "status": status,
             "account": account, "track": track, "fixture": bool(fixture_dir or fixture_path),
             "items": len(items), "segments": len(segments), "errors": errors,
             "snapshot": str(snapshot), "summary": summary, "top": top,
+            "telegram_links": telegram_linked,
         }
     except Exception as exc:  # noqa: BLE001 - source failures are isolated by contract
         message = f"{type(exc).__name__}: {exc}"

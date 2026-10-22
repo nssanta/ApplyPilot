@@ -210,6 +210,10 @@ def build_parser() -> argparse.ArgumentParser:
     sources_scan.add_argument("--details-limit", type=int)
     sources_scan.add_argument("--limit", type=int, default=100)
     sources_scan.add_argument("--fixture-dir", help="офлайн-каталог публичных HTML-образцов")
+    sources_scan.add_argument(
+        "--telegram-hints", action="store_true",
+        help="Getmatch: обогатить вакансии из уже сохранённых сообщений @g_jobbot",
+    )
     sources_scan.add_argument("--json", action="store_true")
     sources_approve = sources_sub.add_parser("approve", help="source-scoped решение по вакансиям")
     sources_approve.add_argument("--track", required=True)
@@ -1023,7 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
                 selected_config, args.track, profile, search, sources=sources,
                 pages=args.pages, request_budget=args.request_budget,
                 details_limit=args.details_limit, limit=args.limit,
-                fixture_dir=args.fixture_dir, registry=registry,
+                fixture_dir=args.fixture_dir, telegram_hints=args.telegram_hints,
+                registry=registry,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
