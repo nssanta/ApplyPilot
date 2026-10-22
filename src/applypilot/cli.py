@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import logging
 import os
@@ -141,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_sub = queue.add_subparsers(dest="queue_action", required=True)
     queue_list = queue_sub.add_parser("list", help="показать вакансии из SQLite")
     queue_list.add_argument("--track")
+    queue_list.add_argument("--source", help="фильтр по источнику; без флага — все источники")
     queue_list.add_argument("--view", choices=(
         "all", "new", "top", "deferred", "approved", "ready", "needs_letter", "needs_form",
         "external_ats", "unknown", "applied", "skip",
@@ -149,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_list.add_argument("--json", action="store_true")
     queue_set = queue_sub.add_parser("set", help="сохранить решение владельца по вакансии")
     queue_set.add_argument("--track", required=True)
+    queue_set.add_argument("--source", default="hh.ru", help="источник вакансии")
     queue_set.add_argument("--id", required=True)
     queue_set.add_argument("--state", required=True,
                            choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
@@ -156,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_set.add_argument("--notes")
     queue_batch = queue_sub.add_parser("batch-set", help="атомарно пометить пакет вакансий")
     queue_batch.add_argument("--track", required=True)
+    queue_batch.add_argument("--source", default="hh.ru", help="источник вакансий")
     queue_batch.add_argument("--id", action="append", required=True,
                              help="ID вакансии; повторить до 100 раз")
     queue_batch.add_argument("--state", required=True,
@@ -167,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_history.add_argument("--json", action="store_true")
     queue_apply = queue_sub.add_parser("apply", help="dry-run или явный запуск по APPROVED из очереди")
     queue_apply.add_argument("--track", required=True)
+    queue_apply.add_argument("--source", default="hh.ru", help="источник очереди")
     queue_apply.add_argument("--limit", type=int, default=100)
     apply_mode = queue_apply.add_mutually_exclusive_group(required=True)
     apply_mode.add_argument("--dry-run", action="store_true")
@@ -177,6 +182,199 @@ def build_parser() -> argparse.ArgumentParser:
                             help="открыть реальное окно Chrome (ручная CAPTCHA)")
     queue_mode.add_argument("--headless", dest="headless", action="store_true",
                             help="без окна; CAPTCHA нельзя пройти вручную")
+
+    sources = sub.add_parser("sources", help="мультиплатформенные источники и их сессии")
+    sources_sub = sources.add_subparsers(dest="sources_action", required=True)
+    sources_list = sources_sub.add_parser("list", help="показать источники и их возможности")
+    sources_list.add_argument("--json", action="store_true")
+    sources_status = sources_sub.add_parser("status", help="показать очередь и состояние источников")
+    sources_status.add_argument("--track", required=True)
+    sources_status.add_argument("--json", action="store_true")
+    for action_name, action_help in (
+        ("login", "открыть видимое окно ручной авторизации источника"),
+        ("check", "проверить сохранённую сессию источника"),
+    ):
+        action = sources_sub.add_parser(action_name, help=action_help)
+        action.add_argument("--source", required=True)
+        action.add_argument("--account", default=None, help="по умолчанию из sources.toml")
+        action.add_argument("--wait-seconds", type=int, default=300,
+                            help="сколько ждать подтверждения входа; 0 — не ждать")
+        action.add_argument("--no-interactive", action="store_true",
+                            help="не читать stdin; только окно браузера и проверка маркера")
+        action.add_argument("--json", action="store_true")
+    sources_scan = sources_sub.add_parser("scan", help="сканировать все или выбранные источники")
+    sources_scan.add_argument("--track", required=True)
+    sources_scan.add_argument("--source", action="append", help="повторить для выбора нескольких")
+    sources_scan.add_argument("--pages", type=int)
+    sources_scan.add_argument("--request-budget", type=int)
+    sources_scan.add_argument("--details-limit", type=int)
+    sources_scan.add_argument("--limit", type=int, default=100)
+    sources_scan.add_argument("--fixture-dir", help="офлайн-каталог публичных HTML-образцов")
+    sources_scan.add_argument("--json", action="store_true")
+    sources_approve = sources_sub.add_parser("approve", help="source-scoped решение по вакансиям")
+    sources_approve.add_argument("--track", required=True)
+    sources_approve.add_argument("--source", required=True)
+    sources_approve.add_argument("--id", action="append", required=True)
+    sources_approve.add_argument("--state", default="APPROVED",
+                                 choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
+    sources_approve.add_argument("--reason", default="")
+    sources_plan = sources_sub.add_parser("plan", help="dry-run план очереди без отправки")
+    sources_plan.add_argument("--track", required=True)
+    sources_plan.add_argument("--source", required=True)
+    sources_plan.add_argument("--limit", type=int, default=100)
+    sources_plan.add_argument("--json", action="store_true")
+
+    sources_dispatch_plan = sources_sub.add_parser(
+        "dispatch-plan", help="общий dry-run план по всем или выбранным источникам",
+    )
+    sources_dispatch_plan.add_argument("--track", required=True)
+    sources_dispatch_plan.add_argument("--source", action="append")
+    sources_dispatch_plan.add_argument("--limit", type=int, default=100)
+    sources_dispatch_plan.add_argument("--json", action="store_true")
+
+    sources_dispatch_apply = sources_sub.add_parser(
+        "dispatch-apply", help="общий диспетчер откликов; по умолчанию только dry-run",
+    )
+    sources_dispatch_apply.add_argument("--track", required=True)
+    sources_dispatch_apply.add_argument("--source", action="append")
+    sources_dispatch_apply.add_argument("--limit", type=int, default=100)
+    sources_dispatch_apply.add_argument("--allow-live", action="store_true",
+                                        help="разрешить live-драйверы; без драйвера источник пропускается")
+    sources_dispatch_apply.add_argument("--json", action="store_true")
+
+    sources_approve_batch = sources_sub.add_parser(
+        "approve-batch", help="атомарное пакетное решение по вакансиям источника",
+    )
+    sources_approve_batch.add_argument("--track", required=True)
+    sources_approve_batch.add_argument("--source", required=True)
+    sources_approve_batch.add_argument("--id", action="append",
+                                       help="ID или список ID через запятую; повторите флаг")
+    sources_approve_batch.add_argument("--from-view", choices=("top", "review", "all"))
+    sources_approve_batch.add_argument("--limit", type=int, default=100)
+    sources_approve_batch.add_argument(
+        "--state", default="APPROVED",
+        choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"),
+    )
+    sources_approve_batch.add_argument("--reason", default="")
+    sources_approve_batch.add_argument("--json", action="store_true")
+
+    sources_accounts = sources_sub.add_parser("accounts", help="показать source account mapping")
+    sources_accounts.add_argument("--track", required=True)
+    sources_accounts.add_argument("--json", action="store_true")
+    sources_recover = sources_sub.add_parser("recover", help="карантинить прерванные submitting-попытки")
+    sources_recover.add_argument("--account")
+    sources_recover.add_argument("--max-age-seconds", type=int, default=900)
+    sources_recover.add_argument("--json", action="store_true")
+    sources_reconcile = sources_sub.add_parser("reconcile", help="подтвердить unknown только с evidence")
+    sources_reconcile.add_argument("--track", required=True)
+    sources_reconcile.add_argument("--source", required=True)
+    sources_reconcile.add_argument("--id", required=True)
+    sources_reconcile.add_argument("--channel", required=True)
+    sources_reconcile.add_argument("--evidence", required=True)
+    sources_reconcile.add_argument("--note", default="")
+    sources_attempts = sources_sub.add_parser("attempts", help="история source-aware попыток")
+    sources_attempts.add_argument("--source")
+    sources_attempts.add_argument("--limit", type=int, default=200)
+    sources_attempts.add_argument("--json", action="store_true")
+
+    accounts = sub.add_parser("accounts", help="локальные аккаунты Telegram MTProto и HH OAuth")
+    accounts_sub = accounts.add_subparsers(dest="accounts_action", required=True)
+
+    accounts_list = accounts_sub.add_parser("list", help="показать локальные аккаунты и статусы")
+    accounts_list.add_argument("--json", action="store_true")
+
+    accounts_check = accounts_sub.add_parser("check", help="проверить статус; --online включает сеть")
+    accounts_check.add_argument("--account", default=None)
+    accounts_check.add_argument("--online", action="store_true")
+    accounts_check.add_argument("--json", action="store_true")
+
+    tg_setup = accounts_sub.add_parser("telegram-setup", help="сохранить API_ID/API_HASH локально")
+    tg_setup.add_argument("--api-id", type=int)
+    tg_setup.add_argument("--account", default=None)
+    tg_setup.add_argument("--json", action="store_true")
+
+    tg_login = accounts_sub.add_parser("telegram-login", help="локальный вход в Telegram")
+    tg_login.add_argument("--account", default=None)
+    tg_login.add_argument("--phone", default=None)
+    tg_login.add_argument("--json", action="store_true")
+
+    tg_status = accounts_sub.add_parser("telegram-status", help="статус Telegram-сессии")
+    tg_status.add_argument("--account", default=None)
+    tg_status.add_argument("--online", action="store_true")
+    tg_status.add_argument("--json", action="store_true")
+
+    tg_history = accounts_sub.add_parser("telegram-history", help="прочитать историю @g_jobbot")
+    tg_history.add_argument("--account", default=None)
+    tg_history.add_argument("--limit", type=int, default=50)
+    tg_history.add_argument("--json", action="store_true")
+
+    tg_sync = accounts_sub.add_parser("telegram-sync", help="сохранить историю и построить dry-run план")
+    tg_sync.add_argument("--account", default=None)
+    tg_sync.add_argument("--track", default=None)
+    tg_sync.add_argument("--limit", type=int, default=50)
+    tg_sync.add_argument("--json", action="store_true")
+
+    tg_plan = accounts_sub.add_parser("telegram-plan", help="dry-run план из сохранённых сообщений")
+    tg_plan.add_argument("--account", default=None)
+    tg_plan.add_argument("--track", default=None)
+    tg_plan.add_argument("--limit", type=int, default=50)
+    tg_plan.add_argument("--json", action="store_true")
+
+    tg_import = accounts_sub.add_parser(
+        "telegram-import", help="связать сохранённые сообщения @g_jobbot с очередью Getmatch",
+    )
+    tg_import.add_argument("--account", default=None)
+    tg_import.add_argument("--track", default=None)
+    tg_import.add_argument("--source", default="getmatch.ru")
+    tg_import.add_argument("--limit", type=int, default=200)
+    tg_import.add_argument("--create-missing", action="store_true",
+                           help="создать review-only placeholder для ещё не скачанной вакансии")
+    tg_import.add_argument("--json", action="store_true")
+
+    hh_setup = accounts_sub.add_parser("hh-oauth-setup", help="сохранить client_id/secret HH OAuth")
+    hh_setup.add_argument("--client-id")
+    hh_setup.add_argument("--redirect-uri", default=None)
+    hh_setup.add_argument("--json", action="store_true")
+
+    hh_auth = accounts_sub.add_parser("hh-oauth-authorize", help="локальная ссылка авторизации HH")
+    hh_auth.add_argument("--account", default=None)
+    hh_auth.add_argument("--json", action="store_true")
+
+    hh_exchange = accounts_sub.add_parser(
+        "hh-oauth-exchange",
+        help="обменять redirect URL или code на токен (state проверяется обязательно)",
+    )
+    hh_exchange.add_argument("--account", default=None)
+    hh_exchange.add_argument(
+        "--state", default=None,
+        help="state из redirect URL; не нужен, если вставлен полный redirect URL",
+    )
+    hh_exchange.add_argument("--json", action="store_true")
+
+    hh_status = accounts_sub.add_parser("hh-oauth-status", help="статус токена HH")
+    hh_status.add_argument("--account", default=None)
+    hh_status.add_argument("--online", action="store_true")
+    hh_status.add_argument("--json", action="store_true")
+
+    hh_neg = accounts_sub.add_parser("hh-oauth-negotiations", help="прочитать отклики HH")
+    hh_neg.add_argument("--account", default=None)
+    hh_neg.add_argument("--limit", type=int, default=20)
+    hh_neg.add_argument("--json", action="store_true")
+
+    hh_msgs = accounts_sub.add_parser(
+        "hh-oauth-messages", help="read-only: сообщения конкретного отклика HH",
+    )
+    hh_msgs.add_argument("--account", default=None)
+    hh_msgs.add_argument("--negotiation-id", required=True)
+    hh_msgs.add_argument("--limit", type=int, default=50)
+    hh_msgs.add_argument("--json", action="store_true")
+
+    hh_apply = accounts_sub.add_parser("hh-oauth-apply-plan", help="spec отклика HH без отправки")
+    hh_apply.add_argument("--account", default=None)
+    hh_apply.add_argument("--vacancy-id", required=True)
+    hh_apply.add_argument("--resume-id", required=True)
+    hh_apply.add_argument("--message", default="")
+    hh_apply.add_argument("--json", action="store_true")
 
     workflow = sub.add_parser("workflow", help="сохранённые письма и ручные формы")
     workflow_sub = workflow.add_subparsers(dest="workflow_action", required=True)
@@ -365,6 +563,12 @@ def _campaign_view(config: AppConfig, track: str | None, *, profile_override: bo
     return Store(config.db_path), _account(profile), None
 
 
+def _default_track(config: AppConfig) -> str:
+    from .tracks import load_tracks
+    tracks = load_tracks(config.root)
+    return "ai_core" if "ai_core" in tracks else (next(iter(tracks), "") if tracks else "")
+
+
 def _account(profile: dict) -> str:
     """Использует явный приватный ключ аккаунта с сохранением обратной совместимости."""
     return str(profile.get("account") or "default").strip() or "default"
@@ -426,6 +630,291 @@ def _print_candidates(items: list[dict], profile: dict, limit: int, min_score: i
     return [candidate.to_dict() for candidate in candidates]
 
 
+def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
+    """Local account management for Telegram MTProto and HH OAuth."""
+    from .accounts import (
+        DEFAULT_HH_ACCOUNT,
+        DEFAULT_TELEGRAM_ACCOUNT,
+        telegram_queue_plan,
+        unified_accounts,
+    )
+    from .hh_oauth import (
+        HhOAuthAccount,
+        HhOAuthError,
+        hh_oauth_status,
+    )
+    from .hh_oauth import (
+        save_credentials as save_hh_credentials,
+    )
+    from .storage import Store
+    from .telegram_client import (
+        TelegramAccount,
+        TelegramNotConfigured,
+        TelegramUnavailable,
+        telegram_status,
+    )
+    from .telegram_client import (
+        save_credentials as save_tg_credentials,
+    )
+
+    root = config.root
+    store = Store(config.db_path)
+    telegram_account = str(getattr(args, "account", None) or DEFAULT_TELEGRAM_ACCOUNT).strip() or DEFAULT_TELEGRAM_ACCOUNT
+    hh_account = str(getattr(args, "account", None) or DEFAULT_HH_ACCOUNT).strip() or DEFAULT_HH_ACCOUNT
+    track = str(getattr(args, "track", None) or _default_track(config)).strip()
+
+    def emit(payload: object) -> None:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    try:
+        if args.accounts_action == "list":
+            payload = unified_accounts(root, telegram_account=telegram_account, hh_account=hh_account)
+            payload["last_checks"] = store.external_accounts()
+            if args.json:
+                emit(payload)
+            else:
+                for provider in ("telegram", "hh_oauth"):
+                    item = payload[provider]
+                    print(f"{provider}: {item.get('status')} · account={item.get('account')} · "
+                          f"apply={item.get('apply_status', '')}")
+            return 0
+
+        if args.accounts_action == "check":
+            payload = unified_accounts(root, telegram_account=telegram_account, hh_account=hh_account)
+            if args.online:
+                payload["telegram"] = TelegramAccount(root, telegram_account).status()
+                payload["hh_oauth"] = HhOAuthAccount(root, hh_account).status(check_remote=True)
+                for provider, item in (("telegram", payload["telegram"]), ("hh_oauth", payload["hh_oauth"])):
+                    store.save_external_account(
+                        provider, item.get("account", ""), str(item.get("status", "")),
+                        str(item.get("detail", "")), {"source": "accounts check"},
+                    )
+            if args.json:
+                emit(payload)
+            else:
+                for provider in ("telegram", "hh_oauth"):
+                    item = payload[provider]
+                    print(f"{provider}: {item.get('status')} · account={item.get('account')} · "
+                          f"detail={item.get('detail', '')}")
+            return 0
+
+        if args.accounts_action == "telegram-setup":
+            api_id = args.api_id
+            if api_id is None:
+                api_id = int(input("Telegram API_ID (my.telegram.org): ").strip())
+            api_hash = getpass.getpass("Telegram API_HASH (hidden): ").strip()
+            path = save_tg_credentials(root, api_id, api_hash)
+            payload = {
+                "status": "configured",
+                "path": str(path),
+                "api_id": api_id,
+                "api_hash": "***",
+                "next": "applypilot accounts telegram-login --phone +<your number>",
+            }
+            if args.json:
+                emit(payload)
+            else:
+                print(f"Telegram credentials saved to {path} (0600). Next: "
+                      "applypilot accounts telegram-login --phone +<your number>")
+            return 0
+
+        if args.accounts_action == "telegram-login":
+            phone = args.phone or input("Telegram phone (+...): ").strip()
+            result = TelegramAccount(root, telegram_account).login(
+                phone,
+                code_callback=lambda: getpass.getpass("Telegram code (hidden): ").strip(),
+                password_callback=lambda: getpass.getpass("Telegram 2FA password (hidden): ").strip(),
+            )
+            store.save_external_account(
+                "telegram", telegram_account, str(result.get("status", "")),
+                str(result.get("detail", "")), {"source": "telegram-login"},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"telegram: {result.get('status')} · account={telegram_account} · "
+                      f"session={result.get('session')}")
+            return 0 if result.get("status") == "confirmed" else 2
+
+        if args.accounts_action == "telegram-status":
+            result = (
+                TelegramAccount(root, telegram_account).status()
+                if args.online else telegram_status(root, telegram_account)
+            )
+            store.save_external_account(
+                "telegram", telegram_account, str(result.get("status", "")),
+                str(result.get("detail", "")), {"source": "telegram-status"},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"telegram: {result.get('status')} · account={telegram_account} · "
+                      f"session_present={result.get('session_present')}")
+            return 0
+
+        if args.accounts_action == "telegram-history":
+            messages = TelegramAccount(root, telegram_account).history(args.limit)
+            public = [
+                {
+                    "message_id": item.get("message_id"),
+                    "sent_at": item.get("sent_at"),
+                    "text": item.get("text"),
+                    "buttons": [
+                        {key: value for key, value in button.items() if key != "callback_sha256"}
+                        for button in item.get("buttons", [])
+                    ],
+                    "vacancy_refs": item.get("vacancy_refs", []),
+                    "application_likely": item.get("application_likely"),
+                }
+                for item in messages
+            ]
+            if args.json:
+                emit(public)
+            else:
+                for item in public:
+                    print(f"{item['message_id']} · {item['sent_at']} · {item['text'][:120]!r} · "
+                          f"buttons={len(item['buttons'])}")
+            return 0
+
+        if args.accounts_action == "telegram-sync":
+            result = TelegramAccount(root, telegram_account).sync(store, args.limit)
+            result["plan"] = telegram_queue_plan(store, telegram_account, track, args.limit)
+            store.save_external_account(
+                "telegram", telegram_account, "ok", "history synced",
+                {"messages": result.get("messages"), "saved": result.get("saved")},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"telegram: synced {result.get('messages')} message(s), saved {result.get('saved')}; "
+                      f"planned {result['plan'].get('planned_count')} dry-run item(s)")
+            return 0
+
+        if args.accounts_action == "telegram-plan":
+            result = telegram_queue_plan(store, telegram_account, track, args.limit)
+            if args.json:
+                emit(result)
+            else:
+                print(f"telegram plan: {result.get('planned_count')} item(s), "
+                      f"{result.get('unmatched_count')} unmatched · mode=dry_run")
+            return 0
+
+        if args.accounts_action == "telegram-import":
+            from .multisource import resolve_source_account
+            from .telegram_import import import_telegram_vacancies
+
+            ledger_account = resolve_source_account(config, config.load_profile(), args.source)
+            result = import_telegram_vacancies(
+                store, account=telegram_account, source=args.source, track=track,
+                limit=args.limit, create_missing=bool(args.create_missing),
+                ledger_account=ledger_account,
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(
+                    f"telegram import: linked={result['linked_count']} "
+                    f"created={result['created_count']} missing={result['missing_count']}"
+                )
+            return 0
+
+        if args.accounts_action == "hh-oauth-setup":
+            client_id = args.client_id or input("HH OAuth client_id: ").strip()
+            client_secret = getpass.getpass("HH OAuth client_secret (hidden): ").strip()
+            redirect_uri = args.redirect_uri or input(
+                "HH OAuth redirect_uri [http://localhost:8765/callback]: "
+            ).strip() or "http://localhost:8765/callback"
+            path = save_hh_credentials(root, client_id, client_secret, redirect_uri)
+            payload = {
+                "status": "configured", "path": str(path), "client_id": client_id,
+                "client_secret": "***", "redirect_uri": redirect_uri,
+                "next": "applypilot accounts hh-oauth-authorize",
+            }
+            if args.json:
+                emit(payload)
+            else:
+                print(f"HH OAuth credentials saved to {path} (0600). Next: "
+                      "applypilot accounts hh-oauth-authorize")
+            return 0
+
+        if args.accounts_action == "hh-oauth-authorize":
+            result = HhOAuthAccount(root, hh_account).authorize_url()
+            store.save_external_account(
+                "hh_oauth", hh_account, "authorization_required", "local authorize URL issued",
+                {"redirect_uri": result.get("redirect_uri")},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"Open locally:\n{result.get('url')}\nstate={result.get('state')}")
+            return 0
+
+        if args.accounts_action == "hh-oauth-exchange":
+            code = getpass.getpass(
+                "HH redirect URL or authorization code (hidden): "
+            ).strip()
+            result = HhOAuthAccount(root, hh_account).exchange_code(code, args.state)
+            store.save_external_account(
+                "hh_oauth", hh_account, "authorized", "token saved",
+                {"expires_at": result.get("expires_at")},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"hh_oauth: authorized · account={hh_account} · expires_at={result.get('expires_at')}")
+            return 0
+
+        if args.accounts_action == "hh-oauth-status":
+            result = (
+                HhOAuthAccount(root, hh_account).status(check_remote=True)
+                if args.online else hh_oauth_status(root, hh_account)
+            )
+            store.save_external_account(
+                "hh_oauth", hh_account, str(result.get("status", "")),
+                str(result.get("detail", "")), {"source": "hh-oauth-status"},
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(f"hh_oauth: {result.get('status')} · account={hh_account} · "
+                      f"token_present={result.get('token_present', False)}")
+            return 0
+
+        if args.accounts_action == "hh-oauth-negotiations":
+            rows = HhOAuthAccount(root, hh_account).negotiations(args.limit)
+            if args.json:
+                emit(rows)
+            else:
+                print(f"hh_oauth negotiations: {len(rows)}")
+            return 0
+
+        if args.accounts_action == "hh-oauth-messages":
+            rows = HhOAuthAccount(root, hh_account).messages(
+                args.negotiation_id, args.limit,
+            )
+            if args.json:
+                emit(rows)
+            else:
+                print(f"hh_oauth messages: {len(rows)} · negotiation={args.negotiation_id}")
+                for row in rows:
+                    print(f"{row.get('created_at', '')} · {row.get('author', '')} · "
+                          f"{row.get('text', '')}")
+            return 0
+
+        if args.accounts_action == "hh-oauth-apply-plan":
+            spec = HhOAuthAccount.apply_spec(args.vacancy_id, args.resume_id, args.message)
+            if args.json:
+                emit(spec)
+            else:
+                print(json.dumps(spec, ensure_ascii=False, indent=2))
+            return 0
+    except (ConfigError, ValueError, OSError, HhOAuthError, TelegramNotConfigured, TelegramUnavailable) as exc:
+        print(f"accounts: error ({str(exc)[:240]})", file=sys.stderr)
+        return 2
+    print(f"accounts: unknown action {args.accounts_action}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = _config(args)
@@ -466,6 +955,254 @@ def main(argv: list[str] | None = None) -> int:
                                profile=config.load_profile())
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
+    if args.command == "sources":
+        from .multisource import queue_plan, scan_sources, source_status
+        from .providers import default_registry
+
+        registry = default_registry()
+        if args.sources_action == "list":
+            rows = registry.catalogue()
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    caps = row["capabilities"]
+                    enabled = "scan" if caps["discover"] else "read-only"
+                    print(f"{row['source']} · {row['label']} · {enabled} · "
+                          f"login={'yes' if caps['login'] else 'no'} · "
+                          f"apply={caps['apply_status']}")
+            return 0
+        if args.sources_action == "status":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search())
+            result = source_status(selected_config, args.track, None, registry=registry)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"sources: track={args.track}; account={result['account']}")
+                for row in result["sources"]:
+                    print(f"  {row['source']}: account={row['account']} queue={row['queue']} "
+                          f"reviewable={row.get('reviewable', 0)} approved={row['approved']} "
+                          f"apply={row['capabilities']['apply_status']}")
+            return 0
+        if args.sources_action in {"login", "check"}:
+            from .multisource import resolve_source_account
+            from .provider_sessions import ProviderSessionManager
+            selected_config, _track_info = _track_config(
+                config, args.track if getattr(args, "track", None) else _default_track(config),
+                profile_override=bool(args.profile), search_override=bool(args.search),
+            )
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            account = args.account or resolve_source_account(selected_config, profile, args.source)
+            manager = ProviderSessionManager(config.data_dir / "providers")
+            if args.sources_action == "login":
+                result = manager.login(
+                    args.source, account,
+                    wait_seconds=args.wait_seconds,
+                    interactive=not args.no_interactive,
+                )
+            else:
+                result = manager.check(args.source, account)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"{args.source}/{account}: {result.get('status')} — {result.get('detail','')}")
+            return 0 if result.get("status") in {"confirmed", "valid-format", "saved"} else 1
+        if args.sources_action == "scan":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search())
+            profile = _profile(selected_config, search)
+            sources = args.source or None
+            result = scan_sources(
+                selected_config, args.track, profile, search, sources=sources,
+                pages=args.pages, request_budget=args.request_budget,
+                details_limit=args.details_limit, limit=args.limit,
+                fixture_dir=args.fixture_dir, registry=registry,
+            )
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"multi-source scan: track={args.track}; sources={len(result['sources'])}")
+                for row in result["sources"]:
+                    print(f"  {row['source']}: {row['status']} · items={row.get('items', 0)} · "
+                          f"campaign={row.get('campaign_id','-')}")
+                    for error in row.get("errors", [])[:4]:
+                        print(f"    note: {error[:220]}")
+            return 0 if not result["failed_sources"] else 2
+        if args.sources_action == "approve":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search())
+            from .multisource import resolve_source_account
+            account = resolve_source_account(
+                selected_config, _profile(selected_config, search), args.source,
+            )
+            changed = Store(selected_config.db_path).set_review_state_batch(
+                account, args.source, args.id, args.state, reason=args.reason, track=args.track,
+            )
+            print(f"sources: {changed} -> {args.state.upper()} ({args.source}, track={args.track})")
+            return 0
+        if args.sources_action == "plan":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            search = effective_search(selected_config.load_search())
+            from .multisource import resolve_source_account
+            account = resolve_source_account(
+                selected_config, _profile(selected_config, search), args.source,
+            )
+            plan = queue_plan(Store(selected_config.db_path), account, args.track,
+                              args.source, args.limit, registry=registry)
+            if args.json:
+                print(json.dumps(plan, ensure_ascii=False, indent=2))
+            else:
+                print(f"source dry-run: {args.source}; planned={plan['planned_count']} "
+                      f"blocked={plan['blocked_count']} · apply={plan['apply_status']}")
+                for row in plan["planned"]:
+                    print(f"  PLAN {row['id']} · {row['name']} — {row['company']}")
+                for row in plan["blocked"]:
+                    print(f"  BLOCKED {row['id']} · {row['reason']}")
+            return 0
+        if args.sources_action in {"dispatch-plan", "dispatch-apply"}:
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            from .dispatch import dispatch_apply, dispatch_plan
+            from .multisource import resolve_source_account
+
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            selected = args.source or [row["source"] for row in registry.catalogue()]
+            accounts = {
+                source: resolve_source_account(selected_config, profile, source)
+                for source in selected
+            }
+            store = Store(selected_config.db_path)
+            if args.sources_action == "dispatch-plan":
+                result = dispatch_plan(
+                    store, "default", args.track, selected, args.limit,
+                    accounts=accounts, registry=registry,
+                )
+            else:
+                result = dispatch_apply(
+                    store, "default", args.track, selected, args.limit,
+                    allow_live=bool(args.allow_live), accounts=accounts, registry=registry,
+                )
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"dispatch {result['mode']}: sources={len(result['sources'])} "
+                    f"planned={result['planned_count']} blocked={result['blocked_count']} "
+                    f"executed={result.get('executed', 0)}"
+                )
+                for row in result["planned"]:
+                    print(f"  PLAN {row['source']}:{row['id']} · {row['name']} — {row['company']}")
+                for row in result["blocked"]:
+                    print(f"  BLOCKED {row['source']}:{row['id']} · {row['reason']}")
+                for row in result.get("results", []):
+                    print(f"  RESULT {row['source']}:{row['id']} · {row['status']} · {row.get('reason', '')}")
+            return 0
+        if args.sources_action == "approve-batch":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            from .dispatch import approve_batch
+            from .multisource import resolve_source_account
+
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            account = resolve_source_account(selected_config, profile, args.source)
+            store = Store(selected_config.db_path)
+            ids: list[str] = []
+            for chunk in (args.id or []):
+                ids.extend(value.strip() for value in chunk.split(",") if value.strip())
+            if not ids and args.from_view:
+                rows = store.list_campaign_vacancies(account, args.track, args.from_view, args.limit)
+                ids = [str(row["id"]) for row in rows]
+            result = approve_batch(
+                store, account, args.track, args.source, ids,
+                state=args.state, reason=args.reason,
+            )
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"approve-batch {result['source']}: requested={result['requested']} "
+                    f"updated={result['updated']} state={result['state']}"
+                )
+            return 0
+        if args.sources_action == "accounts":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            from .multisource import resolve_source_account
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            rows = [
+                {"source": row["source"], "label": row["label"],
+                 "account": resolve_source_account(selected_config, profile, row["source"]),
+                 "capabilities": row["capabilities"]}
+                for row in registry.catalogue()
+            ]
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    print(f"{row['source']} -> {row['account']} · apply={row['capabilities']['apply_status']}")
+            return 0
+        if args.sources_action == "recover":
+            store = Store(config.db_path)
+            rows = store.recover_stale_source_reservations(
+                max_age_seconds=args.max_age_seconds, account=args.account,
+            )
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            else:
+                print(f"recovered/quarantined: {len(rows)}")
+                for row in rows:
+                    print(f"  {row['source']}:{row['vacancy_id']} · {row['status']} · {row['run_id']}")
+            return 0
+        if args.sources_action == "reconcile":
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            from .multisource import resolve_source_account
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            account = resolve_source_account(selected_config, profile, args.source)
+            ok = Store(selected_config.db_path).reconcile_source_application(
+                account, args.source, args.id, args.track, args.channel,
+                args.evidence, note=args.note,
+            )
+            print(f"reconcile {args.source}:{args.id}: {'confirmed' if ok else 'rejected'}")
+            return 0 if ok else 2
+        if args.sources_action == "attempts":
+            store = Store(config.db_path)
+            if args.source:
+                rows = store.source_attempts("default", args.source, args.limit)
+            else:
+                rows = []
+                for source in registry.sources():
+                    rows.extend(store.source_attempts("default", source, args.limit))
+            rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+            if args.json:
+                print(json.dumps(rows[:args.limit], ensure_ascii=False, indent=2))
+            else:
+                for row in rows[:args.limit]:
+                    print(f"{row['updated_at']} {row['source']}:{row['vacancy_id']} "
+                          f"{row['status']} {row.get('note','')}")
+            return 0
+        return 2
     if args.command == "run" and args.run_action == "bundle":
         from .bundles import compile_bundle
         from .campaigns import run_campaign
@@ -599,7 +1336,9 @@ def main(argv: list[str] | None = None) -> int:
                     config, args.track, profile_override=bool(args.profile),
                     search_override=bool(args.search),
                 )
-                rows = store.list_campaign_vacancies(account, track, args.view, args.limit)
+                rows = store.list_campaign_vacancies(
+                    account, track, args.view, args.limit, source=args.source,
+                )
                 if args.json:
                     print(json.dumps({"account": account, "track": track, "view": args.view,
                                       "count": len(rows), "items": rows}, ensure_ascii=False, indent=2))
@@ -641,7 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
                 search = effective_search(selected_config.load_search())
                 account = _account(_profile(selected_config, search))
                 Store(selected_config.db_path).set_review_state(
-                    account, "hh.ru", args.id, args.state, reason=args.reason, notes=args.notes,
+                    account, args.source, args.id, args.state, reason=args.reason, notes=args.notes,
                     track=args.track,
                 )
                 print(f"queue: {args.id} -> {args.state.upper()} (track={args.track})")
@@ -654,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
                 search = effective_search(selected_config.load_search())
                 account = _account(_profile(selected_config, search))
                 changed = Store(selected_config.db_path).set_review_state_batch(
-                    account, "hh.ru", args.id, args.state, reason=args.reason, track=args.track,
+                    account, args.source, args.id, args.state, reason=args.reason, track=args.track,
                 )
                 print(f"queue: batch={changed} -> {args.state.upper()} (track={args.track})")
                 return 0
@@ -673,6 +1412,20 @@ def main(argv: list[str] | None = None) -> int:
                 profile = _profile(selected_config, search)
                 account = _account(profile)
                 store = Store(selected_config.db_path)
+                if args.source != "hh.ru":
+                    from .multisource import queue_plan
+                    plan = queue_plan(store, account, args.track, args.source, args.limit)
+                    print(f"source dry-run: {args.source}; planned={plan['planned_count']} "
+                          f"blocked={plan['blocked_count']} · apply={plan['apply_status']}")
+                    for row in plan["planned"]:
+                        print(f"  PLAN {row['id']} · {row['name']} — {row['company']}")
+                    for row in plan["blocked"]:
+                        print(f"  BLOCKED {row['id']} · {row['reason']}")
+                    if args.run:
+                        print("real submit is disabled for this source: needs_live_validation",
+                              file=sys.stderr)
+                        return 2
+                    return 0
                 from .campaigns import write_approved_input
 
                 input_path, selected = write_approved_input(selected_config, args.track, account, args.limit)
@@ -718,6 +1471,8 @@ def main(argv: list[str] | None = None) -> int:
         except (ConfigError, ValueError, OSError) as exc:
             print(f"queue: error ({str(exc)[:240]})", file=sys.stderr)
             return 2
+    if args.command == "accounts":
+        return _accounts_command(config, args)
     if args.command == "workflow":
         try:
             if args.workflow_action == "list":
