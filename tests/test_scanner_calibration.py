@@ -194,3 +194,21 @@ def test_bundle_new_count_uses_sqlite_not_stale_legacy_is_new_flag(tmp_path):
     assert report["first_seen_sqlite_unique"] == 0
     assert report["new_since_previous_unique"] == 0
     assert report["published_last_24h_unique"] == 1
+
+
+def test_ai_devops_plus_development_is_not_false_negative():
+    cfg = ROLE_PRESETS["ai-agents-llmops"]
+    profile = {**cfg, "search": cfg, "rescore": True}
+    engineer = score_vacancy(
+        {"id": "one", "name": "AI инженер (devops и разработка)",
+         "description": ("Проектировать и разрабатывать AI-агентов, Claude Code skills, "
+                         "MCP, Python, LLM-шлюз, FastAPI, интеграции, Docker.")},
+        profile,
+    )
+    assert engineer.decision == "pass", engineer.hard_killers
+    pure_ops = score_vacancy(
+        {"id": "two", "name": "DevOps / LLMOps Engineer (AI-платформа)",
+         "description": "Администрировать Kubernetes кластеры и CI/CD"},
+        profile,
+    )
+    assert pure_ops.decision == "reject"

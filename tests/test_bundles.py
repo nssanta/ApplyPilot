@@ -135,3 +135,54 @@ def test_publication_last_24h_is_relative_to_snapshot_time_not_replay_time(tmp_p
     }), encoding="utf-8")
     result = compile_bundle(store, "account", {"ai": report})
     assert result["published_last_24h_unique"] == 1
+
+
+def test_risks_from_exact_vacancy_text_flag_moscow_only_and_6yrs():
+    from applypilot.bundles import _description_risks
+
+    text = ("Важно: Рассмотрим кандидатов ТОЛЬКО с Москвы, интервью ОЧНО в офисе. "
+            "Опыт работы с ML от 6 лет.")
+    risk = _description_risks(text, "ML Engineer Middle")
+    assert "geo:only_moscow_applicants" in risk
+    assert "geo:in_person_interview" in risk
+    assert "grade:ml_6plus" in risk
+    assert _description_risks("Удалённая работа по РФ", "AI Engineer") == []
+
+
+def test_bundle_does_not_auto_authorize_only_moscow_vacancy(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    rows = [
+        {"id": "201", "name": "ML Engineer", "company": "Lab",
+         "description": "Рассмотрим кандидатов ТОЛЬКО с Москвы. Интервью ОЧНО.",
+         "description_status": "ok", "score_decision": "pass",
+         "filter_status": "pass", "score": 90, "resume": "ML"},
+        {"id": "202", "name": "ML Engineer", "company": "Other",
+         "description": "Удалённо по всей РФ", "description_status": "ok",
+         "score_decision": "pass", "filter_status": "pass", "score": 65, "resume": "ML"},
+    ]
+    data = _save(store, tmp_path, "ml", rows)
+    result = compile_bundle(store, "account", {"ml": data})
+    assert result["manual_geo_check_candidates"] == 1
+    assert result["items"][0]["id"] == "202"
+    only_moscow = next(row for row in result["items"] if row["id"] == "201")
+    assert only_moscow["review_lane"] == "manual_geo_check"
+    assert only_moscow["auto_apply_eligible"] is False
+
+
+
+def test_top_review_prefers_stronger_fit_to_previously_approved_but_weaker_role(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    rows = [
+        {"id": "previous", "company": "Old", "name": "AI Engineer",
+         "description_status": "ok", "description": "RAG Python agent",
+         "score": 65, "score_decision": "pass", "filter_status": "pass", "resume": "AI"},
+        {"id": "strong", "company": "New", "name": "AI Agent Engineer",
+         "description_status": "ok", "description": "MCP LLM Python agents",
+         "score": 95, "score_decision": "pass", "filter_status": "pass", "resume": "AI"},
+    ]
+    report = _save(store, tmp_path, "ai", rows)
+    store.set_review_state("account", "hh.ru", "previous", "APPROVED",
+                           reason="approved in an older campaign", track="ai")
+    output = compile_bundle(store, "account", {"ai": report})
+    assert [item["id"] for item in output["items"]] == ["strong", "previous"]
+    assert output["items"][1]["review_state"] == "APPROVED"

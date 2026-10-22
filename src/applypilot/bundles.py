@@ -14,8 +14,41 @@ from .storage import Store
 OUT_OF_SCOPE_TITLES = re.compile(
     r"\b(?:aqa|qa|sdet|php|bim|bitrix|computer vision|cv engineer|quality assurance|"
     r"test automation|test engineer|software development engineer in test)\b"
-    r"|тестиров|битрикс|1с", re.IGNORECASE,
+    r"|тестиров|битрикс|1с|3d-разработчик", re.IGNORECASE,
 )
+
+
+def _description_risks(description: str, title: str) -> list[str]:
+    """Signals from the vacancy's own description, not site chrome or similar jobs."""
+    body = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", description)).casefold().split())
+    title_lower = html.unescape(title).casefold()
+    risks: list[str] = []
+    if re.search(r"(?:только|строго)\s+(?:с|из|для\s+кандидат\w+\s+из)\s+москв", body):
+        risks.append("geo:only_moscow_applicants")
+    if re.search(r"интервью\s+очно|собеседование\s+очно|очно\s+в\s+офисе", body):
+        risks.append("geo:in_person_interview")
+    if re.search(r"от\s+[56]\s*\+?\s*лет\s+(?:коммерческ|опыт\w+\s+коммерческ)", body):
+        risks.append("grade:commercial_5plus")
+    if re.search(r"опыт\w*\s+работы\s+(?:с\s+ml\s+)?от\s+6\s*лет|6\s*лет\s+(?:опыта|в\s+ml)", body):
+        risks.append("grade:ml_6plus")
+    if re.search(r"профильное\s+высшее\s+образование|оконченное\s+высшее\s+образование", body):
+        risks.append("education:degree_requirement")
+    if "aest" in body or "sydney time" in body:
+        risks.append("timezone:australia")
+    if re.search(r"\b(?:teamlead|team lead|тимлид)\b", title_lower) and re.search(
+        r"от\s+\d+\s+лет\s+опыта\s+руковод", body,
+    ):
+        risks.append("grade:team_management_required")
+    if (
+        re.search(r"обучени[ея]\s+модел\w*\s+компьютерного\s+зрения", body)
+        and "rag" not in title_lower and "llm" not in title_lower
+    ):
+        risks.append("domain:computer_vision_core")
+    if "comfyui" in title_lower or (
+        "обучени" in body and "lora" in body and "иллюстрац" in body
+    ):
+        risks.append("domain:image_model_training")
+    return risks
 
 
 def compile_bundle(
@@ -129,6 +162,10 @@ def compile_bundle(
                 skipped["screening_rejected"] += 1
                 continue
             flags = list(dict.fromkeys([*item.get("filter_reasons", []), *item.get("problems", [])]))
+            new_risks = _description_risks(
+                str(item.get("description") or ""), str(item.get("name") or ""),
+            )
+            flags = list(dict.fromkeys([*flags, *new_risks]))
             if item.get("filter_status") == "unknown":
                 flags.append("verify:uncertain-filter")
             if track != "ai" and re.search(
@@ -151,15 +188,53 @@ def compile_bundle(
                 adjustments -= 18
             if any("english_requirement" in str(f) for f in flags):
                 adjustments -= 12
+            if "grade:commercial_5plus" in flags:
+                adjustments -= 30
+            if "grade:ml_6plus" in flags:
+                adjustments -= 35
+            if "education:degree_requirement" in flags:
+                adjustments -= 12
+            if "domain:computer_vision_core" in flags:
+                adjustments -= 28
+            if "domain:image_model_training" in flags:
+                adjustments -= 30
+            if "timezone:australia" in flags:
+                adjustments -= 30
+            if "geo:in_person_interview" in flags:
+                adjustments -= 18
+            manual_geo_block = "geo:only_moscow_applicants" in flags
+            manual_seniority_block = any(
+                flag in flags for flag in (
+                    "grade:commercial_5plus", "grade:ml_6plus",
+                    "grade:team_management_required",
+                )
+            )
+            manual_specialist_block = any(
+                flag in flags for flag in (
+                    "timezone:australia", "domain:computer_vision_core",
+                    "domain:image_model_training",
+                )
+            )
+            if manual_geo_block:
+                adjustments -= 100
+            if "grade:team_management_required" in flags:
+                adjustments -= 75
             review_rank = score + adjustments if not needs_enrichment else min(74, preliminary - 15)
+            review_lane = (
+                "manual_geo_check" if manual_geo_block
+                else "needs_enrichment" if needs_enrichment
+                else "manual_seniority_check" if manual_seniority_block
+                else "manual_specialist_check" if manual_specialist_block
+                else "fit"
+            )
             if needs_enrichment:
                 flags.append("review:needs_full_description")
             item_copy = {
                 "id": vacancy_id, "track": track, "name": item.get("name", ""),
                 "company": item.get("company", ""), "url": item.get("url", ""),
                 "score": score, "review_rank": review_rank,
-                "review_lane": "needs_enrichment" if needs_enrichment else "fit",
-                "auto_apply_eligible": not needs_enrichment,
+                "review_lane": review_lane,
+                "auto_apply_eligible": review_lane == "fit",
                 "resume": item.get("resume", ""), "salary": item.get("salary"),
                 "review_state": item.get("review_state", "UNREVIEWED"),
                 "application_state": item.get("application_state", "NOT_STARTED"),
@@ -179,9 +254,9 @@ def compile_bundle(
     ordered = sorted(
         selected.values(),
         key=lambda v: (
-            v["review_state"] != "APPROVED",
             v["review_lane"] != "fit",
             -v["review_rank"],
+            v["review_state"] != "APPROVED",
             priority.get(v["track"], 9),
             v["id"],
         ),
@@ -219,6 +294,15 @@ def compile_bundle(
         "fit_candidates": sum(v["review_lane"] == "fit" for v in unique_roles),
         "needs_enrichment_candidates": sum(
             v["review_lane"] == "needs_enrichment" for v in unique_roles
+        ),
+        "manual_geo_check_candidates": sum(
+            v["review_lane"] == "manual_geo_check" for v in unique_roles
+        ),
+        "manual_seniority_check_candidates": sum(
+            v["review_lane"] == "manual_seniority_check" for v in unique_roles
+        ),
+        "manual_specialist_check_candidates": sum(
+            v["review_lane"] == "manual_specialist_check" for v in unique_roles
         ),
         "skipped": skipped,
         "items": ranked,

@@ -184,6 +184,12 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
             hard_killers.append(f"noise:{term}")
     for term in title_excludes:
         if term and matches(term, title):
+            # A job that actually builds agents and writes code can have DevOps
+            # duties; pure DevOps vacancies are still outside the AI track.
+            if term == "devops" and "разработ" in title and any(
+                matches(signal, title) for signal in ("ai", "ии", "agent", "агент", "llm")
+            ):
+                continue
             hard_killers.append(f"preset_noise:{term}")
     if (any(matches(term, title) for term in incompatible_title_terms)
             and not any(matches(term, title) for term in primary_role_terms)):
