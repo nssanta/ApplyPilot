@@ -235,11 +235,17 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
         if _contains_captcha(response_text):
             return ApplyResult("unknown", "CAPTCHA detected after first response action")
+        resume_selected = False
         if "поменяйте видимость резюме" in response_text:
             if not visibility_verified:
                 return ApplyResult("needs_manual", "resume visibility must be changed manually")
-            # HH may display a stale warning after the exact resume is confirmed
-            # public on its own page. Do not override a disabled submit control.
+            # The exact public resume may not be selected in HH's response popup.
+            # Select it before deciding that the visible warning blocks submission.
+            resume_error = _select_resume(page, dialog, resume)
+            if resume_error:
+                return ApplyResult("needs_manual", resume_error)
+            resume_selected = True
+            # Even after selection, never force a disabled HH submit control.
             if not submit.is_enabled(timeout=2000):
                 return ApplyResult("needs_manual", "visibility warning and submit is disabled")
         if "сопроводительное письмо обязательное" in response_text and not cover_letter.strip():
@@ -251,9 +257,10 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         )
         if dialog_controls.count() == 0:
             return ApplyResult("unknown", "first response action had no follow-up dialog")
-        resume_error = _select_resume(page, dialog, resume)
-        if resume_error:
-            return ApplyResult("needs_manual", resume_error)
+        if not resume_selected:
+            resume_error = _select_resume(page, dialog, resume)
+            if resume_error:
+                return ApplyResult("needs_manual", resume_error)
         if cover_letter:
             field = response_root.locator(LETTER_SELECTOR).first
             if field.count() != 1 or not field.is_visible(timeout=2000):

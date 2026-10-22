@@ -98,6 +98,8 @@ class _Locator:
             self.page.body = self.page.body_after_response
             if self.page.full_page_response:
                 self.page.url = "https://hh.ru/applicant/vacancy_response?vacancyId=1"
+        elif "resume-title" in self.selector and self.page.enable_submit_on_resume_selection:
+            self.page.submit_enabled = True
         elif "vacancy-response-submit-popup" in self.selector:
             self.page.state = "submitted"
             self.page.body = self.page.body_after_submit
@@ -124,6 +126,7 @@ class _Page:
         self.resume_visible = True
         self.question_count = 0
         self.submit_enabled = True
+        self.enable_submit_on_resume_selection = False
         self.resume_filter = ""
         self.response_href = ""
         self.clicks = []
@@ -558,6 +561,18 @@ def test_verified_public_visibility_allows_enabled_hh_submit():
     result = apply_one(page, _item(), "Python", visibility_verified=True)
     assert result.status == "success"
     assert sum("submit-popup" in selector for selector in page.clicks) == 1
+
+
+def test_verified_resume_selection_can_enable_disabled_popup_submit():
+    page = _Page(body_after_response="Чтобы откликнуться, поменяйте видимость резюме.")
+    page.submit_enabled = False
+    page.enable_submit_on_resume_selection = True
+
+    result = apply_one(page, _item(), "Python", visibility_verified=True)
+
+    assert result.status == "success"
+    assert any("resume-title" in s for s in page.clicks)
+    assert sum("submit-popup" in s for s in page.clicks) == 1
 
 
 def test_verified_public_visibility_never_overrides_disabled_submit():
