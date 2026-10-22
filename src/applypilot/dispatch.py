@@ -73,17 +73,22 @@ def dispatch_plan(
     *,
     accounts: Mapping[str, str] | None = None,
     registry: ProviderRegistry | None = None,
+    verified_sources: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregates per-source dry-run plans without reserving or writing."""
     registry = registry or default_registry()
     account_for = dict(accounts or {})
+    verified = set(verified_sources or ())
     selected = list(dict.fromkeys(str(source) for source in sources if str(source).strip()))
     plans: dict[str, dict[str, Any]] = {}
     planned: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for source in selected:
         source_account = str(account_for.get(source, account))
-        plan = queue_plan(store, source_account, track, source, limit, registry=registry)
+        plan = queue_plan(
+            store, source_account, track, source, limit, registry=registry,
+            verified_driver=source in verified,
+        )
         plan["account"] = source_account
         plans[source] = plan
         for row in plan.get("planned", []):
@@ -148,12 +153,19 @@ def dispatch_apply(
     and recorded as ``submitting``.  A driver exception becomes ``unknown``
     quarantine, never a retry.  One source failure does not stop the others.
     """
-    plan = dispatch_plan(store, account, track, sources, limit, accounts=accounts, registry=registry)
+    drivers = dict(drivers or {})
+    verified_sources = (
+        {source for source, driver in drivers.items() if getattr(driver, "submit_verified", False)}
+        if allow_live else set()
+    )
+    plan = dispatch_plan(
+        store, account, track, sources, limit, accounts=accounts, registry=registry,
+        verified_sources=verified_sources,
+    )
     if not allow_live:
         return {**plan, "executed": 0, "results": [], "summary": {"dry_run": plan["planned_count"]}}
 
     run_id = str(run_id or uuid.uuid4().hex[:12])
-    drivers = dict(drivers or {})
     results: list[dict[str, Any]] = []
     for row in plan["planned"]:
         source = str(row.get("source") or "")

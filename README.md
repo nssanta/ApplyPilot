@@ -60,8 +60,10 @@ read-only зеркало HH и не создаёт второй канал от�
 .venv/bin/python -m applypilot accounts telegram-import --track default --json
 ```
 
-Кликеры Habr/GeekJob/Яндекса/Getmatch предоставляют только `preflight` и
-read-only `inspect`; `submit_verified=false` до живой проверки формы.
+Нативный Habr-кликер проверен одним реальным откликом с HTTP 200, сообщением
+«Отклик отправлен» и точным совпадением ID в /responses. Для него доступен
+отдельный CLI live opt-in; GeekJob, Яндекс и Getmatch пока остаются
+`needs_live_validation`, без реальной отправки.
 
 ## Аккаунты Telegram и HH OAuth (этап 3)
 

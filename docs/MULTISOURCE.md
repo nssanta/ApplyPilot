@@ -9,13 +9,13 @@
 | Источник | Поиск | Детали | Аккаунт/сессия | Отклик |
 |---|---|---|---|---|
 | `hh.ru` | да, legacy `run campaign` | да | HH-профиль | проверенный legacy runner |
-| `career.habr.com` | да, список + пагинация | да, приоритетно | отдельный профиль | `needs_live_validation` |
+| `career.habr.com` | да, список + пагинация | да, приоритетно | отдельный профиль | подтверждённый native one-click, только через CLI live opt-in |
 | `geekjob.ru` | да, `/vacancies` + `/vacancies/2` | да, приоритетно | отдельный профиль | `needs_live_validation` |
 | `getmatch.ru` | да, публичный sitemap + delta | да, JSON-LD | отдельный профиль | `needs_live_validation` |
 | `yandex.ru/jobs` | да, подтверждённые remote/GenAI URL | да | отдельный профиль | `needs_live_validation` |
 | `dreamjob.ru` | да, company listing | да | без логина | `mirror_only`, канал HH |
 
-`needs_live_validation` — не ошибка поиска. Это честный статус: карточка и
+`needs_live_validation` — не ошибка поиска. Хабр подтверждён одним реальным откликом; для остальных источников это честный статус: карточка и
 описание разобраны, но авторизованная форма отклика ещё не подтверждена живой
 сессией. Такие вакансии видны в review-очереди, но не попадают в реальную
 отправку.
@@ -49,6 +49,14 @@ cp examples/sources.toml private/config/sources.toml
 # 5. Вход и проверка конкретного источника.
 .venv/bin/python -m applypilot sources login --source career.habr.com
 .venv/bin/python -m applypilot sources check --source career.habr.com
+
+# Отдельный проверенный Habr native-one-click, без отправки при обычном dry-run:
+.venv/bin/python -m applypilot sources dispatch-plan \
+  --track default --source career.habr.com --json
+
+# Для реальных Habr откликов только после проверки профиля и APPROVED:
+# .venv/bin/python -m applypilot sources dispatch-apply --track default \
+#   --source career.habr.com --limit 1 --allow-live --enable-habr --visible
 
 # 6. Единая очередь и dry-run выбранного источника.
 .venv/bin/python -m applypilot sources status --track default

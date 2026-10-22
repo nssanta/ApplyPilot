@@ -9,6 +9,7 @@ import random
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -244,6 +245,14 @@ def build_parser() -> argparse.ArgumentParser:
     sources_dispatch_apply.add_argument("--limit", type=int, default=100)
     sources_dispatch_apply.add_argument("--allow-live", action="store_true",
                                         help="разрешить live-драйверы; без драйвера источник пропускается")
+    sources_dispatch_apply.add_argument(
+        "--enable-habr", action="store_true",
+        help="включить проверенный нативный Habr-драйвер (требует --allow-live и APPROVED)",
+    )
+    sources_dispatch_apply.add_argument(
+        "--visible", action="store_true",
+        help="Habr: использовать видимое окно Chrome для ручной проверки и CAPTCHA",
+    )
     sources_dispatch_apply.add_argument("--json", action="store_true")
 
     sources_approve_batch = sources_sub.add_parser(
@@ -1098,10 +1107,41 @@ def main(argv: list[str] | None = None) -> int:
                     accounts=accounts, registry=registry,
                 )
             else:
-                result = dispatch_apply(
-                    store, "default", args.track, selected, args.limit,
-                    allow_live=bool(args.allow_live), accounts=accounts, registry=registry,
-                )
+                if args.enable_habr and not args.allow_live:
+                    print("dispatch: --enable-habr requires --allow-live", file=sys.stderr)
+                    return 2
+                drivers: dict[str, Any] = {}
+                with ExitStack() as cleanup:
+                    if args.allow_live and args.enable_habr and "career.habr.com" in selected:
+                        from .habr_apply import HabrPageDriver
+                        from .provider_sessions import (
+                            ProviderSessionManager,
+                            _exclusive_profile_lock,
+                        )
+
+                        manager = ProviderSessionManager(selected_config.data_dir / "providers")
+                        habr_account = accounts["career.habr.com"]
+                        auth = manager.check("career.habr.com", habr_account)
+                        if auth.get("status") == "confirmed":
+                            from playwright.sync_api import sync_playwright
+
+                            profile_dir = manager.profile_dir("career.habr.com", habr_account)
+                            cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
+                            playwright = cleanup.enter_context(sync_playwright())
+                            context = manager._context_factory(playwright, profile_dir, not args.visible)
+                            cleanup.callback(context.close)
+                            drivers["career.habr.com"] = HabrPageDriver(context.new_page)
+                        else:
+                            print(
+                                f"Habr driver unavailable: login={auth.get('status', 'unknown')}; "
+                                "run sources login/check first",
+                                file=sys.stderr,
+                            )
+                    result = dispatch_apply(
+                        store, "default", args.track, selected, args.limit,
+                        allow_live=bool(args.allow_live), drivers=drivers,
+                        accounts=accounts, registry=registry,
+                    )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:

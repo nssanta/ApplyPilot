@@ -68,12 +68,16 @@ def test_admin_telegram_import_links_saved_message(tmp_path: Path) -> None:
     assert result["missing_count"] == 0
 
 
-def test_admin_clickers_are_explicitly_unverified(tmp_path: Path) -> None:
+def test_admin_clickers_show_only_habr_as_native_verified(tmp_path: Path) -> None:
     app, _config = _app(tmp_path)
     result = app.clickers_overview()
     assert len(result["clickers"]) == 4
-    assert all(not spec["submit_verified"] for spec in result["clickers"])
-    assert all(spec["apply_status"] == "needs_live_validation" for spec in result["clickers"])
+    specs = {spec["source"]: spec for spec in result["clickers"]}
+    assert specs["career.habr.com"]["submit_verified"] is True
+    assert specs["career.habr.com"]["apply_status"] == "verified_native_one_click"
+    for source in ("geekjob.ru", "yandex.ru/jobs", "getmatch.ru"):
+        assert specs[source]["submit_verified"] is False
+        assert specs[source]["apply_status"] == "needs_live_validation"
 
 
 def test_admin_dispatch_rejects_unknown_track(tmp_path: Path) -> None:

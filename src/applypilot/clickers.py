@@ -47,7 +47,11 @@ CLICKERS: dict[str, ClickerSpec] = {
     "career.habr.com": ClickerSpec(
         source="career.habr.com", label="Habr Career",
         login_url="https://career.habr.com/login",
-        notes="Authorized form DOM not captured yet; no selector or submit is claimed.",
+        submit_verified=True, apply_status="verified_native_one_click",
+        selectors=(".create-vacancy-response__apply button[type='submit']",),
+        notes=("Native one-click verified with live Habr POST 200 and /responses receipt. "
+               "Requires an authenticated account, explicit approval and CLI live opt-in; "
+               "extra applicant forms and external ATS remain manual."),
     ),
     "geekjob.ru": ClickerSpec(
         source="geekjob.ru", label="GeekJob",
@@ -147,6 +151,12 @@ def apply_with_clicker(source: str, row: Mapping[str, Any]) -> ApplyOutcome:
     spec = CLICKERS.get(source)
     if spec is None:
         return ApplyOutcome("needs_live_validation", f"unsupported source: {source}")
+    if source == "career.habr.com":
+        return ApplyOutcome(
+            "needs_live_validation",
+            "Habr's verified live driver is enabled separately by "
+            "'sources dispatch-apply --allow-live --enable-habr'; no click from inspector",
+        )
     return ApplyOutcome(
         "needs_live_validation",
         f"{spec.label}: authorized form DOM is not captured; submit stays disabled",

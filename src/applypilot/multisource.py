@@ -524,7 +524,8 @@ def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search:
 
 
 def queue_plan(store: Store, account: str, track: str, source: str, limit: int = 100,
-               registry: ProviderRegistry | None = None) -> dict[str, Any]:
+               registry: ProviderRegistry | None = None,
+               *, verified_driver: bool = False) -> dict[str, Any]:
     """Builds a dry-run plan; it never reserves, writes an event or clicks submit."""
     registry = registry or default_registry()
     # A source plan is read-only and must include every human-approved row,
@@ -560,6 +561,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
             "channel_key": channel_key,
             "application_state": row.get("application_state", ""),
             "application_url": row.get("application_url", ""),
+            "channel_type": row.get("channel_type", ""),
             "review_state": row.get("review_state", ""),
             "score_decision": row.get("score_decision", ""),
             "filter_status": row.get("filter_status", ""),
@@ -590,11 +592,11 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         elif source == "hh.ru" and row.get("application_state") != "READY_TO_APPLY":
             # Approval is not proof that the HH form, letter and resume are ready.
             reason = f"not_ready:{row.get('application_state')}"
-        elif source != "hh.ru" and not capabilities.apply:
+        elif source != "hh.ru" and not capabilities.apply and not verified_driver:
             reason = f"needs_live_validation:{capabilities.apply_status}"
         elif row.get("application_channel_type") == "external_ats":
             reason = "external_ats_manual_review"
-        elif not capabilities.apply and source != "hh.ru":
+        elif not capabilities.apply and source != "hh.ru" and not verified_driver:
             reason = "apply_not_available"
         if reason:
             blocked.append({**item, "action": "blocked", "reason": reason})
@@ -605,7 +607,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         "mode": "dry_run", "candidate_count": len(rows),
         "planned_count": len(planned), "blocked_count": len(blocked),
         "planned": planned, "blocked": blocked,
-        "apply_status": capabilities.apply_status,
+        "apply_status": ("verified_driver" if verified_driver else capabilities.apply_status),
     }
 
 

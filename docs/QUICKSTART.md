@@ -142,17 +142,33 @@ Telegram-импорт и статус кликеров. Live-отправка и
 
 ## 9. Кликеры и живая проверка
 
-`applypilot` не придумывает селекторы. Для Habr, GeekJob, Яндекса и Getmatch
-есть контракты `preflight`/`inspect`; все они имеют
-`apply_status=needs_live_validation` и `submit_verified=false`.
+`applypilot` не придумывает селекторы. Для Habr, GeekJob, Яндекса и Getmatch есть контракты `preflight`/`inspect`.
+На Хабре подтверждён нативный one-click и отдельный HabrPageDriver; остальные
+площадки пока имеют `apply_status=needs_live_validation`.
 
 ```bash
 applypilot accounts --help
 ```
 
-Перед включением реальной отправки нужно вручную авторизоваться, снять DOM
-формы через `inspect`, подтвердить кнопку/поля/резюме и только затем добавить
-проверенный драйвер. До этого live-запуск честно пропускает источник.
+Для проверенного **нативного** сценария Habr Career доступны отдельный
+браузерный профиль и явное разрешение запуска:
+
+```bash
+applypilot sources check --source career.habr.com
+applypilot sources dispatch-plan --track ai_core --source career.habr.com --json
+
+# РЕАЛЬНАЯ ОТПРАВКА: только ранее APPROVED и READY_TO_APPLY,
+# с действующей сессией и независимым подтверждением в /responses.
+# Запускать осознанно, не использовать для тестирования без разрешения.
+applypilot sources dispatch-apply --track ai_core --source career.habr.com \
+  --limit 1 --allow-live --enable-habr --visible
+```
+
+Habr driver поддерживает подтверждённую one-click форму; дополнительные
+обязательные вопросы, другие формы и внешние ATS требуют ручной проверки.
+Для GeekJob, Яндекса и Getmatch пока нет подтверждённого live-драйвера;
+диспетчер пропускает их, не отправляя отклик. Для них сначала нужна
+проверка реального авторизованного интерфейса.
 
 ## 10. Безопасность
 

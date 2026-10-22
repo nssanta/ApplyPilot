@@ -11,14 +11,21 @@ from applypilot.clickers import (
 )
 
 
-def test_registry_covers_sources_without_claimed_submit() -> None:
+def test_registry_exposes_guarded_habr_native_submit_only() -> None:
     assert set(CLICKERS) == {
         "career.habr.com", "geekjob.ru", "yandex.ru/jobs", "getmatch.ru",
     }
-    for spec in clicker_specs():
-        assert spec["submit_verified"] is False
-        assert spec["apply_status"] == "needs_live_validation"
-        assert spec["selectors"] == []
+    specs = {spec["source"]: spec for spec in clicker_specs()}
+    habr = specs["career.habr.com"]
+    assert habr["submit_verified"] is True
+    assert habr["apply_status"] == "verified_native_one_click"
+    assert habr["selectors"] == [
+        ".create-vacancy-response__apply button[type='submit']",
+    ]
+    for source in ("geekjob.ru", "yandex.ru/jobs", "getmatch.ru"):
+        assert specs[source]["submit_verified"] is False
+        assert specs[source]["apply_status"] == "needs_live_validation"
+        assert specs[source]["selectors"] == []
 
 
 def test_preflight_requires_local_profile(tmp_path: Path) -> None:
@@ -103,4 +110,4 @@ def test_inspect_page_never_clicks_or_submits() -> None:
 def test_apply_with_clicker_is_explicitly_blocked() -> None:
     outcome = apply_with_clicker("career.habr.com", {"id": "1"})
     assert outcome.status == "needs_live_validation"
-    assert "authorized form DOM" in outcome.note
+    assert "dispatch-apply --allow-live --enable-habr" in outcome.note
