@@ -1127,7 +1127,9 @@ def main(argv: list[str] | None = None) -> int:
             for chunk in (args.id or []):
                 ids.extend(value.strip() for value in chunk.split(",") if value.strip())
             if not ids and args.from_view:
-                rows = store.list_campaign_vacancies(account, args.track, args.from_view, args.limit)
+                rows = store.list_campaign_vacancies(
+                    account, args.track, args.from_view, args.limit, source=args.source,
+                )
                 ids = [str(row["id"]) for row in rows]
             result = approve_batch(
                 store, account, args.track, args.source, ids,

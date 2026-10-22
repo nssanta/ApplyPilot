@@ -1851,16 +1851,54 @@ class Store:
                         raise ValueError(f"cannot batch approve {vacancy_id} in {app_state}")
                     if row["score_decision"] != "pass" or row["filter_status"] not in {"pass", "unknown"}:
                         raise ValueError(f"vacancy {vacancy_id} did not pass screening rules")
-                    blocked = conn.execute(
-                        "SELECT status FROM attempts WHERE account=? AND vacancy_id=?",
-                        (account, vacancy_id),
+                    # Legacy HH attempts are keyed by HH vacancy ID, even when
+                    # the discovered apply channel points to an external ATS.
+                    # Never let a new channel identity bypass prior HH attempts.
+                    if source == "hh.ru":
+                        legacy = conn.execute(
+                            "SELECT status FROM attempts WHERE account=? AND vacancy_id=?",
+                            (account, vacancy_id),
+                        ).fetchone()
+                        negotiation = conn.execute(
+                            "SELECT 1 FROM negotiation_statuses "
+                            "WHERE account=? AND vacancy_id=?",
+                            (account, vacancy_id),
+                        ).fetchone()
+                        if negotiation or (legacy and legacy["status"] in BLOCKED_STATUSES):
+                            raise ValueError(
+                                f"vacancy {vacancy_id} has an existing HH application/uncertain attempt"
+                            )
+                    # Check the actual channel, not a coincidentally equal ID on HH.
+                    # A DreamJob mirror shares the HH channel, while an independent
+                    # Getmatch/Habr form must not inherit unrelated HH attempts.
+                    link = conn.execute(
+                        "SELECT channel_key,mirror_source,mirror_native_id FROM vacancy_links "
+                        "WHERE account=? AND source=? AND vacancy_id=?",
+                        (account, source, vacancy_id),
                     ).fetchone()
-                    hh = conn.execute(
-                        "SELECT 1 FROM negotiation_statuses WHERE account=? AND vacancy_id=?",
-                        (account, vacancy_id),
+                    channel = canonical_channel_key(
+                        str(link["channel_key"] if link else f"{source}:{vacancy_id}")
+                    )
+                    duplicate_source, duplicate_id = self._channel_is_applied(
+                        conn, account, channel, source=source, vacancy_id=vacancy_id,
+                        mirror_source=str(link["mirror_source"] or "") if link else "",
+                        mirror_native_id=str(link["mirror_native_id"] or "") if link else "",
+                    )
+                    if duplicate_source:
+                        raise ValueError(
+                            f"vacancy {vacancy_id} channel already used by "
+                            f"{duplicate_source}:{duplicate_id}"
+                        )
+                    reserved = conn.execute(
+                        "SELECT source,vacancy_id FROM channel_reservations "
+                        "WHERE account=? AND channel_key=?",
+                        (account, channel),
                     ).fetchone()
-                    if hh or (blocked and blocked["status"] in BLOCKED_STATUSES):
-                        raise ValueError(f"vacancy {vacancy_id} has an existing HH application/uncertain attempt")
+                    if reserved:
+                        raise ValueError(
+                            f"vacancy {vacancy_id} channel reserved by "
+                            f"{reserved['source']}:{reserved['vacancy_id']}"
+                        )
             for vacancy_id in ids:
                 conn.execute(
                     """UPDATE vacancy_track_scores SET review_state=?,review_reason=?

@@ -495,14 +495,21 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
     registry = registry or default_registry()
     # A source plan is read-only and must include every human-approved row,
     # including native forms that have no HH cover-letter workflow state yet.
-    rows = [
+    # Fetch beyond the requested batch size before filtering. Otherwise an
+    # already-applied high-score row can consume the 100-row window and hide a
+    # lower-score READY_TO_APPLY vacancy that should be sent this run.
+    eligible = [
         row for row in store.list_campaign_vacancies(
-            account, track, "approved", min(100, max(1, int(limit))), source=source,
+            account, track, "approved", 5000, source=source,
         )
         if not row.get("applied_before")
         and row.get("filter_status") in {"pass", "unknown"}
         and row.get("score_decision") == "pass"
-    ][:min(100, max(1, int(limit)))]
+    ]
+    # Keep scoring order *within* each group, but inspect ready work before
+    # unfinished forms/letters when the batch limit is reached.
+    eligible.sort(key=lambda row: row.get("application_state") != "READY_TO_APPLY")
+    rows = eligible[:min(100, max(1, int(limit)))]
     planned: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     try:
@@ -544,6 +551,11 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
                 reason = f"channel_conflict:{conflict.get('kind')}"
         elif row.get("application_state") in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}:
             reason = f"application_state:{row.get('application_state')}"
+        elif row.get("application_state") in {"NEEDS_FORM", "NEEDS_LETTER", "NEEDS_MANUAL"}:
+            reason = f"needs_workflow:{row.get('application_state')}"
+        elif source == "hh.ru" and row.get("application_state") != "READY_TO_APPLY":
+            # Approval is not proof that the HH form, letter and resume are ready.
+            reason = f"not_ready:{row.get('application_state')}"
         elif source != "hh.ru" and not capabilities.apply:
             reason = f"needs_live_validation:{capabilities.apply_status}"
         elif row.get("application_channel_type") == "external_ats":
