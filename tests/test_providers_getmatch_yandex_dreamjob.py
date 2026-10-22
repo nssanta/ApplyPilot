@@ -181,6 +181,30 @@ def test_getmatch_sitemap_delta_uses_atomic_seen_state(tmp_path: Path) -> None:
     assert "unseen=0" in second_segments[1].error
 
 
+def test_getmatch_sitemap_seen_state_accumulates_across_bounded_scans(tmp_path: Path) -> None:
+    path = tmp_path / "sitemap-seen.json"
+    filters = {
+        "sitemap_text": _sitemap(
+            "https://getmatch.ru/vacancies/36887-llm-engineer",
+            "https://getmatch.ru/vacancies/36789-product-engineer-python-v-komandu-analitiki",
+        ),
+        "fixture_dir": str(FIXTURES),
+        "state_path": str(path),
+        "details_limit": 1,
+    }
+    provider = GetMatchProvider()
+    first, _ = provider.discover(filters)
+    assert len(first) == 1
+    second, _ = provider.discover(filters)
+    assert len(second) == 1
+    assert first[0]["id"] != second[0]["id"]
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert set(state["seen_ids"]) == {"36887", "36789"}
+    third, segments = provider.discover(filters)
+    assert third == []
+    assert "unseen=0" in segments[-1].error
+
+
 def test_getmatch_detail_json_ld_supplies_real_date_salary_and_location(
     tmp_path: Path,
 ) -> None:

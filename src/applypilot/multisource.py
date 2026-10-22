@@ -410,6 +410,13 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             detail_fixture_path=detail_fixture_path,
             remote=group.get("only_remote"), date_from=cutoff.date().isoformat(),
         )
+        if source == "getmatch.ru" and not fixture_mode:
+            # Namespace incremental sitemap cursor per source and account.
+            # Telegram-specific scans use explicit URLs, not the sitemap.
+            filters["state_path"] = str(
+                config.data_dir / "providers" / source_slug(source)
+                / source_slug(account) / "sitemap_seen.json"
+            )
         # The user already owns these messages. Extract public job IDs only:
         # no bot commands are interpreted, no callbacks are executed.
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:

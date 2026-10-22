@@ -665,7 +665,9 @@ class GetMatchProvider:
             items.append(item)
             new_seen.add(row["native_id"])
             seen_urls.add(row["url"])
-        _persist_seen(state_path, new_seen, seen_urls, filters)
+        # Incremental sitemap scan: never erase IDs covered in earlier runs.
+        # Otherwise a small details_limit loops over the same pages forever.
+        _persist_seen(state_path, seen | new_seen, seen_urls, filters)
 
         coverage = (
             f"sitemap_urls={len(rows)} matched={len(matched)} unseen={len(unseen)} "
