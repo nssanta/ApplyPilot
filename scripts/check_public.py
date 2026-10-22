@@ -9,7 +9,10 @@ from pathlib import Path
 FORBIDDEN_PATHS = ("private/", ".hh_session", "session.json")
 SECRET_PATTERNS = (
     re.compile(r"OPENROUTER_API_KEY\s*=\s*['\"]?sk-or-v1-[A-Za-z0-9_-]+"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    # Classic GitHub tokens have exactly 36 alphanumerics after the prefix;
+    # fine-grained PATs use the separate github_pat_ prefix.
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
 )
 
 
