@@ -80,3 +80,58 @@ def test_bundle_filters_non_target_qa_php_and_primary_cv_titles(tmp_path):
     result = compile_bundle(store, "account", {"backend": report})
     assert [row["id"] for row in result["items"]] == ["good"]
     assert result["skipped"]["out_of_scope_title"] == 3
+
+
+def test_bundle_deduplicates_same_employer_and_role_but_not_different_roles(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    items = [
+        {"id": "201", "company": "Example Inc", "name": "AI-инженер по автоматизации",
+         "description": "LLM Python RAG", "description_status": "ok",
+         "score": 85, "score_decision": "pass", "filter_status": "pass", "resume": "AI"},
+        {"id": "202", "company": "Example Inc", "name": "AI-инженер по автоматизации",
+         "description": "LLM Python RAG", "description_status": "ok",
+         "score": 80, "score_decision": "pass", "filter_status": "pass", "resume": "AI"},
+        {"id": "203", "company": "Example Inc", "name": "RAG Backend Developer",
+         "description": "RAG Python FastAPI", "description_status": "ok",
+         "score": 68, "score_decision": "pass", "filter_status": "pass", "resume": "AI"},
+    ]
+    report = _save(store, tmp_path, "ai", items)
+    result = compile_bundle(store, "account", {"ai": report})
+    assert result["eligible_postings"] == 3
+    assert result["unique_candidates"] == 2
+    assert result["duplicate_postings_suppressed"] == 1
+    assert [v["id"] for v in result["items"]] == ["201", "203"]
+    assert result["items"][0]["duplicate_posting_ids"] == ["202"]
+
+
+def test_bundle_keeps_forms_in_separate_workflow_queue(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    items = [
+        {"id": "201", "company": "Example", "name": "AI Engineer",
+         "score": 80, "score_decision": "pass", "filter_status": "pass",
+         "description_status": "ok", "description": "Python LLM"},
+    ]
+    report = _save(store, tmp_path, "ai", items)
+    store.record({**items[0], "track": "ai"}, "needs_manual",
+                 "screening questions require manual review", account="account")
+    result = compile_bundle(store, "account", {"ai": report})
+    assert result["review_count"] == 0
+    assert result["skipped"]["awaiting_form_or_letter"] == 1
+    assert len(store.workflow_tasks("account", "form")) == 1
+
+
+def test_publication_last_24h_is_relative_to_snapshot_time_not_replay_time(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    items = [
+        {"id": "one", "company": "Lab", "name": "AI Engineer",
+         "published": "2026-10-21T10:00:00+00:00",
+         "score": 80, "score_decision": "pass", "filter_status": "pass",
+         "description": "LLM Python", "description_status": "ok", "resume": "AI"},
+    ]
+    report = _save(store, tmp_path, "ai", items)
+    snap = tmp_path / "ai.json"
+    snap.write_text(json.dumps({
+        "observed_at": "2026-10-21T19:00:00+00:00", "items": items
+    }), encoding="utf-8")
+    result = compile_bundle(store, "account", {"ai": report})
+    assert result["published_last_24h_unique"] == 1

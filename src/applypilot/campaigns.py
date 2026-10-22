@@ -229,7 +229,7 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                 "remote": only_remote if only_remote is not None else bool(group.get("only_remote", False)),
                 "date_from": cutoff.date().isoformat(), "search": group,
             })
-        for order_by, allocated_budget in sort_budgets:
+        for pass_index, (order_by, allocated_budget) in enumerate(sort_budgets):
             remaining = allocated_budget
             for spec in group_specs:
                 if remaining <= 0:
@@ -237,8 +237,14 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                                                 "truncated", 0, "search request budget reached",
                                                 order_by=order_by))
                     break
+                ordered_queries = list(spec["queries"])
+                if sort_mode == "balanced" and pass_index == 1 and len(ordered_queries) > 1:
+                    # Complement the first-pass phrases instead of using the
+                    # whole second budget on the same leading phrases.
+                    pivot = len(ordered_queries) // 2
+                    ordered_queries = ordered_queries[pivot:] + ordered_queries[:pivot]
                 group_items, group_segments = adapter.discover({
-                    "queries": spec["queries"], "areas": spec["areas"],
+                    "queries": ordered_queries, "areas": spec["areas"],
                     "pages": spec["pages"], "remote": spec["remote"],
                     "date_from": spec["date_from"], "pause_seconds": 1.0,
                     "request_budget": remaining, "order_by": order_by,
@@ -264,19 +270,36 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                                                 | {item.get("search_group", "")})
         all_items = list(deduplicated.values())
 
+        # Hydrate cached full descriptions before enrichment. Re-fetching the
+        # same 70 old vacancies every morning wastes network budget and leaves
+        # newly published AI roles with only provisional snippets.
+        old_payloads = store.vacancy_payloads(
+            account, "hh.ru", [str(item.get("id") or "") for item in all_items],
+        )
+        cached_descriptions = 0
+        for item in all_items:
+            old = old_payloads.get(str(item.get("id") or ""), {})
+            if old:
+                item.update(_merge_known_fields(old, item))
+            if item.get("description_status") == "ok" and str(item.get("description") or "").strip():
+                cached_descriptions += 1
+
         details = effective_details
         ranking_profile = {**profile, "search": search, "rescore": True}
-        enrichment = prioritize_for_enrichment(all_items, ranking_profile, details)
+        needs_full_description = [
+            item for item in all_items
+            if item.get("description_status") != "ok" or not str(item.get("description") or "").strip()
+        ]
+        enrichment = prioritize_for_enrichment(needs_full_description, ranking_profile, details)
         candidate_ids = {candidate.id for candidate in enrichment}
-        enrichment_items = [item for item in all_items if str(item.get("id") or "") in candidate_ids]
-        for item in all_items:
+        enrichment_items = [
+            item for item in needs_full_description if str(item.get("id") or "") in candidate_ids
+        ]
+        for item in needs_full_description:
             if str(item.get("id") or "") not in candidate_ids:
                 item["description_status"] = "provisional"
         enriched, detail_errors = enrich_items(enrichment_items, details, pause_seconds=1.0)
         enriched_by_id = {str(item.get("id") or ""): item for item in enriched}
-        old_payloads = store.vacancy_payloads(
-            account, "hh.ru", [str(item.get("id") or "") for item in all_items],
-        )
         for item in all_items:
             fresh = enriched_by_id.get(str(item.get("id") or ""))
             if fresh is not None:
@@ -332,7 +355,11 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
 
         stamp_first_seen(campaign_items, config.data_dir / "seen.json")
         failed_segments = [segment for segment in segments if segment.status in {"failed", "captcha"}]
-        truncated = any(segment.status == "truncated" for segment in segments)
+        covered_queries = {
+            segment.query for segment in segments if segment.pages > 0 and segment.requests > 0
+        }
+        uncovered_queries = sorted(set(query_list) - covered_queries)
+        truncated = bool(uncovered_queries) or any(segment.status == "truncated" for segment in segments)
         status = ("partial" if failed_segments or detail_errors else "truncated" if truncated
                   else "ok" if campaign_items else "empty")
         errors = [f"{segment.query} area {segment.area}: {segment.error}"
@@ -342,7 +369,10 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             campaign_items, config.snapshots_dir, " | ".join(query_list), status,
             "\n".join(errors), segments, preset,
             metadata={"campaign_id": campaign_id, "track": track,
-                      "observed_at": started.isoformat(), "campaign_config": safe_config},
+                      "observed_at": started.isoformat(), "campaign_config": safe_config,
+                      "covered_queries": len(covered_queries), "uncovered_queries": uncovered_queries,
+                      "cached_descriptions": cached_descriptions,
+                      "detail_fetch_attempts": len(enrichment_items)},
         )
         summary = store.save_campaign_items(
             campaign_id, account, track, campaign_items, status=status,
@@ -359,7 +389,10 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
         return {
             "campaign_id": campaign_id, "previous_campaign_id": previous_campaign_id,
             "account": account, "track": track, "status": status, "snapshot": str(snapshot_path),
-            "query_count": len(query_list), "segment_count": len(segments),
+            "query_count": len(query_list), "covered_query_count": len(covered_queries),
+            "uncovered_queries": uncovered_queries, "segment_count": len(segments),
+            "cached_descriptions": cached_descriptions,
+            "detail_fetch_attempts": len(enrichment_items),
             "segment_errors": errors, "summary": summary, "score_counts": score_counts,
             "top": store.list_campaign_vacancies(account, track, "top", limit),
         }

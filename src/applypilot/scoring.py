@@ -304,7 +304,17 @@ def prioritize_for_enrichment(raw_items: Iterable[dict[str, Any]], profile: dict
         if decision.status == "reject":
             continue
         result.append(candidate)
-    result.sort(key=lambda candidate: (-candidate.score, candidate.id))
+    # Provisional HH snippets often cap scores at 29 before full enrichment.
+    # Rank by underlying role/stack evidence instead of treating every
+    # provisional candidate as equally valuable and sorting by old ID.
+    def enrichment_rank(candidate: Candidate) -> tuple[int, int, int, str]:
+        evidence = candidate.components
+        preliminary = sum(int(value) for value in evidence.values())
+        role = int(evidence.get("role", 0))
+        salary = int(evidence.get("salary", 0))
+        return (-preliminary, -role, -salary, candidate.id)
+
+    result.sort(key=enrichment_rank)
     return result[:max(0, limit)]
 
 

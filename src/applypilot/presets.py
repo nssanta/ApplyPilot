@@ -16,9 +16,11 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
     },
     "ai-agents-llmops": {
         "queries": [
-            "AI Agent Engineer", "LLM Engineer", "RAG Engineer", "LLMOps Engineer",
+            "AI Agent Engineer", "LLM Engineer", "AI-разработчик", "Вайбкодер",
+            "Разработчик ИИ-решений", "RAG Engineer", "AI-native Developer",
             "AI Platform Engineer", "GenAI Engineer", "AI Automation Engineer",
-            "Разработчик ИИ агентов", "LLM разработчик", "RAG разработчик",
+            "AI Product Engineer", "LLMOps Engineer", "Разработчик ИИ агентов",
+            "LLM разработчик", "RAG разработчик",
         ],
         "include_terms": [
             "llm", "rag", "agent", "langchain", "langgraph", "openai", "mcp", "qdrant",
@@ -26,14 +28,26 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         ],
         "exclude_titles": [
             "продаж", "ассистент", "тренер", "маркетолог", "рекрутер", "support", "qa",
-            "тестиров", "quality assurance", "sdet", "security", "кибербез", "иб", "vibe", "вайб",
-            "training", "обучению",
+            "тестиров", "quality assurance", "sdet", "security", "кибербез", "иб",
+            "training", "обучению", "наставник", "ментор", "mentor",
             "devops", "site reliability", "sre", "java", ".net", "php", "computer vision", "bioinformatics", "marketing engineer", "growth engineer",
         ],
-        "role_terms": ["ai", "llm", "agent", "rag", "genai", "llmops", "ai platform"],
-        "primary_role_terms": ["llm", "agent", "rag", "genai", "llmops", "ai platform", "ai automation"],
-        "required_role_terms": ["engineer", "developer", "разработчик", "программист", "backend", "software"],
-        "title_role_terms": ["ai", "llm", "agent", "rag", "genai", "llmops", "ai platform"],
+        "role_terms": [
+            "ai", "ии", "llm", "agent", "агент", "rag", "genai", "llmops",
+            "ai-native", "ai-first", "vibe", "вайбкод", "mcp", "ai platform",
+        ],
+        "primary_role_terms": [
+            "ai", "ии", "llm", "agent", "агент", "rag", "genai", "llmops",
+            "ai-native", "ai-first", "vibe coder", "vibe coding", "вайбкод", "mcp", "ai platform",
+        ],
+        "required_role_terms": [
+            "engineer", "инженер", "developer", "разработчик", "программист",
+            "backend", "software", "вайбкодер", "вайб-кодер", "vibecoder", "vibe coder",
+        ],
+        "title_role_terms": [
+            "ai", "ии", "llm", "agent", "агент", "rag", "genai", "llmops", "ai platform",
+            "ai-native", "ai-first", "вайбкод", "vibe", "mcp",
+        ],
     },
     "ml-engineering": {
         "queries": ["ML Engineer", "Machine Learning Engineer", "NLP Engineer", "MLOps", "Computer Vision"],
@@ -76,7 +90,6 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "title_role_terms": ["software", "developer", "разработчик", "engineer", "инженер", "backend", "python", "go", "golang"],
     },
 }
-
 
 def resolve_search(search: dict[str, Any], preset_name: str | None = None) -> dict[str, Any]:
     """Применяет публичный пресет роли, после чего приватные search-настройки могут его переопределить."""

@@ -124,16 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
     bundle.add_argument("--track", action="append", choices=("ai", "backend", "ml"),
                         help="направление, повторить при необходимости; default: все три")
     bundle.add_argument("--days", type=int, default=3)
-    bundle.add_argument("--pages", type=int, default=2)
-    bundle.add_argument("--request-budget", type=int, default=32,
+    bundle.add_argument("--pages", type=int, default=1)
+    bundle.add_argument("--request-budget", type=int, default=90,
                         help="число поисковых HTTP-запросов на каждый трек")
-    bundle.add_argument("--details-limit", type=int, default=65,
+    bundle.add_argument("--details-limit", type=int, default=90,
                         help="число полных описаний на каждый трек")
     bundle.add_argument("--limit", type=int, default=100)
     bundle.add_argument("--remote", action=argparse.BooleanOptionalAction, default=True)
     bundle.add_argument("--salary-from", type=int, default=140000)
     bundle.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"),
-                        default="balanced")
+                        default="newest")
     bundle.add_argument("--wide-ai", action=argparse.BooleanOptionalAction, default=True,
                         help="использовать private/config/search-ai-broad.toml, если он есть")
 
@@ -492,6 +492,9 @@ def main(argv: list[str] | None = None) -> int:
                     sort_mode=args.sort_mode, track_resume=str(track_info.get("resume") or ""),
                 )
                 print(f"bundle: {track} found={reports[track]['summary']['items']}"
+                      f" queries={reports[track]['covered_query_count']}/{reports[track]['query_count']}"
+                      f" cached={reports[track]['cached_descriptions']}"
+                      f" fetched={reports[track]['detail_fetch_attempts']}"
                       f" status={reports[track]['status']}", flush=True)
             except (Exception, KeyboardInterrupt) as exc:
                 if isinstance(exc, KeyboardInterrupt):
@@ -508,7 +511,15 @@ def main(argv: list[str] | None = None) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         output = output_dir / f"bundle-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"bundle: raw_rows={result['raw_rows_by_track']}"
+              f" unique_raw={result['unique_raw_vacancies']}"
+              f" new_to_sqlite={result['first_seen_sqlite_unique']}"
+              f" new_since_previous={result['new_since_previous_unique']}"
+              f" published_last24h={result['published_last_24h_unique']}")
         print(f"bundle: unique_candidates={result['unique_candidates']}"
+              f" fit={result['fit_candidates']}"
+              f" needs_enrichment={result['needs_enrichment_candidates']}"
+              f" duplicates={result['duplicate_postings_suppressed']}"
               f" review={result['review_count']} failures={len(failures)}")
         print(f"bundle_report: {output}")
         for index, item in enumerate(result["items"][:20], 1):

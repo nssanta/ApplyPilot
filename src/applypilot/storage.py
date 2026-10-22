@@ -1147,7 +1147,7 @@ class Store:
         result.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
         if view == "top":
             result.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
-        return result[:max(1, min(1000, int(limit)))]
+        return result[:max(1, min(5000, int(limit)))]
 
     def set_review_state(self, account: str, source: str, vacancy_id: str, state: str,
                          *, reason: str, notes: str | None = None, track: str | None = None) -> None:
