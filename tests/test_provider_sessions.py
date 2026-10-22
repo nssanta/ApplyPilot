@@ -407,3 +407,49 @@ def test_all_registry_source_ids_have_browser_session_mapping(tmp_path: Path) ->
         config = manager.source_config(source)
         assert config.login_url or config.source == "dreamjob"
     assert manager.source_config("yandex.ru/jobs").source == "yandex"
+
+
+def test_habr_real_account_navigation_is_confirmed(tmp_path: Path) -> None:
+    manager = ProviderSessionManager(tmp_path)
+    config = manager.source_config("career.habr.com")
+    status, detail = classify_provider_page(
+        config, "https://career.habr.com/vacancies",
+        "Личный кабинет Избранные вакансии Отклики на вакансии Выход",
+    )
+    assert status is SessionStatus.CONFIRMED
+    assert detail == "https://career.habr.com/vacancies"
+
+
+def test_habr_ordinary_job_text_does_not_impersonate_logged_in_user(tmp_path: Path) -> None:
+    config = ProviderSessionManager(tmp_path).source_config("habr")
+    status, _ = classify_provider_page(
+        config, "https://career.habr.com/vacancies",
+        "Выходные дни, успешный выход на работу. Зарегистрироваться",
+    )
+    assert status is not SessionStatus.CONFIRMED
+
+
+def test_habr_hidden_dom_account_controls_confirm_session(tmp_path: Path) -> None:
+    page = FakePage("https://career.habr.com/vacancies", "Каталог вакансий")
+    seen_scripts: list[str] = []
+
+    def evaluate(script: str) -> bool:
+        seen_scripts.append(script)
+        return "users/sign_out" in script and "'/responses'" in script
+
+    page.evaluate = evaluate
+    manager, context, _ = manager_with_context(tmp_path, page)
+    write_state(manager)
+    result = manager.check("career.habr.com")
+    assert result["status"] == SessionStatus.CONFIRMED.value
+    assert result["detail"] == "Habr account controls verified"
+    assert seen_scripts
+    assert context.closed is True
+
+
+def test_habr_hidden_dom_without_logout_does_not_confirm(tmp_path: Path) -> None:
+    page = FakePage("https://career.habr.com/vacancies", "Каталог вакансий")
+    page.evaluate = lambda _script: False
+    manager, _context, _ = manager_with_context(tmp_path, page)
+    write_state(manager)
+    assert manager.check("career.habr.com")["status"] == SessionStatus.UNKNOWN.value

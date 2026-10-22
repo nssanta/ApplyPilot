@@ -286,6 +286,24 @@ def _safe_url(url: str) -> str:
     return urlunparse((parsed.scheme.lower(), netloc, parsed.path or "/", "", "", ""))
 
 
+# Habr Career may render authenticated navigation inside a hidden account menu.
+# body.inner_text() excludes those controls. Prove login by BOTH an internal
+# sign-out form and the applicant response-history link; never read cookie values.
+HABR_ACCOUNT_DOM_PROOF = """() => {
+  const sameOriginPath = (node, attribute, expected) => {
+    try {
+      const url = new URL(node.getAttribute(attribute) || "", location.href);
+      return url.origin === location.origin && url.pathname === expected;
+    } catch { return false; }
+  };
+  return [...document.querySelectorAll('form[action]')].some(
+    node => sameOriginPath(node, 'action', '/users/sign_out')
+  ) && [...document.querySelectorAll('a[href]')].some(
+    node => sameOriginPath(node, 'href', '/responses')
+  );
+}"""
+
+
 def classify_provider_page(
     config: ProviderSessionConfig, url: str, body: str
 ) -> tuple[SessionStatus, str]:
@@ -323,6 +341,15 @@ def classify_provider_page(
         if existing.status == "expired":
             return SessionStatus.EXPIRED, existing.detail
         return SessionStatus.UNKNOWN, existing.detail
+
+    # Live Habr Career uses "Выход" (not "Выйти") and shows a personal
+    # "Отклики на вакансии" navigation item to signed-in applicants.
+    # Require both signals so ordinary job descriptions mentioning an
+    # "выход" do not authenticate an anonymous page by accident.
+    if (config.source == "habr"
+            and re.search(r"(?<![\w])выход(?![\w])", low_body)
+            and "отклики на вакансии" in low_body):
+        return SessionStatus.CONFIRMED, _safe_url(url)
 
     confirmed = [marker for marker in config.confirmed_body_markers if marker in low_body]
     expired = [marker for marker in config.expired_body_markers if marker in low_body]
@@ -796,6 +823,27 @@ class ProviderSessionManager:
                         status, _detail = classify_provider_page(
                             config, getattr(page, "url", config.check_url), body
                         )
+                        if status == SessionStatus.UNKNOWN and config.source == "habr":
+                            # Habr's personal menu is hidden until opened; the
+                            # visible body text alone cannot establish login.
+                            evaluate = getattr(page, "evaluate", None)
+                            if callable(evaluate):
+                                try:
+                                    proved = bool(evaluate(HABR_ACCOUNT_DOM_PROOF))
+                                    if not proved and callable(getattr(page, "wait_for_function", None)):
+                                        try:
+                                            page.wait_for_function(HABR_ACCOUNT_DOM_PROOF, timeout=2000)
+                                        except Exception as exc:  # noqa: BLE001
+                                            LOGGER.debug(
+                                                "Habr account controls were not ready: %s",
+                                                type(exc).__name__,
+                                            )
+                                        proved = bool(evaluate(HABR_ACCOUNT_DOM_PROOF))
+                                    if proved:
+                                        status = SessionStatus.CONFIRMED
+                                        _detail = "Habr account controls verified"
+                                except Exception:
+                                    LOGGER.debug("Habr DOM auth check failed", exc_info=True)
                         return self._result(
                             config,
                             account_id,
