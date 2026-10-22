@@ -380,7 +380,9 @@ def evaluate_search_filter(raw: dict[str, Any], search: dict[str, Any]) -> Filte
         if wanted_currency and not currency:
             return FilterDecision("unknown", ("salary:currency_unknown",), tuple(fields))
         if wanted_currency and currency != wanted_currency:
-            return FilterDecision("reject", ("salary:currency_mismatch",), tuple(fields))
+            # E.g. USD listings in the Russian HH feed: do not compare
+            # 3000 USD numerically with 120000 RUR or discard a good AI role.
+            return FilterDecision("unknown", ("salary:currency_mismatch_check",), tuple(fields))
         minimum = int(salary_cfg.get("from", 0) or 0)
         if minimum:
             lower = salary.get("from")
@@ -394,6 +396,10 @@ def evaluate_search_filter(raw: dict[str, Any], search: dict[str, Any]) -> Filte
             else:
                 if lower is None and upper is None:
                     return FilterDecision("unknown", ("salary:range_unknown",), tuple(fields))
+                if upper is None and lower is not None and int(lower) < minimum:
+                    # "from 100k" has no ceiling: it may still overlap a 120k
+                    # target, but cannot be advertised as verified salary.
+                    return FilterDecision("unknown", ("salary:open_range_below_target",), tuple(fields))
                 if max(int(lower or 0), int(upper or 0)) < minimum:
                     return FilterDecision("reject", ("salary:possible_below_threshold",), tuple(fields))
         if salary.get("gross") is None and "gross" in salary:

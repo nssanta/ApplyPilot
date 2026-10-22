@@ -11,10 +11,23 @@ from typing import Any
 
 from .storage import Store
 
+AI_AGENT_ROLE = re.compile(
+    r"\b(?:llm|rag|genai|agent|agentic)\b|агент|мультиагент"
+    r"|ai[- /]?инженер|ии[- /]?инженер|ai[- /]?разработчик|ии[- /]?разработчик"
+    r"|ai.{0,16}интеграци", re.IGNORECASE,
+)
+
+AI_CODING_TOOLS = re.compile(
+    r"\b(?:claude code|openai codex|codex|cursor|windsurf|github copilot|vibe coding)\b"
+    r"|вайбкод|ai-native|ai-first", re.IGNORECASE,
+)
+
 OUT_OF_SCOPE_TITLES = re.compile(
     r"\b(?:aqa|qa|sdet|php|bim|bitrix|computer vision|cv engineer|quality assurance|"
-    r"test automation|test engineer|software development engineer in test)\b"
-    r"|тестиров|битрикс|1с|3d-разработчик", re.IGNORECASE,
+    r"test automation|test engineer|software development engineer in test|"
+    r"embedded|firmware|observability|knx)\b"
+    r"|тестиров|битрикс|1с|3d-разработчик|fullstack-аналитик"
+    r"|инженер-проектировщик систем автоматизации|инженер эксплуатации", re.IGNORECASE,
 )
 
 
@@ -29,6 +42,8 @@ def _description_risks(description: str, title: str) -> list[str]:
         risks.append("geo:in_person_interview")
     if re.search(r"от\s+[56]\s*\+?\s*лет\s+(?:коммерческ|опыт\w+\s+коммерческ)", body):
         risks.append("grade:commercial_5plus")
+    if re.search(r"обычно\s+(?:это\s+)?[56]\s*\+?\s*лет", body):
+        risks.append("grade:commercial_5plus")
     if re.search(r"опыт\w*\s+работы\s+(?:с\s+ml\s+)?от\s+6\s*лет|6\s*лет\s+(?:опыта|в\s+ml)", body):
         risks.append("grade:ml_6plus")
     if re.search(r"профильное\s+высшее\s+образование|оконченное\s+высшее\s+образование", body):
@@ -39,6 +54,24 @@ def _description_risks(description: str, title: str) -> list[str]:
         r"от\s+\d+\s+лет\s+опыта\s+руковод", body,
     ):
         risks.append("grade:team_management_required")
+    if re.search(r"руководител|лидер направления|\b(?:head of|tech lead|team lead)\b", title_lower):
+        risks.append("grade:management_title")
+    if re.search(r"\b(?:rust|c\+\+|с\+\+)\b", title_lower) and not re.search(
+        r"\b(?:python|golang|fastapi)\b", title_lower
+    ):
+        risks.append("domain:rust_cpp_primary")
+    if re.search(r"\b(?:frontend|фронтенд)\b", title_lower) and not re.search(
+        r"\b(?:fullstack|backend|node\.js|python)\b", title_lower
+    ):
+        risks.append("domain:frontend_only")
+    if re.search(r"опыт разработки проектов на php|php7\s*\+\s*mysql|основной стек.{0,30}php", body):
+        risks.append("domain:php_primary")
+    if "свой собственный язык программирования mpl" in body:
+        risks.append("domain:proprietary_language_core")
+    if re.search(r"без\s+вайб[- ]кодинг|запрещен\w*\s+использова\w*\s+ии", body):
+        risks.append("workflow:ai_coding_discouraged")
+    if re.search(r"офисный формат|формат работы.{0,20}офис|работа строго в офисе|ежедневно в офис", body):
+        risks.append("geo:office_required")
     if (
         re.search(r"обучени[ея]\s+модел\w*\s+компьютерного\s+зрения", body)
         and "rag" not in title_lower and "llm" not in title_lower
@@ -179,11 +212,28 @@ def compile_bundle(
             adjustments = 10 if item.get("filter_status") == "pass" else -5
             if "salary:lower_bound_meets_threshold" in flags:
                 adjustments += 12
+                salary = item.get("salary") or {}
+                lower = salary.get("from") if isinstance(salary, dict) else None
+                try:
+                    if lower is not None and int(lower) >= 200000:
+                        adjustments += 9
+                    elif lower is not None and int(lower) >= 150000:
+                        adjustments += 4
+                except (TypeError, ValueError):
+                    pass
             elif "salary:range_overlaps_threshold" in flags:
                 adjustments += 3
             if any(str(v) in str(item.get("name", "")).casefold() for v in
                    ("agent", "агент", "ai-native", "ai-first", "вайб", "vibe", "llm", "rag")):
                 adjustments += 7
+            if AI_AGENT_ROLE.search(str(item.get("name") or "")):
+                adjustments += 15
+                flags.append("role:agent_llm_priority")
+            if AI_CODING_TOOLS.search(
+                str(item.get("name") or "") + " " + str(item.get("description") or "")
+            ):
+                adjustments += 12
+                flags.append("workflow:ai_assisted_coding")
             if any("seniority" in str(f) for f in flags):
                 adjustments -= 18
             if any("english_requirement" in str(f) for f in flags):
@@ -202,19 +252,50 @@ def compile_bundle(
                 adjustments -= 30
             if "geo:in_person_interview" in flags:
                 adjustments -= 18
-            manual_geo_block = "geo:only_moscow_applicants" in flags
+            if "workflow:ai_coding_discouraged" in flags:
+                adjustments -= 24
+            if "grade:management_title" in flags:
+                adjustments -= 65
+            if "domain:rust_cpp_primary" in flags:
+                adjustments -= 40
+            if "domain:php_primary" in flags:
+                adjustments -= 45
+            if "domain:proprietary_language_core" in flags:
+                adjustments -= 55
+            if "domain:frontend_only" in flags:
+                adjustments -= 22
+            manual_geo_block = any(
+                flag in flags for flag in ("geo:only_moscow_applicants", "geo:office_required")
+            )
             manual_seniority_block = any(
                 flag in flags for flag in (
                     "grade:commercial_5plus", "grade:ml_6plus",
-                    "grade:team_management_required",
+                    "grade:team_management_required", "grade:management_title",
                 )
             )
             manual_specialist_block = any(
                 flag in flags for flag in (
                     "timezone:australia", "domain:computer_vision_core",
-                    "domain:image_model_training",
+                    "domain:image_model_training", "domain:rust_cpp_primary",
+                    "domain:php_primary", "domain:proprietary_language_core",
+                    "domain:frontend_only",
                 )
             )
+            salary_range = item.get("salary") or {}
+            manual_salary_block = False
+            if isinstance(salary_range, dict):
+                lower = salary_range.get("from")
+                upper = salary_range.get("to")
+                try:
+                    manual_salary_block = (
+                        upper is not None and int(upper) <= 120000
+                        and (lower is None or int(lower) < 120000)
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if manual_salary_block:
+                adjustments -= 23
+                flags.append("salary:only_upper_bound_120k")
             if manual_geo_block:
                 adjustments -= 100
             if "grade:team_management_required" in flags:
@@ -225,6 +306,7 @@ def compile_bundle(
                 else "needs_enrichment" if needs_enrichment
                 else "manual_seniority_check" if manual_seniority_block
                 else "manual_specialist_check" if manual_specialist_block
+                else "manual_salary_check" if manual_salary_block
                 else "fit"
             )
             if needs_enrichment:
@@ -303,6 +385,9 @@ def compile_bundle(
         ),
         "manual_specialist_check_candidates": sum(
             v["review_lane"] == "manual_specialist_check" for v in unique_roles
+        ),
+        "manual_salary_check_candidates": sum(
+            v["review_lane"] == "manual_salary_check" for v in unique_roles
         ),
         "skipped": skipped,
         "items": ranked,

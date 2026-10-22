@@ -143,3 +143,32 @@ def test_ai_agents_llmops_rejects_qa_and_security_but_keeps_llmops_engineering()
     assert "preset_noise:qa" in qa.hard_killers
     assert "preset_noise:security" in security.hard_killers
     assert llmops.decision == "pass"
+
+
+def test_salary_soft_threshold_keeps_open_ended_and_other_currency_for_review():
+    search = {"salary": {"currency": "RUR", "from": 120000, "policy": "possible"}}
+    open_low = evaluate_search_filter(
+        {"id": "open", "salary": {"from": 100000, "to": None, "currency": "RUR"}},
+        search,
+    )
+    assert open_low.status == "unknown"
+    assert "salary:open_range_below_target" in open_low.reasons
+
+    usd = evaluate_search_filter(
+        {"id": "usd", "salary": {"from": 3000, "to": 5000, "currency": "USD"}},
+        search,
+    )
+    assert usd.status == "unknown"
+    assert "salary:currency_mismatch_check" in usd.reasons
+
+    bounded_below = evaluate_search_filter(
+        {"id": "low", "salary": {"from": 70000, "to": 110000, "currency": "RUR"}},
+        search,
+    )
+    assert bounded_below.status == "reject"
+
+    guaranteed = evaluate_search_filter(
+        {"id": "fixed", "salary": {"from": 120000, "currency": "RUR"}},
+        search,
+    )
+    assert guaranteed.status == "pass"
