@@ -569,6 +569,17 @@ def test_verified_public_visibility_never_overrides_disabled_submit():
     assert not any("submit-popup" in selector for selector in page.clicks)
 
 
+def test_disabled_submit_without_visibility_banner_is_manual_before_click():
+    page = _Page(body_after_response="Form")
+    page.submit_enabled = False
+
+    result = apply_one(page, _item(), "Python", visibility_verified=True)
+
+    assert result.status == "needs_manual"
+    assert result.note == "HH confirmation button is disabled"
+    assert not any("submit-popup" in selector for selector in page.clicks)
+
+
 def test_live_resume_visibility_verification_checks_exact_resume_id_and_title():
     resume_id = "a" * 40
     title = "AI/LLM Engineer / AI Agent Engineer"

@@ -263,6 +263,11 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("needs_manual", "screening questions require manual review")
         if not submit.is_visible(timeout=8000):
             return ApplyResult("needs_manual", "confirmation button not found")
+        # A disabled HH submit cannot complete a response. Diagnose it before
+        # attempting a click, rather than misclassifying a click timeout as an
+        # uncertain submission. Never force-click or retry a submitted action.
+        if not submit.is_enabled(timeout=3000):
+            return ApplyResult("needs_manual", "HH confirmation button is disabled")
         # HH может ненадолго оставлять кнопку popup неактивной, пока стабилизируется состояние формы.
         # Ожидание здесь остаётся одной попыткой клика: не используем force-click и не повторяем действие.
         submit.click(timeout=15000)
