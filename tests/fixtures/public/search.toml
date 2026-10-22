@@ -1,0 +1,15 @@
+# Generic AI/LLM search used by public offline tests and the smoke demo.
+queries = ["AI engineer", "LLM engineer", "RAG"]
+max_pages = 1
+request_budget = 50
+sort_mode = "relevance"
+only_remote = false
+days = 3650
+min_score = 0
+details_limit = 8
+skip_high_security = false
+
+[salary]
+currency = "RUR"
+from = 100000
+missing = "include"

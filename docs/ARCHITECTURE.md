@@ -426,3 +426,25 @@ PDF/DOCX автоматически не парсятся.
 - блокировка включения legacy watcher из admin.
 
 Перед публикацией дополнительно запускаются Ruff, build, public leak-check и `git diff --check`.
+
+## Multi-Source слой (22.10.2026)
+
+Провайдеры (`src/applypilot/providers/`) только читают публичные страницы и
+возвращают нормализованные записи; они не авторизуются и не отправляют отклики.
+`multisource.scan_source` изолирует падение одного источника, сохраняет snapshot
+по `(source, account, track)` и пишет наблюдения в общие `vacancies`/`scores`.
+
+HH не переписан: `scan_source("hh.ru")` маршрутизируется в существующий
+`campaigns.run_campaign`, поэтому approvals, UNKNOWN, резюме и legacy attempts
+сохраняются. Non-HH источники используют source-aware ledger.
+
+`vacancy_links` хранит группу роли и канал, но duplicate-флаг является снимком;
+планировщик и резервирование всегда перечитывают актуальные attempts и
+`channel_reservations`. Канал — глобальный для аккаунта writer-lock: один ATS URL
+не может быть зарезервирован двумя площадками. Нативные формы разных площадок
+остаются независимыми. DreamJob использует `hh.ru:<id>` и `mirror_only`.
+
+`review_lane` отделяет `FIT` от `GOOD_UNKNOWN`: сильная роль с неизвестной
+зарплатой/датой/remote остаётся в review, но не считается подтверждённым FIT.
+`unknown` — карантин; `reconcile` требует evidence, `recover` не повторяет
+зависшие `submitting` вслепую.

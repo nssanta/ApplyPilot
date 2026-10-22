@@ -1,0 +1,26 @@
+# Generic example profile for public tests. No real personal data.
+name = "Example Candidate"
+location = "Remote"
+english_level = "B2"
+profile_version = "public-1"
+reviewed = false
+account = "default"
+
+[limits]
+per_run = 100
+per_day = 300
+
+[apply]
+delay_min_seconds = 5
+delay_max_seconds = 12
+confirmation_timeout_seconds = 15
+
+[llm]
+enabled = false
+model = "openrouter/free"
+
+[resumes]
+default = "Example Resume"
+
+[answers]
+motivation = "Example motivation."

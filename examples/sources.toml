@@ -1,0 +1,9 @@
+# Copy to private/config/sources.toml and replace labels with your own.
+# Never put passwords or cookies in this file.
+[accounts]
+"hh.ru" = "hh-primary"
+"career.habr.com" = "habr-primary"
+"getmatch.ru" = "getmatch-primary"
+"geekjob.ru" = "geekjob-primary"
+"yandex.ru/jobs" = "yandex-primary"
+"dreamjob.ru" = "hh-primary"
