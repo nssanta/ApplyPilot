@@ -703,23 +703,152 @@ class AdminApp:
         return {"track": track, "model": report.get("model"), "count": len(rows),
                 "folded_duplicates": folded, "rows": rows}
 
-    def campaign_queue(self, track: str, view: str = "all", limit: int = 100) -> dict[str, Any]:
+    def campaign_queue(self, track: str, view: str = "all", limit: int = 100,
+                       source: str | None = None) -> dict[str, Any]:
         if track not in TRACKS:
             return {"error": "unknown track", "items": []}
-        account = self._account_for_track(track)
+        from .multisource import resolve_source_account
+        from .providers import default_registry
         store = Store(self.config.db_path)
+        profile = self.config.load_profile()
+        selected = [source] if source else default_registry().sources()
+        accounts: dict[str, str] = {}
+        rows: list[dict[str, Any]] = []
+        for src in selected:
+            account = resolve_source_account(self.config, profile, src)
+            accounts[src] = account
+            try:
+                rows.extend(store.list_campaign_vacancies(
+                    account, track, view, limit, source=src,
+                ))
+            except ValueError as exc:
+                return {"error": str(exc), "items": []}
+        # A vacancy is unique by (source, native id).  Different sources remain
+        # visible even when they point at the same role.
+        deduped: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            deduped[(str(row.get("source") or ""), str(row.get("id") or ""))] = row
+        lane_rank = {"FIT": 0, "GOOD_UNKNOWN": 1, "NEEDS_ENRICHMENT": 2,
+                     "MANUAL_REVIEW": 3, "SKIP": 4, "APPLIED": 5}
+        merged = sorted(
+            deduped.values(),
+            key=lambda row: (lane_rank.get(str(row.get("review_lane") or ""), 4),
+                             -int(row.get("score") or 0)),
+        )[:limit]
+        return {"account": accounts.get(source) if source else str(profile.get("account") or ""),
+                "accounts": accounts, "track": track, "view": view, "source": source,
+                "count": len(merged), "items": merged}
+
+    def sources_overview(self, track: str) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track", "sources": []}
+        from .multisource import source_status
+        return source_status(self.config, track, None)
+
+    def accounts_overview(self) -> dict[str, Any]:
+        """Local-only Telegram/HH OAuth account status; never returns secrets."""
+        from .accounts import unified_accounts
+        from .storage import Store
+        payload = unified_accounts(self.config.root)
+        payload["last_checks"] = Store(self.config.db_path).external_accounts()
+        return payload
+
+    def source_plan(self, track: str, source: str, limit: int = 100) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track", "planned": [], "blocked": []}
+        if not source:
+            return {"error": "source is required", "planned": [], "blocked": []}
+        if limit < 1 or limit > 100:
+            return {"error": "limit must be between 1 and 100", "planned": [], "blocked": []}
+        from .multisource import queue_plan, resolve_source_account
+        profile = self.config.load_profile()
+        account = resolve_source_account(self.config, profile, source)
+        return queue_plan(Store(self.config.db_path), account, track, source, limit)
+
+    def dispatch_overview(self, track: str, sources: list[str] | None = None,
+                          limit: int = 100) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track", "planned": [], "blocked": []}
+        if limit < 1 or limit > 100:
+            return {"error": "limit must be between 1 and 100", "planned": [], "blocked": []}
+        from .dispatch import dispatch_plan
+        from .multisource import resolve_source_account
+        from .providers import default_registry
+        registry = default_registry()
+        selected = sources or registry.sources()
+        profile = self.config.load_profile()
+        accounts = {
+            source: resolve_source_account(self.config, profile, source)
+            for source in selected
+        }
+        return dispatch_plan(
+            Store(self.config.db_path), "default", track, selected, limit,
+            accounts=accounts, registry=registry,
+        )
+
+    def telegram_import(self, track: str, source: str = "getmatch.ru",
+                        create_missing: bool = False, limit: int = 200) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        from .accounts import DEFAULT_TELEGRAM_ACCOUNT
+        from .multisource import resolve_source_account
+        from .telegram_import import import_telegram_vacancies
+        profile = self.config.load_profile()
+        ledger_account = resolve_source_account(self.config, profile, source)
+        return import_telegram_vacancies(
+            Store(self.config.db_path),
+            account=DEFAULT_TELEGRAM_ACCOUNT,
+            source=source,
+            track=track,
+            limit=limit,
+            create_missing=create_missing,
+            ledger_account=ledger_account,
+        )
+
+    def clickers_overview(self) -> dict[str, Any]:
+        from .clickers import clicker_specs
+        return {"clickers": clicker_specs()}
+
+    def set_campaign_review_batch(self, track: str, source: str,
+                                  vacancy_ids: list[str], state: str,
+                                  reason: str, notes: str | None = None) -> dict[str, Any]:
+        if track not in TRACKS:
+            return {"error": "unknown track"}
+        if not source:
+            return {"error": "source is required"}
+        if not vacancy_ids or len(vacancy_ids) > 100:
+            return {"error": "1–100 vacancy IDs are required"}
+        from .multisource import resolve_source_account
+        account = resolve_source_account(self.config, self.config.load_profile(), source)
         try:
-            rows = store.list_campaign_vacancies(account, track, view, limit)
+            changed = Store(self.config.db_path).set_review_state_batch(
+                account, source, vacancy_ids, state, reason=reason, track=track,
+            )
         except ValueError as exc:
-            return {"error": str(exc), "items": []}
-        return {"account": account, "track": track, "view": view, "count": len(rows), "items": rows}
+            return {"error": str(exc)}
+        return {"ok": True, "source": source, "account": account,
+                "changed": changed, "state": state.upper()}
 
     def campaign_history(self, track: str = "", limit: int = 20) -> dict[str, Any]:
-        account = self._account_for_track(track) if track in TRACKS else self._account_for_profile(
-            _profile_flag(self.root, next(iter(TRACKS))) if TRACKS else {}
-        )
-        rows = Store(self.config.db_path).campaign_history(account, track or None, limit)
-        return {"account": account, "track": track or None, "runs": rows}
+        from .multisource import resolve_source_account
+        from .providers import default_registry
+        profile = self.config.load_profile()
+        store = Store(self.config.db_path)
+        accounts = {
+            source: resolve_source_account(self.config, profile, source)
+            for source in default_registry().sources()
+        }
+        rows: list[dict[str, Any]] = []
+        for account in dict.fromkeys(accounts.values()):
+            rows.extend(store.campaign_history(account, track or None, limit))
+        deduped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            deduped[str(row.get("campaign_id") or "")] = row
+        merged = sorted(
+            deduped.values(),
+            key=lambda row: str(row.get("started_at") or ""), reverse=True,
+        )[:limit]
+        return {"accounts": accounts, "track": track or None, "runs": merged}
 
     def inbox_messages(self, track: str = "", limit: int = 100) -> dict[str, Any]:
         if track and track not in TRACKS:
@@ -731,17 +860,19 @@ class AdminApp:
         return {"account": account, "messages": rows[-max(1, min(1000, int(limit))):]}
 
     def set_campaign_review(self, track: str, vacancy_id: str, state: str,
-                            reason: str, notes: str | None = None) -> dict[str, Any]:
+                            reason: str, notes: str | None = None,
+                            source: str = "hh.ru") -> dict[str, Any]:
         if track not in TRACKS:
             return {"error": "unknown track"}
-        account = self._account_for_track(track)
+        from .multisource import resolve_source_account
+        account = resolve_source_account(self.config, self.config.load_profile(), source)
         try:
             Store(self.config.db_path).set_review_state(
-                account, "hh.ru", vacancy_id, state, reason=reason, notes=notes, track=track,
+                account, source, vacancy_id, state, reason=reason, notes=notes, track=track,
             )
         except ValueError as exc:
             return {"error": str(exc)}
-        return {"ok": True, "id": str(vacancy_id), "state": state.upper()}
+        return {"ok": True, "id": str(vacancy_id), "source": source, "state": state.upper()}
 
     # ---- фоновые задачи --------------------------------------------------
     def start_job(self, body: dict[str, Any]) -> tuple[bool, str]:
@@ -753,6 +884,53 @@ class AdminApp:
         base = [sys.executable, "-m", "applypilot"]
         # Глобальные флаги profile/search должны стоять перед подкомандой.
         gflags = ["--profile", cfg["profile"], "--search", cfg["search"]]
+        if action == "sources_scan":
+            try:
+                limit = int(body.get("limit", 100))
+            except (TypeError, ValueError):
+                return False, "limit must be an integer"
+            if limit < 1 or limit > 100:
+                return False, "limit must be between 1 and 100"
+            requested = body.get("sources") or []
+            if isinstance(requested, str):
+                requested = [requested]
+            if not isinstance(requested, list) or len(requested) > 20:
+                return False, "sources must be a list of at most 20 source keys"
+            argv = base + gflags + ["sources", "scan", "--track", track, "--limit", str(limit)]
+            for source in requested:
+                value = str(source).strip()
+                if value:
+                    if len(value) > 80:
+                        return False, "source key is too long"
+                    argv += ["--source", value]
+            return self.runner.start(argv, f"sources_scan:{track}")
+        if action == "source_check":
+            source = str(body.get("source") or "").strip()
+            if not source or len(source) > 80:
+                return False, "a source key is required"
+            from .multisource import resolve_source_account
+            account = str(body.get("account") or "").strip() or resolve_source_account(
+                self.config, self.config.load_profile(), source,
+            )
+            if len(account) > 80:
+                return False, "account label is too long"
+            argv = base + gflags + ["sources", "check", "--source", source,
+                                    "--account", account, "--json"]
+            return self.runner.start(argv, f"source_check:{source}")
+        if action in {"telegram_check", "hh_oauth_check", "telegram_sync"}:
+            account = str(body.get("account") or "").strip()
+            if len(account) > 80:
+                return False, "account label is too long"
+            if action == "telegram_check":
+                argv = base + gflags + ["accounts", "telegram-status", "--online"]
+            elif action == "hh_oauth_check":
+                argv = base + gflags + ["accounts", "hh-oauth-status", "--online"]
+            else:
+                argv = base + gflags + ["accounts", "telegram-sync", "--limit", "30"]
+            if account:
+                argv += ["--account", account]
+            argv += ["--json"]
+            return self.runner.start(argv, f"{action}:{account or 'default'}")
         if action == "scan":
             # UI явно использует двухпроходный поиск. Обычный CLI сохраняет
             # исторический relevance-only режим, пока пользователь не выберет другой.
@@ -832,6 +1010,11 @@ class AdminApp:
                 return False, "limit must be between 1 and 100"
             argv = base + gflags + ["queue", "apply", "--track", track,
                                     "--limit", str(limit)]
+            requested_source = str(body.get("source") or "").strip()
+            if requested_source:
+                if len(requested_source) > 80:
+                    return False, "source key is too long"
+                argv += ["--source", requested_source]
             argv += ["--dry-run"] if action == "queue_apply_dry" else ["--run"]
             if action == "queue_apply_run":
                 if not body.get("confirm"):
@@ -1759,7 +1942,37 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                 except ValueError:
                     self._send(400, {"error": "limit must be an integer", "items": []})
                     return
-                self._send(200, app.campaign_queue(track, view, limit))
+                source = query.get("source", [None])[0] or None
+                self._send(200, app.campaign_queue(track, view, limit, source=source))
+            elif parsed.path == "/api/accounts":
+                self._send(200, app.accounts_overview())
+            elif parsed.path == "/api/sources":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [next(iter(TRACKS), "")])[0]
+                self._send(200, app.sources_overview(track))
+            elif parsed.path == "/api/source-plan":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [next(iter(TRACKS), "")])[0]
+                source = query.get("source", [""])[0]
+                try:
+                    limit = int(query.get("limit", ["100"])[0])
+                except ValueError:
+                    self._send(400, {"error": "limit must be an integer", "planned": [], "blocked": []})
+                    return
+                self._send(200, app.source_plan(track, source, limit))
+            elif parsed.path == "/api/dispatch":
+                query = parse_qs(parsed.query)
+                track = query.get("track", [next(iter(TRACKS), "")])[0]
+                sources = query.get("source") or None
+                try:
+                    limit = int(query.get("limit", ["100"])[0])
+                except ValueError:
+                    self._send(400, {"error": "limit must be an integer",
+                                     "planned": [], "blocked": []})
+                    return
+                self._send(200, app.dispatch_overview(track, sources, limit))
+            elif parsed.path == "/api/clickers":
+                self._send(200, app.clickers_overview())
             elif parsed.path == "/api/campaign-history":
                 query = parse_qs(parsed.query)
                 track = query.get("track", [""])[0]
@@ -1826,8 +2039,51 @@ def _handler(app: AdminApp) -> type[BaseHTTPRequestHandler]:
                     str(body.get("track") or ""), str(body.get("id") or ""),
                     str(body.get("state") or ""), str(body.get("reason") or ""),
                     None if body.get("notes") is None else str(body.get("notes")),
+                    source=str(body.get("source") or "hh.ru"),
                 )
                 self._send(200 if result.get("ok") else 400, result)
+            elif parsed.path == "/api/campaign-review-batch":
+                ids = body.get("ids") or []
+                if isinstance(ids, str):
+                    ids = [ids]
+                if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+                    self._send(400, {"error": "ids must be a list of strings"})
+                    return
+                result = app.set_campaign_review_batch(
+                    str(body.get("track") or ""), str(body.get("source") or ""),
+                    ids, str(body.get("state") or "APPROVED"),
+                    str(body.get("reason") or ""),
+                    None if body.get("notes") is None else str(body.get("notes")),
+                )
+                self._send(200 if result.get("ok") else 400, result)
+            elif parsed.path == "/api/dispatch":
+                if body.get("allow_live"):
+                    self._send(400, {"error": "live apply is CLI-only; admin exposes dry-run"})
+                    return
+                sources = body.get("sources") or None
+                if sources is not None and not isinstance(sources, list):
+                    self._send(400, {"error": "sources must be a list"})
+                    return
+                try:
+                    limit = int(body.get("limit") or 100)
+                except (TypeError, ValueError):
+                    self._send(400, {"error": "limit must be an integer"})
+                    return
+                self._send(200, app.dispatch_overview(
+                    str(body.get("track") or ""), sources, limit,
+                ))
+            elif parsed.path == "/api/telegram/import":
+                try:
+                    limit = int(body.get("limit") or 200)
+                except (TypeError, ValueError):
+                    self._send(400, {"error": "limit must be an integer"})
+                    return
+                self._send(200, app.telegram_import(
+                    str(body.get("track") or ""),
+                    str(body.get("source") or "getmatch.ru"),
+                    bool(body.get("create_missing")),
+                    limit,
+                ))
             elif parsed.path == "/api/workflow-task":
                 result = app.update_workflow_task(
                     str(body.get("task_id") or ""), str(body.get("action") or ""),
@@ -2039,6 +2295,7 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <div class="tab" data-t="stats">Статистика</div>
 <div class="tab" data-t="tracks">Резюме и треки</div>
 <div class="tab" data-t="log">Лог</div>
+<div class="tab" data-t="accounts">Аккаунты</div>
 <div class="tab" data-t="settings">Настройки</div>
 </div>
 <div class="bal"><span id="hbal" class="muted"></span><span id="jobstate" class="muted"></span></div>
@@ -2062,7 +2319,12 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <div class="row"><button onclick="startCampaign()">Запустить поиск сейчас</button><span id="cmessage" class="muted"></span></div>
   </div>
   <div class="card" style="margin-top:12px">
-    <div class="row" style="margin:0"><label>Очередь</label><select id="cview">
+    <div class="row" style="margin:0"><label>Источник</label><select id="csource">
+      <option value="">все источники</option><option value="hh.ru">HH.ru</option>
+      <option value="career.habr.com">Habr Career</option><option value="getmatch.ru">Getmatch</option>
+      <option value="geekjob.ru">GeekJob</option><option value="yandex.ru/jobs">Карьера Яндекса</option>
+      <option value="dreamjob.ru">DreamJob (зеркало HH)</option>
+    </select><label>Очередь</label><select id="cview">
       <option value="all">все</option><option value="new">новые в последнем scan</option><option value="top">топ по score</option>
       <option value="deferred">отложенные</option><option value="approved">одобренные</option><option value="ready">готовы к отклику</option>
       <option value="needs_letter">нужно письмо</option><option value="needs_form">нужна анкета</option>
@@ -2072,7 +2334,14 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
     <div class="tablewrap"><div id="ctable"></div></div>
     <div class="row" style="margin-top:12px"><label>Лимит одобренного пакета</label><input id="capplylimit" type="number" min="1" max="100" value="5" style="width:80px">
       <button class="ghost" onclick="campaignApply(false)">Dry-run одобренных</button>
-      <button class="danger" onclick="campaignApply(true)">Отправить одобренные</button></div>
+      <button class="danger" onclick="campaignApply(true)">Отправить одобренные</button>
+      <button class="ghost" onclick="sourcePlan()">План выбранного источника</button>
+      <button class="ghost" onclick="dispatchPlan()">Общий dry-run</button>
+      <button class="ghost" onclick="telegramImport()">Импорт Telegram</button>
+      <button class="ghost" onclick="clickersInfo()">Кликеры</button>
+      <button class="ghost" onclick="batchReview()">Пакетное решение</button>
+      <button class="ghost" onclick="checkSourceSession()">Проверить сессию источника</button>
+      <button class="ghost" onclick="startSourcesScan()">Сканировать все источники</button></div>
     <p class="muted">Реальный запуск дополнительно требует проверенного профиля, точного резюме трека и свежего успешного HH sync.</p>
     <h3 style="margin-top:18px">Черновики и ручные действия</h3><div id="workflowtasks" class="muted">загрузка…</div>
     <h3 style="margin-top:18px">История поисков</h3><div id="chistory" class="muted"></div>
@@ -2161,6 +2430,18 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
   <pre id="logbox"></pre>
 </section>
 
+<section id="accounts" class="hide">
+  <div class="card"><h3>Локальные аккаунты Telegram и HH OAuth</h3>
+    <p class="muted">Секреты вводятся только в локальном терминале: <code>applypilot accounts telegram-setup</code> и <code>applypilot accounts hh-oauth-setup</code>. В интерфейсе видны только статусы; токены и session-файлы не возвращаются.</p>
+    <div class="row"><button onclick="loadAccounts()">Обновить</button>
+      <button class="ghost" onclick="checkAccount('telegram_check')">Проверить Telegram</button>
+      <button class="ghost" onclick="checkAccount('hh_oauth_check')">Проверить HH OAuth</button>
+      <button class="ghost" onclick="checkAccount('telegram_sync')">Синхронизировать @g_jobbot</button>
+      <span id="acctmsg" class="muted"></span></div>
+    <div id="acctable" class="sub"></div>
+    <p class="muted">Отправка откликов через Telegram и HH OAuth не включена: оба метода имеют статус <b>needs_live_validation</b> до совместной проверки на реальных аккаунтах.</p>
+  </div>
+</section>
 <section id="settings" class="hide">
   <div class="settings-grid">
     <div class="stack">
@@ -2208,14 +2489,14 @@ pre{background:#0a0d11;border:1px solid var(--line);border-radius:8px;padding:12
 <script>
 const $=s=>document.querySelector(s);
 const ADMIN_TOKEN="__APPLYPILOT_CSRF_TOKEN__";
-const SECTIONS=["overview","campaign","inbox","vac","apply","stats","tracks","log","settings"];
+const SECTIONS=["overview","campaign","inbox","vac","apply","stats","tracks","log","accounts","settings"];
 let tab="overview",TRACKS=[],VFILTER="";
 function setHdr(){document.documentElement.style.setProperty('--hdr',(document.querySelector('header').offsetHeight)+'px');}
 addEventListener('resize',setHdr);
 function show(t){tab=t;location.hash=t;
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x.dataset.t===t));
   SECTIONS.forEach(id=>$("#"+id).classList.toggle("hide",id!==t));setHdr();
-  ({overview:loadOverview,campaign:loadCampaign,inbox:loadInbox,vac:loadVac,apply:loadApply,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
+  ({overview:loadOverview,campaign:loadCampaign,inbox:loadInbox,vac:loadVac,apply:loadApply,accounts:loadAccounts,settings:loadSettings,stats:loadStats,tracks:()=>loadTracks(false),log:refreshJob}[t]||(()=>{}))();}
 document.querySelectorAll(".tab").forEach(el=>el.onclick=()=>show(el.dataset.t));
 async function api(p,opt={}){const method=(opt.method||"GET").toUpperCase();
   if(method==="POST"){const headers=new Headers(opt.headers||{});headers.set("Content-Type","application/json");
@@ -2245,6 +2526,7 @@ function fillTrackSelects(tracks){TRACKS=tracks||[];
     sel.innerHTML=TRACKS.map(t=>`<option value="${escAttr(t.key)}">${esc(t.label)}</option>`).join("");
     if(cur&&TRACKS.some(t=>t.key===cur))sel.value=cur;}
   const campaignTrack=$("#ctrack");if(campaignTrack&&!campaignTrack.dataset.bound){campaignTrack.onchange=loadCampaignQueue;campaignTrack.dataset.bound="1";}
+  const campaignSource=$("#csource");if(campaignSource&&!campaignSource.dataset.bound){campaignSource.onchange=loadCampaignQueue;campaignSource.dataset.bound="1";}
   const tt=$("#ttype");if(tt&&!tt.dataset.filled){tt.innerHTML=["ai","infra","general"].map(x=>`<option>${x}</option>`).join("");tt.dataset.filled="1";}}
 
 /* ---- обзор ---- */
@@ -2310,7 +2592,8 @@ async function startCampaign(){
 async function loadCampaignQueue(){
   const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";if(!track)return;
   const view=$("#cview").value||"all";
-  const d=await api("/api/campaign-queue?track="+encodeURIComponent(track)+"&view="+encodeURIComponent(view)+"&limit=100");
+  const source=$("#csource")?$("#csource").value:"";
+  const d=await api("/api/campaign-queue?track="+encodeURIComponent(track)+"&view="+encodeURIComponent(view)+"&limit=100"+(source?"&source="+encodeURIComponent(source):""));
   const rows=d.items||[];$("#cmeta").textContent=(d.error?"Ошибка: "+d.error:`${d.count||0} вакансий · фильтр ${view}`);
   let h='<table><tr><th>#</th><th>Решение</th><th>Оценка</th><th>Вакансия</th><th>Причины и проверки</th><th>Отклик</th><th>Изменить решение</th></tr>';
   rows.forEach((r,i)=>{
@@ -2321,11 +2604,11 @@ async function loadCampaignQueue(){
     const choice=`<select id="cdecision-${i}"><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>APPROVED</option><option>DEFERRED</option></select>`;
     h+=`<tr><td>${i+1}</td><td><b>${esc(r.review_state||"UNREVIEWED")}</b><div class="muted">${esc(r.discovery_status||"")}</div></td>
       <td>${safeInt(r.score)}<div class="muted">${esc(r.score_decision||"unknown")}</div></td>
-      <td>${title}<div class="muted">${esc(r.company||"")} · ${salary}</div><div class="muted">${esc(r.area||"")} · ${esc(r.experience||"")}</div></td>
+      <td>${title}<div class="muted">${esc(r.company||"")} · ${salary}</div><div class="muted">${esc(r.area||"")} · ${esc(r.experience||"")}</div><span class="badge">${esc(r.source||"hh.ru")}</span></td>
       <td class="reason"><div>${esc(reasons||"нет явных сигналов")}</div><div class="hl">${esc(checks)}</div>
       ${r.review_reason?`<div class="muted">решение: ${esc(r.review_reason)}</div>`:""}${r.review_notes?`<div class="muted">заметки: ${esc(r.review_notes)}</div>`:""}</td>
       <td>${esc(r.application_state||"NOT_STARTED")}${r.applied_before?'<div class="badge applied">уже есть отклик</div>':""}</td>
-      <td class="nowrap">${choice}<button class="ghost mini" onclick="saveCampaignReview(${jsArg(track)},${jsArg(r.id)},document.getElementById('cdecision-${i}').value)">Сохранить</button></td></tr>`;
+      <td class="nowrap">${choice}<button class="ghost mini" onclick="saveCampaignReview(${jsArg(track)},${jsArg(r.id)},document.getElementById('cdecision-${i}').value,${jsArg(r.source||"hh.ru")})">Сохранить</button></td></tr>`;
   });
   $("#ctable").innerHTML=rows.length?h+"</table>":'<p class="muted">Очередь пока пуста. Запусти поиск по команде выше.</p>';
   const history=await api("/api/campaign-history?track="+encodeURIComponent(track)+"&limit=10");
@@ -2338,18 +2621,80 @@ async function loadCampaignQueue(){
       '<span class="muted">Вопросы не сохранены автоматикой; нужен ручной ответ владельца</span>')+`</div>`;
   }).join("")||"Сохранённых задач пока нет.";
 }
-async function saveCampaignReview(track,id,state){
+async function saveCampaignReview(track,id,state,source){
   const reason=prompt("Короткая причина решения (обязательна):","");if(reason===null||!reason.trim())return;
   const notes=prompt("Заметки (необязательно):","");if(notes===null)return;
   const r=await api("/api/campaign-review",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({track,id,state,reason:reason.trim(),notes:notes.trim()})});
+    body:JSON.stringify({track,id,state,reason:reason.trim(),notes:notes.trim(),source:source||"hh.ru"})});
   if(!r.ok){alert("Не сохранено: "+(r.error||"ошибка"));return;}loadCampaignQueue();
+}
+async function dispatchPlan(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  if(!track){alert("Сначала выбери трек.");return;}
+  const d=await api("/api/dispatch?track="+encodeURIComponent(track)+"&limit=100");
+  if(d.error){alert(d.error);return;}
+  const lines=(d.planned||[]).map(x=>"PLAN "+x.source+":"+x.id+" · "+x.name)
+    .concat((d.blocked||[]).map(x=>"BLOCKED "+x.source+":"+x.id+" · "+x.reason));
+  alert(`Общий dry-run: planned=${d.planned_count||0}, blocked=${d.blocked_count||0}\n\n`+(lines.slice(0,30).join("\n")||"Очередь пуста"));
+}
+async function telegramImport(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  if(!track){alert("Сначала выбери трек.");return;}
+  const r=await api("/api/telegram/import",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({track,source:"getmatch.ru",create_missing:false,limit:200})});
+  if(r.error){alert(r.error);return;}
+  alert(`Telegram import: linked=${r.linked_count||0}, created=${r.created_count||0}, missing=${r.missing_count||0}`);
+}
+async function clickersInfo(){
+  const d=await api("/api/clickers");
+  alert((d.clickers||[]).map(x=>`${x.label}: ${x.apply_status} (submit_verified=${x.submit_verified})`).join("\n"));
+}
+async function sourcePlan(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  const source=$("#csource")?$("#csource").value:"";
+  if(!source){alert("Выбери конкретный источник для dry-run плана.");return;}
+  const limit=Math.max(1,Math.min(100,+$("#capplylimit").value||100));
+  const d=await api("/api/source-plan?track="+encodeURIComponent(track)+"&source="+encodeURIComponent(source)+"&limit="+limit);
+  if(d.error){alert(d.error);return;}
+  const lines=(d.planned||[]).map(x=>"PLAN "+x.id+" · "+x.name+" — "+x.company)
+    .concat((d.blocked||[]).map(x=>"BLOCKED "+x.id+" · "+x.reason));
+  alert(`Dry-run ${source}: planned=${d.planned_count||0}, blocked=${d.blocked_count||0}\n\n`+(lines.slice(0,30).join("\n")||"Очередь пуста"));
+}
+async function startSourcesScan(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  if(!track)return;
+  if(!confirm("Запустить чтение всех источников? Отклики не отправляются."))return;
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"sources_scan",track,limit:100})});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();
+}
+async function batchReview(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  const source=$("#csource")?$("#csource").value:"";
+  if(!source){alert("Выбери конкретный источник для пакетного решения.");return;}
+  const raw=prompt("ID вакансий через запятую (до 100):","");if(raw===null)return;
+  const ids=raw.split(/[,\s]+/).map(x=>x.trim()).filter(Boolean);
+  if(!ids.length){alert("ID не указаны.");return;}
+  const state=(prompt("Решение: APPROVED / FIT / MAYBE / SKIP / DEFERRED","APPROVED")||"APPROVED").toUpperCase();
+  const reason=prompt("Причина решения (обязательна):","");if(reason===null||!reason.trim())return;
+  const r=await api("/api/campaign-review-batch",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({track,source,ids,state,reason:reason.trim()})});
+  if(!r.ok){alert("Не сохранено: "+(r.error||"ошибка"));return;}
+  alert(`Обновлено: ${r.changed} (${r.source}, ${r.state})`);loadCampaignQueue();
+}
+async function checkSourceSession(){
+  const track=$("#ctrack").value||(TRACKS[0]&&TRACKS[0].key)||"";
+  const source=$("#csource")?$("#csource").value:"";
+  if(!source){alert("Выбери конкретный источник.");return;}
+  const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"source_check",track,source})});
+  if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();
 }
 async function campaignApply(real){
   const track=$("#ctrack").value,limit=Math.max(1,Math.min(100,+$("#capplylimit").value||5));
   if(real&&!confirm("Отправить только ранее одобренные вакансии? Нужны reviewed-профиль, точное резюме и свежая HH sync."))return;
   const r=await api("/api/job",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({action:real?"queue_apply_run":"queue_apply_dry",track,limit,confirm:real})});
+    body:JSON.stringify({action:real?"queue_apply_run":"queue_apply_dry",track,limit,confirm:real,source:($("#csource")?$("#csource").value:"")})});
   if(!r.ok){alert("Не запущено: "+r.message);return;}logFollow=true;logCache={};show("log");refreshJob();
 }
 
@@ -2568,6 +2913,16 @@ async function deleteTrack(key){const t=TRACKS.find(x=>x.key===key);if(!t)return
     await loadTracks(false);msg.textContent=`Трек «${t.label}» удалён из поиска.`;
   }catch(e){msg.textContent="Ошибка: "+e.message;}}
 /* ---- настройки ---- */
+async function loadAccounts(){const a=await api("/api/accounts");const rows=[];
+  for(const p of ["telegram","hh_oauth"]){const x=a[p]||{};
+    rows.push(`<div class="card"><b>${esc(p)}</b> · ${esc(x.account||"")} · <b>${esc(x.status||"")}</b>
+      <div class="muted">apply: ${esc(x.apply_status||"")} · session: ${x.session_present?"yes":"no"} · token: ${x.token_present?"yes":"no"}</div>
+      <div class="muted">${esc(x.detail||"")}</div></div>`);}
+  const checks=(a.last_checks||[]).map(c=>`<div class="muted">${esc(c.provider)}/${esc(c.account)}: ${esc(c.status)} · ${esc(c.checked_at||"")}</div>`).join("");
+  $("#acctable").innerHTML=(rows.join("")||'<span class="muted">нет данных</span>')+(checks?`<div class="card"><h3>Последние проверки</h3>${checks}</div>`:"");}
+async function checkAccount(action){$("#acctmsg").textContent="запуск…";
+  const r=await api("/api/job",{method:"POST",body:JSON.stringify({action})});
+  $("#acctmsg").textContent=r.ok?("запущено: "+r.message):("ошибка: "+r.message);setTimeout(loadAccounts,1500);}
 async function loadSettings(){const s=await api("/api/settings");fillTrackSelects(s.tracks);
   const sel=$("#smodel");sel.innerHTML="";(s.models||[]).forEach(m=>{const o=document.createElement("option");o.value=m;o.textContent=m;if(m===s.model)o.selected=true;sel.appendChild(o);});
   $("#sbase").value=s.base_url||"";
