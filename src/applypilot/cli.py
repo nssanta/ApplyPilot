@@ -214,6 +214,16 @@ def build_parser() -> argparse.ArgumentParser:
     sources_form_audit.add_argument("--limit", type=int, default=100)
     sources_form_audit.add_argument("--delay-seconds", type=float, default=0.75)
     sources_form_audit.add_argument("--json", action="store_true")
+    sources_geekjob_pilot = sources_sub.add_parser(
+        "geekjob-pilot", help="один GeekJob native-form отклик; dry-run по умолчанию",
+    )
+    sources_geekjob_pilot.add_argument("--track", required=True)
+    sources_geekjob_pilot.add_argument("--id", required=True)
+    sources_geekjob_pilot.add_argument("--letter-file", default=None)
+    sources_geekjob_pilot.add_argument("--allow-live", action="store_true")
+    sources_geekjob_pilot.add_argument("--confirm-id", default="")
+    sources_geekjob_pilot.add_argument("--visible", action="store_true")
+    sources_geekjob_pilot.add_argument("--json", action="store_true")
     sources_scan = sources_sub.add_parser("scan", help="сканировать все или выбранные источники")
     sources_scan.add_argument("--track", required=True)
     sources_scan.add_argument("--source", action="append", help="повторить для выбора нескольких")
@@ -1173,13 +1183,119 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"{args.source}/{account}: {result.get('status')} — {result.get('detail','')}")
             return 0 if result.get("status") in {"confirmed", "valid-format", "saved"} else 1
+        if args.sources_action == "geekjob-pilot":
+            from .geekjob_apply import apply_geekjob_page
+            from .geekjob_apply import vacancy_id as geekjob_vacancy_id
+            from .multisource import resolve_source_account
+            from .provider_sessions import ProviderSessionManager, _exclusive_profile_lock
+
+            selected_config, _ = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            source = "geekjob.ru"
+            profile = _profile(
+                selected_config, effective_search(selected_config.load_search()),
+            )
+            account = resolve_source_account(selected_config, profile, source)
+            store = Store(selected_config.db_path)
+            rows = [x for x in store.list_campaign_vacancies(
+                account, args.track, "all", 5000, source=source,
+            ) if str(x.get("id")) == str(args.id)]
+            if len(rows) != 1 or geekjob_vacancy_id(str(rows[0].get("url") or "")) != str(args.id):
+                print("geekjob-pilot: exact canonical job not found", file=sys.stderr)
+                return 2
+            row = rows[0]
+            def output(obj: dict[str, Any]) -> None:
+                if args.json:
+                    print(json.dumps(obj, ensure_ascii=False, indent=2))
+                else:
+                    print(f"GeekJob {args.id}: {obj['status']} {obj.get('note','')}")
+
+            if not args.allow_live:
+                output({"mode": "dry_run", "submitted": False, "id": args.id,
+                        "status": "requires_explicit_live_optin",
+                        "name": row["name"], "review_state": row["review_state"],
+                        "application_state": row["application_state"]})
+                return 0
+            if str(args.id) != args.confirm_id:
+                print("geekjob-pilot: --confirm-id must exactly match --id", file=sys.stderr)
+                return 2
+            if (row.get("review_state") != "APPROVED"
+                    or row.get("application_state") != "READY_TO_APPLY"
+                    or row.get("score_decision") != "pass"
+                    or row.get("filter_status") == "reject"):
+                print("geekjob-pilot: vacancy is not approved / ready / eligible", file=sys.stderr)
+                return 2
+            letter_root = (selected_config.data_dir / "providers" / "geekjob" / account)
+            expected = letter_root / "letters" / f"{args.id}.txt"
+            letter_path = Path(args.letter_file or "").resolve() if args.letter_file else expected
+            if (letter_path != expected.resolve() or letter_path.is_symlink()
+                    or not letter_path.is_file()):
+                print("geekjob-pilot: exact private per-vacancy letter missing", file=sys.stderr)
+                return 2
+            letter = letter_path.read_text(encoding="utf-8")
+            if not 50 <= len(letter.strip()) <= 2500:
+                print("geekjob-pilot: cover letter length must be 50..2500", file=sys.stderr)
+                return 2
+            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+            session_check = manager.check(source, account)
+            if session_check.get("status") != "confirmed":
+                print("geekjob-pilot: account login not confirmed", file=sys.stderr)
+                return 2
+            run_id = f"geekjob-pilot-{uuid.uuid4().hex[:12]}"
+            channel = str(row.get("channel_key") or f"{source}:{args.id}")
+            reserved, reason = store.reserve_source_application(
+                account, source, str(args.id), args.track, channel, run_id,
+            )
+            if not reserved:
+                output({"status": "channel_conflict", "id": args.id, "note": reason})
+                return 2
+            if not store.record_source_application(
+                account, source, str(args.id), args.track, channel, "submitting",
+                note="One explicitly authorized GeekJob test", run_id=run_id,
+            ):
+                output({"status": "ledger_rejected", "id": args.id})
+                return 2
+            from playwright.sync_api import sync_playwright
+
+            browser_dir = manager.profile_dir(source, account)
+            try:
+                with _exclusive_profile_lock(browser_dir.parent), sync_playwright() as pw:
+                    context = manager._context_factory(pw, browser_dir, not args.visible)
+                    try:
+                        page = context.new_page()
+                        try:
+                            outcome = apply_geekjob_page(page, row, letter)
+                        finally:
+                            page.close()
+                    finally:
+                        context.close()
+            except Exception as exc:  # noqa: BLE001 - after reservation outcome is uncertain
+                from .dispatch import ApplyOutcome
+                outcome = ApplyOutcome("unknown", f"pilot runtime exception: {type(exc).__name__}")
+            status = outcome.status if outcome.status in {
+                "success", "unknown", "needs_manual", "already_applied", "failed_before_submit"
+            } else "unknown"
+            note = outcome.note
+            if outcome.receipt:
+                note += f" | receipt={dict(outcome.receipt)}"
+            recorded = store.record_source_application(
+                account, source, str(args.id), args.track, channel, status,
+                note=note[:500], run_id=run_id, mode="run",
+            )
+            output({"id": args.id, "mode": "single_live_pilot", "status": status,
+                    "recorded": bool(recorded), "note": outcome.note,
+                    "receipt": dict(outcome.receipt) if status == "success" else {}})
+            return 0 if recorded and status in {"success", "already_applied"} else 2
         if args.sources_action == "form-audit":
-            if args.source != "career.habr.com":
+            if args.source not in {"career.habr.com", "geekjob.ru"}:
                 print("form-audit: this source has no verified read-only form inspector", file=sys.stderr)
                 return 2
             if not 1 <= args.limit <= 100 or not 0 <= args.delay_seconds <= 20:
                 print("form-audit: limit must be 1..100 and delay 0..20 seconds", file=sys.stderr)
                 return 2
+            from .geekjob_apply import inspect_geekjob_page
             from .habr_apply import inspect_habr_page
             from .multisource import resolve_source_account
             from .provider_sessions import ProviderSessionManager, _exclusive_profile_lock
@@ -1198,7 +1314,7 @@ def main(argv: list[str] | None = None) -> int:
             auth = manager.check(args.source, account)
             if auth.get("status") != "confirmed":
                 print(
-                    "form-audit: Habr session is not confirmed; run sources login/check",
+                    f"form-audit: {args.source} session is not confirmed; run sources login/check",
                     file=sys.stderr,
                 )
                 return 2
@@ -1227,7 +1343,11 @@ def main(argv: list[str] | None = None) -> int:
                             time.sleep(args.delay_seconds)
                         page = context.new_page()
                         try:
-                            results.append(inspect_habr_page(page, row))
+                            audit = (
+                                inspect_habr_page if args.source == "career.habr.com"
+                                else inspect_geekjob_page
+                            )
+                            results.append(audit(page, row))
                         finally:
                             page.close()
                 finally:
@@ -1244,7 +1364,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
             else:
-                print(f"Habr read-only form audit: {len(results)} vacancies; {counts}")
+                print(f"{args.source} read-only form audit: {len(results)} vacancies; {counts}")
                 for item in results:
                     print(f"  {item['id']} score={item['score']} status={item['status']}")
             return 0

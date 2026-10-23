@@ -25,10 +25,14 @@ def test_registry_exposes_guarded_habr_and_getmatch_verified_channels() -> None:
     assert specs["getmatch.ru"]["submit_verified"] is True
     assert specs["getmatch.ru"]["apply_status"] == "verified_telegram_callback"
     assert specs["getmatch.ru"]["selectors"] == []
-    for source in ("geekjob.ru", "yandex.ru/jobs"):
-        assert specs[source]["submit_verified"] is False
-        assert specs[source]["apply_status"] == "needs_live_validation"
-        assert specs[source]["selectors"] == []
+    assert specs["geekjob.ru"]["submit_verified"] is False
+    assert specs["geekjob.ru"]["apply_status"] == "needs_live_validation"
+    assert specs["geekjob.ru"]["selectors"] == [
+        'form #mycvlist', 'form #respond-text', 'form button[type="submit"]',
+    ]
+    assert specs["yandex.ru/jobs"]["submit_verified"] is False
+    assert specs["yandex.ru/jobs"]["apply_status"] == "needs_live_validation"
+    assert specs["yandex.ru/jobs"]["selectors"] == []
 
 
 def test_preflight_requires_local_profile(tmp_path: Path) -> None:

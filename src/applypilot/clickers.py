@@ -55,8 +55,12 @@ CLICKERS: dict[str, ClickerSpec] = {
     ),
     "geekjob.ru": ClickerSpec(
         source="geekjob.ru", label="GeekJob",
-        login_url="https://geekjob.ru/login",
-        notes="Authorized form DOM not captured yet; no selector or submit is claimed.",
+        login_url="https://geekjob.ru/signin/geek",
+        selectors=('form #mycvlist', 'form #respond-text', 'form button[type="submit"]'),
+        notes=("Authorized native GeekJob response form inspected live: one stored CV, "
+               "mandatory vacancy-specific cover letter and submit button. "
+               "Form inspector and mock-browser click/receipt tests passed; real "
+               "submit/receipt unverified, no bulk sends enabled."),
     ),
     "yandex.ru/jobs": ClickerSpec(
         source="yandex.ru/jobs", label="Yandex Jobs",

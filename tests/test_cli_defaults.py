@@ -29,3 +29,19 @@ def test_habr_form_audit_and_live_pacing_arguments() -> None:
     ])
     assert live.allow_live and live.enable_habr
     assert live.habr_min_interval == 3
+
+
+def test_geekjob_audit_and_single_pilot_default_safe() -> None:
+    audit = build_parser().parse_args([
+        'sources', 'form-audit', '--track', 'ai_core',
+        '--source', 'geekjob.ru', '--view', 'review', '--limit', '40', '--json',
+    ])
+    assert audit.source == 'geekjob.ru'
+    assert audit.limit == 40
+    pilot = build_parser().parse_args([
+        'sources', 'geekjob-pilot', '--track', 'ai_core',
+        '--id', '6ab0dcc140fca7e4f5078639', '--json',
+    ])
+    assert pilot.allow_live is False
+    assert pilot.confirm_id == ''
+    assert pilot.letter_file is None
