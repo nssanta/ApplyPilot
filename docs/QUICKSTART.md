@@ -142,9 +142,11 @@ Telegram-импорт и статус кликеров. Live-отправка и
 
 ## 9. Кликеры и живая проверка
 
-`applypilot` не придумывает селекторы. Для Habr, GeekJob, Яндекса и Getmatch есть контракты `preflight`/`inspect`.
-На Хабре подтверждён нативный one-click и отдельный HabrPageDriver; остальные
-площадки пока имеют `apply_status=needs_live_validation`.
+`applypilot` не придумывает селекторы. Для Habr подтверждён
+нативный one-click (`HabrPageDriver`), для Getmatch подтверждён
+callback официального Telegram-бота (`GetmatchCallbackDriver`).
+Оба доступны лишь через отдельные live-флаги и предварительные одобрения.
+GeekJob и Яндекс пока имеют `apply_status=needs_live_validation`.
 
 ```bash
 applypilot accounts --help
@@ -174,9 +176,24 @@ Habr driver поддерживает подтверждённую one-click фо
 останавливается без повторных кликов. Дополнительные обязательные вопросы,
 другие формы и внешние ATS требуют ручной проверки. Сам аудит форм
 не одобряет вакансии и не отправляет их.
-Для GeekJob, Яндекса и Getmatch пока нет подтверждённого live-драйвера;
-диспетчер пропускает их, не отправляя отклик. Для них сначала нужна
-проверка реального авторизованного интерфейса.
+Getmatch можно запускать отдельно после подключения Telegram и
+проверки принятого профиля (`accounts telegram-status --online`):
+
+```bash
+# Безопасное планирование (ничего не отправляет):
+applypilot sources dispatch-plan --track ai_core --source getmatch.ru --json
+
+# Только при готовых, подходящих, явно одобренных Getmatch-кандидатах:
+APPLYPILOT_TELEGRAM_LIVE=1 applypilot sources dispatch-apply \
+  --track ai_core --source getmatch.ru --limit 100 \
+  --allow-live --enable-getmatch --getmatch-min-interval 2
+```
+
+Один live callback+receipt подтверждён; большой пакет пока
+проверен только offline-тестами, а не десятками реальных отправок. При
+`UNKNOWN` драйвер останавливает новые Getmatch-кнопки и не повторяет
+старую. HR-чаты и дополнительные вопросы требуют отдельной проверки.
+Для GeekJob и Яндекса пока нет проверенного live-драйвера, они пропускаются.
 
 ## 10. Безопасность
 

@@ -82,12 +82,27 @@ APPLYPILOT_TELEGRAM_LIVE=1 applypilot accounts telegram-pilot \
   --track ai_core --id VACANCY_ID --allow-live --confirm-id VACANCY_ID
 ```
 
-**Это реальная отправка и не dry-run.** До проверки первого живого пилота
-не запускать массовую отправку через Getmatch. При отсутствии подтверждения
-от официального бота с точным ID вакансия попадает в `UNKNOWN`; повтор
-запрещён. Кнопки выбора страны и отклики на `SKIP` не допускаются.
-`telegram-reconcile` использует только входящие подтверждения, а не
-непроверенные сообщения или один факт нажатия callback.
+**Это реальная отправка и не dry-run.** После одной подтверждённой
+живой отправки через нативный callback реализован и пакетный Getmatch-драйвер:
+
+```bash
+# Только предварительно индивидуально APPROVED вакансии из ai_core:
+applypilot sources dispatch-plan --track ai_core --source getmatch.ru --json
+
+# Реально нажимает сохранённые позитивные callback-кнопки @g_jobbot.
+# Отдельное opt-in, по умолчанию всё выключено.
+APPLYPILOT_TELEGRAM_LIVE=1 applypilot sources dispatch-apply \
+  --track ai_core --source getmatch.ru --limit 100 \
+  --allow-live --enable-getmatch --getmatch-min-interval 2 --json
+```
+
+Пакетный драйвер проверен регрессионными тестами, включая дубли и остановку
+после `UNKNOWN`; многочисленные **реальные** подряд отправки пока
+не валидированы. Успех засчитывается только по новому входящему подтверждению
+бота с точным ID вакансии; при его отсутствии статус `UNKNOWN`, без повтора.
+Кнопки выбора страны и отклики на `SKIP` не допускаются. Сведения о
+гражданстве или иных фактах соискателя не заполняются без подтверждённых данных.
+`telegram-reconcile` использует только входящие подтверждения, не клики.
 
 ## Telegram MTProto для @g_jobbot
 
