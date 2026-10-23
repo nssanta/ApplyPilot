@@ -155,17 +155,25 @@ applypilot accounts --help
 
 ```bash
 applypilot sources check --source career.habr.com
+# Проверить в одной команде до 100 реальных форм по review/TOP, без POST:
+applypilot sources form-audit --track ai_core --source career.habr.com \
+  --view review --limit 100 --json
 applypilot sources dispatch-plan --track ai_core --source career.habr.com --json
 
 # РЕАЛЬНАЯ ОТПРАВКА: только ранее APPROVED и READY_TO_APPLY,
 # с действующей сессией и независимым подтверждением в /responses.
 # Запускать осознанно, не использовать для тестирования без разрешения.
 applypilot sources dispatch-apply --track ai_core --source career.habr.com \
-  --limit 1 --allow-live --enable-habr --visible
+  --limit 100 --allow-live --enable-habr --visible --habr-min-interval 2
 ```
 
-Habr driver поддерживает подтверждённую one-click форму; дополнительные
-обязательные вопросы, другие формы и внешние ATS требуют ручной проверки.
+Habr driver поддерживает подтверждённую one-click форму; перед работой
+проверяет удалёнку и наличие отклика в истории, пишет успех только по
+подтверждению POST + уведомлению + точной записи в /responses. Между
+отправками регулируемый интервал; при UNKNOWN оставшаяся Habr-пачка
+останавливается без повторных кликов. Дополнительные обязательные вопросы,
+другие формы и внешние ATS требуют ручной проверки. Сам аудит форм
+не одобряет вакансии и не отправляет их.
 Для GeekJob, Яндекса и Getmatch пока нет подтверждённого live-драйвера;
 диспетчер пропускает их, не отправляя отклик. Для них сначала нужна
 проверка реального авторизованного интерфейса.

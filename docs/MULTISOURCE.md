@@ -50,6 +50,10 @@ cp examples/sources.toml private/config/sources.toml
 .venv/bin/python -m applypilot sources login --source career.habr.com
 .venv/bin/python -m applypilot sources check --source career.habr.com
 
+# Read-only аудит форм Habr, в том числе обязательных полей и внешних ATS:
+.venv/bin/python -m applypilot sources form-audit --track default \
+  --source career.habr.com --view review --limit 100 --json
+
 # Отдельный проверенный Habr native-one-click, без отправки при обычном dry-run:
 .venv/bin/python -m applypilot sources dispatch-plan \
   --track default --source career.habr.com --json

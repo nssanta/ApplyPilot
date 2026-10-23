@@ -12,6 +12,7 @@ a Telegram session, accesses a password or bypasses a challenge.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +49,79 @@ def _remote_allowed(text: str) -> bool:
         "удалённый формат", "удаленный формат",
         "работа удаленно", "работа удалённо",
     ))
+
+
+def inspect_habr_page(
+    page: Any, row: Mapping[str, Any], *, timeout_ms: int = 25_000,
+) -> dict[str, Any]:
+    """Read-only classification of a real Habr vacancy's applicant form.
+
+    The caller must enforce GET/HEAD/OPTIONS-only routing. Inspecting never
+    invokes a button, sends an application or grants review approval.
+    """
+    vacancy_id = str(row.get("id") or "")
+    url = str(row.get("url") or "")
+    result: dict[str, Any] = {
+        "id": vacancy_id, "source": HABR_HOST,
+        "score": row.get("score", 0), "review_state": row.get("review_state", ""),
+        "status": "unverified", "native_submit": False,
+        "visible_fields": 0, "remote_verified": False, "submitted": False,
+    }
+    if not vacancy_id or _vacancy_id(url) != vacancy_id:
+        return {**result, "status": "invalid_url"}
+    if row.get("application_state") in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}:
+        return {**result, "status": "already_applied_or_quarantined"}
+    try:
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        if response is None or response.status != 200:
+            return {**result, "status": "http_unavailable"}
+        if urlparse(str(page.url)).path != f"/vacancies/{vacancy_id}":
+            return {**result, "status": "redirect"}
+        body = page.locator("body").inner_text(timeout=7000)
+        if "отклик отправлен" in body.casefold():
+            return {**result, "status": "already_applied_on_site"}
+        # Similar vacancies can mention remote work even if the target role
+        # is office-only; trust only the current vacancy header's chips.
+        header = page.locator(".vacancy-header")
+        remote = (header.count() == 1
+                  and _remote_allowed(header.inner_text(timeout=4000)))
+        section = page.locator(".create-vacancy-response__apply")
+        native = False
+        if section.count() == 1:
+            buttons = section.locator("button[type='submit']").filter(
+                has_text=re.compile(r"Откликнуться", re.IGNORECASE)
+            )
+            native = (buttons.count() == 1 and buttons.first.is_visible()
+                      and buttons.first.is_enabled())
+        form = page.locator(".create-vacancy-response")
+        field_count = 0
+        if form.count():
+            fields = form.locator("textarea,select,input:not([type='hidden'])")
+            field_count = sum(
+                int(fields.nth(index).is_visible())
+                for index in range(min(fields.count(), 50))
+            )
+        external = page.locator(
+            f'a[href*="/vacancies/{vacancy_id}/external_response"]'
+        ).count() > 0
+        if external and not native:
+            status = "external_ats"
+        elif not native:
+            status = "no_native_form"
+        elif field_count:
+            status = "form_requires_answers"
+        elif not remote:
+            status = "remote_not_verified"
+        else:
+            status = "native_ready_for_approval"
+        return {
+            **result, "status": status, "native_submit": native,
+            "visible_fields": field_count, "remote_verified": remote,
+            "external_ats": external,
+        }
+    except Exception as exc:  # noqa: BLE001 - a bad provider page cannot block a batch
+        return {**result, "status": "inspection_failed",
+                "error_type": type(exc).__name__}
 
 
 def apply_habr_page(
@@ -107,11 +181,16 @@ def apply_habr_page(
         expected_title = str(row.get("name") or "").strip()
         if not expected_title or expected_title.casefold() not in visible_body.casefold():
             return ApplyOutcome("needs_manual", "vacancy title cannot be verified on live Habr page")
-        if require_remote and not _remote_allowed(visible_body):
-            return ApplyOutcome("needs_manual", "remote eligibility is not verified on Habr page")
+        header = page.locator(".vacancy-header")
+        remote_in_header = (header.count() == 1
+                            and _remote_allowed(header.inner_text(timeout=4000)))
+        if require_remote and not remote_in_header:
+            return ApplyOutcome("needs_manual", "remote eligibility is not verified in vacancy header")
 
         section = page.locator(".create-vacancy-response__apply")
-        submit = section.locator("button[type='submit']").filter(has_text=re.compile(r"^Откликнуться$"))
+        submit = section.locator("button[type='submit']").filter(has_text=re.compile(r"Откликнуться", re.IGNORECASE))
+        if "отклик отправлен" in visible_body.casefold():
+            return ApplyOutcome("already_applied", "Habr vacancy page already shows an application")
         if (section.count() != 1 or submit.count() != 1
                 or not submit.first.is_visible() or not submit.first.is_enabled()):
             return ApplyOutcome("needs_manual", "native Habr one-click form is unavailable")
@@ -132,7 +211,11 @@ def apply_habr_page(
 
         if not (200 in responses and confirmed_notice):
             if not writes and not responses:
-                return ApplyOutcome("needs_manual", "no native Habr submission request was observed")
+                # An actual button was clicked; network-event loss or delayed
+                # submission makes the outcome ambiguous. Never retry blindly.
+                return ApplyOutcome(
+                    "unknown", "Habr button was clicked but no submission receipt was observed",
+                )
             return ApplyOutcome(
                 "unknown", "Habr POST occurred but submission response or on-page notice is unverified",
             )
@@ -180,12 +263,23 @@ class HabrPageDriver:
         *,
         require_remote: bool = True,
         timeout_ms: int = 25_000,
+        min_interval_seconds: float = 2.0,
     ) -> None:
+        if not 0 <= min_interval_seconds <= 30:
+            raise ValueError("Habr live interval must be between 0 and 30 seconds")
         self.page_factory = page_factory
         self.require_remote = require_remote
         self.timeout_ms = timeout_ms
+        self.min_interval_seconds = float(min_interval_seconds)
+        self._last_apply_started: float | None = None
+        self._paused_after_unknown = False
 
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if self._paused_after_unknown:
+            return ApplyOutcome(
+                "needs_manual",
+                "Habr run paused after an ambiguous submission; reconcile the UNKNOWN first",
+            )
         if _vacancy_id(str(row.get("url") or "")) != str(row.get("id") or ""):
             return ApplyOutcome("needs_manual", "Habr vacancy URL is not allowed")
         if (row.get("source") not in (None, "", HABR_HOST)
@@ -197,11 +291,26 @@ class HabrPageDriver:
         return ApplyOutcome("ready")
 
     def apply(self, row: Mapping[str, Any]) -> ApplyOutcome:
-        page = self.page_factory()
+        if self._paused_after_unknown:
+            return ApplyOutcome("needs_manual", "Habr run is paused after UNKNOWN")
+        if self._last_apply_started is not None:
+            wait = self.min_interval_seconds - (time.monotonic() - self._last_apply_started)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_apply_started = time.monotonic()
+        page: Any | None = None
         try:
-            return apply_habr_page(
+            page = self.page_factory()
+            outcome = apply_habr_page(
                 page, row, require_remote=self.require_remote,
                 timeout_ms=self.timeout_ms,
             )
+            if outcome.status == "unknown":
+                self._paused_after_unknown = True
+            return outcome
+        except Exception:
+            self._paused_after_unknown = True
+            raise
         finally:
-            page.close()
+            if page is not None:
+                page.close()

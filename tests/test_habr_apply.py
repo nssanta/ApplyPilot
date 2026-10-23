@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from applypilot.habr_apply import HabrPageDriver, apply_habr_page
+from applypilot.habr_apply import HabrPageDriver, apply_habr_page, inspect_habr_page
 
 ROW = {
     "source": "career.habr.com",
@@ -29,7 +29,7 @@ class StubLocator:
             return int(self.page.applied and self.page.history_available)
         if self.kind == "response_section":
             return 0
-        if self.kind in {"submit_section", "submit"}:
+        if self.kind in {"submit_section", "submit", "vacancy_header"}:
             return 1
         return 0
 
@@ -52,6 +52,8 @@ class StubLocator:
         return True
 
     def inner_text(self, timeout: int = 0) -> str:
+        if self.kind == "vacancy_header":
+            return "Можно удалённо" if self.page.remote else "Только офис, Москва"
         if self.page.on_history:
             return "Ваши отклики\n" + (
                 "Компания QSOFT\nPython-разработчик AI-сервисов (LLM / RAG)"
@@ -111,6 +113,8 @@ class StubHabrPage:
             return StubLocator(self, "body")
         if selector.startswith("a[href="):
             return StubLocator(self, "history_link")
+        if selector == ".vacancy-header":
+            return StubLocator(self, "vacancy_header")
         if selector == ".create-vacancy-response__apply":
             return StubLocator(self, "submit_section")
         if selector == ".create-vacancy-response":
@@ -155,10 +159,10 @@ def test_habr_remote_requirement_is_enforced() -> None:
     assert page.click_count == 0
 
 
-def test_no_post_is_manual_and_never_fake_success() -> None:
+def test_no_post_after_click_is_unknown_and_never_fake_success() -> None:
     page = StubHabrPage(send_request=False)
     result = apply_habr_page(page, ROW)
-    assert result.status == "needs_manual"
+    assert result.status == "unknown"
     assert page.click_count == 1
 
 
@@ -242,3 +246,139 @@ def test_habr_verified_driver_routes_real_dispatch_and_prevents_duplicate(tmp_pa
     )
     assert second["planned_count"] == 0
     assert len(store.source_attempts("habr-primary", "career.habr.com")) == 1
+
+
+def test_readonly_habr_form_audit_classifies_native_remote_form() -> None:
+    page = StubHabrPage()
+    result = inspect_habr_page(page, ROW)
+    assert result["status"] == "native_ready_for_approval"
+    assert result["native_submit"] is True
+    assert result["remote_verified"] is True
+    assert result["visible_fields"] == 0
+    assert result["submitted"] is False
+    assert page.click_count == 0
+
+
+def test_readonly_habr_audit_never_calls_apply_on_nonremote_page() -> None:
+    page = StubHabrPage(remote=False)
+    result = inspect_habr_page(page, ROW)
+    assert result["status"] == "remote_not_verified"
+    assert not result["remote_verified"]
+    assert page.click_count == 0
+
+
+def test_readonly_habr_audit_rejects_noncanonical_host_without_loading() -> None:
+    page = StubHabrPage()
+    result = inspect_habr_page(page, {**ROW, "url": "https://evil.example/vacancies/1000169407"})
+    assert result["status"] == "invalid_url"
+    assert page.visited == []
+
+
+def test_habr_driver_stops_batch_after_unverified_click() -> None:
+    pages: list[StubHabrPage] = []
+
+    def factory() -> StubHabrPage:
+        page = StubHabrPage(send_request=False)
+        pages.append(page)
+        return page
+
+    driver = HabrPageDriver(factory, min_interval_seconds=0)
+    first = driver.apply(ROW)
+    assert first.status == "unknown"
+    assert driver.preflight(ROW).status == "needs_manual"
+    second = driver.apply(ROW)
+    assert second.status == "needs_manual"
+    assert len(pages) == 1
+    assert pages[0].click_count == 1
+
+
+def test_habr_driver_paces_two_confirmed_jobs(monkeypatch) -> None:
+    from applypilot import habr_apply
+
+    times = iter((100.0, 100.7, 100.7))
+    calls: list[float] = []
+    monkeypatch.setattr(habr_apply.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(habr_apply.time, "sleep", calls.append)
+    driver = HabrPageDriver(StubHabrPage, min_interval_seconds=2)
+    assert driver.apply(ROW).status == "success"
+    assert driver.apply(ROW).status == "success"
+    assert len(calls) == 1
+    assert round(calls[0], 2) == 1.3
+
+
+def test_habr_multi_job_dispatch_pauses_after_unknown(tmp_path, monkeypatch) -> None:
+    from applypilot.dispatch import ApplyOutcome, dispatch_apply
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "jobs.sqlite3")
+    ids = ("1000169408", "1000169409", "1000169410")
+    stamp = "2026-10-22T00:00:00+00:00"
+    with store.connect() as conn:
+        for vacancy_id in ids:
+            conn.execute(
+                """INSERT INTO vacancies
+                (account,source,vacancy_id,title,company,url,application_state,
+                 created_at,first_seen_at,last_seen_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                ("habr-primary", "career.habr.com", vacancy_id,
+                 ROW["name"], "Example", f"https://career.habr.com/vacancies/{vacancy_id}",
+                 "READY_TO_APPLY", stamp, stamp, stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO vacancy_track_scores
+                (account,source,vacancy_id,track,score,score_decision,filter_status,
+                 review_state,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                ("habr-primary", "career.habr.com", vacancy_id, "ai_core",
+                 75, "pass", "pass", "APPROVED", stamp),
+            )
+
+    def simulated_apply(page, row, **kwargs):
+        if row["id"] == ids[0]:
+            return ApplyOutcome("success", "confirmed", receipt={"id": "receipt-1"})
+        return ApplyOutcome("unknown", "after click, confirmation missing")
+
+    monkeypatch.setattr("applypilot.habr_apply.apply_habr_page", simulated_apply)
+    pages: list[StubHabrPage] = []
+
+    def factory():
+        page = StubHabrPage()
+        pages.append(page)
+        return page
+
+    driver = HabrPageDriver(factory, min_interval_seconds=0)
+    result = dispatch_apply(
+        store, "default", "ai_core", ["career.habr.com"], 100,
+        allow_live=True, drivers={"career.habr.com": driver},
+        accounts={"career.habr.com": "habr-primary"}, run_id="multi-batch",
+    )
+    assert result["summary"] == {
+        "success": 1, "unknown": 1, "needs_manual": 1,
+    }
+    assert len(pages) == 2
+    assert all(page.closed for page in pages)
+    attempts = {item["vacancy_id"]: item["status"] for item in store.source_attempts(
+        "habr-primary", "career.habr.com",
+    )}
+    assert attempts == {ids[0]: "success", ids[1]: "unknown"}
+    assert ids[2] not in attempts
+
+
+def test_remote_signal_must_be_in_target_header_not_recommended_jobs() -> None:
+    page = StubHabrPage(remote=False)
+    # The overall page includes a similar job that allows remote work,
+    # but the target vacancy's own header is office-only.
+    original_locator = page.locator
+
+    def locator(selector: str):
+        item = original_locator(selector)
+        if selector == "body":
+            inner = item.inner_text
+            item.inner_text = lambda timeout=0: inner(timeout) + "Похожие вакансии: Можно удалённо"
+        return item
+
+    page.locator = locator
+    result = inspect_habr_page(page, ROW)
+    assert result["status"] == "remote_not_verified"
+    outcome = apply_habr_page(page, ROW)
+    assert outcome.status == "needs_manual"
+    assert page.click_count == 0

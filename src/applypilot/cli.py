@@ -203,6 +203,17 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--no-interactive", action="store_true",
                             help="не читать stdin; только окно браузера и проверка маркера")
         action.add_argument("--json", action="store_true")
+    sources_form_audit = sources_sub.add_parser(
+        "form-audit", help="проверить реальные формы вакансий без нажатий и отправок",
+    )
+    sources_form_audit.add_argument("--track", required=True)
+    sources_form_audit.add_argument("--source", required=True)
+    sources_form_audit.add_argument(
+        "--view", choices=("top", "review", "approved", "all"), default="review",
+    )
+    sources_form_audit.add_argument("--limit", type=int, default=100)
+    sources_form_audit.add_argument("--delay-seconds", type=float, default=0.75)
+    sources_form_audit.add_argument("--json", action="store_true")
     sources_scan = sources_sub.add_parser("scan", help="сканировать все или выбранные источники")
     sources_scan.add_argument("--track", required=True)
     sources_scan.add_argument("--source", action="append", help="повторить для выбора нескольких")
@@ -252,6 +263,10 @@ def build_parser() -> argparse.ArgumentParser:
     sources_dispatch_apply.add_argument(
         "--visible", action="store_true",
         help="Habr: использовать видимое окно Chrome для ручной проверки и CAPTCHA",
+    )
+    sources_dispatch_apply.add_argument(
+        "--habr-min-interval", type=float, default=2.0,
+        help="Habr: минимальные секунды между отправками в одной сессии (0..30)",
     )
     sources_dispatch_apply.add_argument("--json", action="store_true")
 
@@ -1024,6 +1039,81 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"{args.source}/{account}: {result.get('status')} — {result.get('detail','')}")
             return 0 if result.get("status") in {"confirmed", "valid-format", "saved"} else 1
+        if args.sources_action == "form-audit":
+            if args.source != "career.habr.com":
+                print("form-audit: this source has no verified read-only form inspector", file=sys.stderr)
+                return 2
+            if not 1 <= args.limit <= 100 or not 0 <= args.delay_seconds <= 20:
+                print("form-audit: limit must be 1..100 and delay 0..20 seconds", file=sys.stderr)
+                return 2
+            from .habr_apply import inspect_habr_page
+            from .multisource import resolve_source_account
+            from .provider_sessions import ProviderSessionManager, _exclusive_profile_lock
+
+            selected_config, _ = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            profile = _profile(
+                selected_config, effective_search(selected_config.load_search()),
+            )
+            account = resolve_source_account(
+                selected_config, profile, args.source,
+            )
+            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+            auth = manager.check(args.source, account)
+            if auth.get("status") != "confirmed":
+                print(
+                    "form-audit: Habr session is not confirmed; run sources login/check",
+                    file=sys.stderr,
+                )
+                return 2
+            rows = Store(selected_config.db_path).list_campaign_vacancies(
+                account, args.track, args.view, args.limit, source=args.source,
+            )
+            from playwright.sync_api import sync_playwright
+
+            results: list[dict[str, Any]] = []
+            profile_dir = manager.profile_dir(args.source, account)
+            with _exclusive_profile_lock(profile_dir.parent), sync_playwright() as playwright:
+                context = manager._context_factory(playwright, profile_dir, True)
+                try:
+                    # Page views only: even unexpected provider scripts must
+                    # not mutate a profile or submit a candidate application.
+                    context.route(
+                        "**/*",
+                        lambda route: (
+                            route.continue_()
+                            if route.request.method.upper() in {"GET", "HEAD", "OPTIONS"}
+                            else route.abort()
+                        ),
+                    )
+                    for index, row in enumerate(rows):
+                        if index and args.delay_seconds:
+                            time.sleep(args.delay_seconds)
+                        page = context.new_page()
+                        try:
+                            results.append(inspect_habr_page(page, row))
+                        finally:
+                            page.close()
+                finally:
+                    context.close()
+            counts: dict[str, int] = {}
+            for item in results:
+                state = str(item["status"])
+                counts[state] = counts.get(state, 0) + 1
+            summary = {
+                "mode": "read_only", "source": args.source, "track": args.track,
+                "account": account, "view": args.view, "inspected": len(results),
+                "counts": counts, "results": results, "submitted": False,
+            }
+            if args.json:
+                print(json.dumps(summary, ensure_ascii=False, indent=2))
+            else:
+                print(f"Habr read-only form audit: {len(results)} vacancies; {counts}")
+                for item in results:
+                    print(f"  {item['id']} score={item['score']} status={item['status']}")
+            return 0
         if args.sources_action == "scan":
             selected_config, _track_info = _track_config(
                 config, args.track, profile_override=bool(args.profile),
@@ -1110,6 +1200,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.enable_habr and not args.allow_live:
                     print("dispatch: --enable-habr requires --allow-live", file=sys.stderr)
                     return 2
+                if not 0 <= args.habr_min_interval <= 30:
+                    print("dispatch: --habr-min-interval must be 0..30", file=sys.stderr)
+                    return 2
                 drivers: dict[str, Any] = {}
                 with ExitStack() as cleanup:
                     if args.allow_live and args.enable_habr and "career.habr.com" in selected:
@@ -1130,7 +1223,9 @@ def main(argv: list[str] | None = None) -> int:
                             playwright = cleanup.enter_context(sync_playwright())
                             context = manager._context_factory(playwright, profile_dir, not args.visible)
                             cleanup.callback(context.close)
-                            drivers["career.habr.com"] = HabrPageDriver(context.new_page)
+                            drivers["career.habr.com"] = HabrPageDriver(
+                                context.new_page, min_interval_seconds=args.habr_min_interval,
+                            )
                         else:
                             print(
                                 f"Habr driver unavailable: login={auth.get('status', 'unknown')}; "

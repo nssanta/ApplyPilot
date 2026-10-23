@@ -47,12 +47,16 @@ cp examples/sources.toml private/config/sources.toml
 # Вход/проверка сессии источника (выполняется вручную, не фоновой задачей).
 .venv/bin/python -m applypilot sources login --source career.habr.com
 .venv/bin/python -m applypilot sources check --source career.habr.com
+.venv/bin/python -m applypilot sources form-audit --track default \
+  --source career.habr.com --view review --limit 100 --json
 ```
 
-Не-HH формы откликов пока имеют `needs_live_validation`: поиск и рейтинг работают,
-реальная отправка отключена до отдельной проверки авторизованных форм. DreamJob —
-read-only зеркало HH и не создаёт второй канал отклика. `dispatch-apply` по
-умолчанию dry-run; live требует `--allow-live` и проверенного драйвера источника.
+У Habr Career есть проверенный native-one-click с отдельным CLI-флагом:
+`dispatch-apply --allow-live --enable-habr`, контролируемым интервалом и
+проверкой ответа в истории. `form-audit` только читает страницы и помогает
+агенту оценить пакет форм без откликов. GeekJob, Getmatch, Яндекс пока имеют
+`needs_live_validation`. DreamJob — зеркало HH без второго отклика.
+По умолчанию `dispatch-apply` всегда dry-run.
 
 Сохранённые сообщения `@g_jobbot` связываются с очередью без повторного логина:
 
