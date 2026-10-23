@@ -1289,7 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
                     "receipt": dict(outcome.receipt) if status == "success" else {}})
             return 0 if recorded and status in {"success", "already_applied"} else 2
         if args.sources_action == "form-audit":
-            if args.source not in {"career.habr.com", "geekjob.ru"}:
+            if args.source not in {"career.habr.com", "geekjob.ru", "yandex.ru/jobs"}:
                 print("form-audit: this source has no verified read-only form inspector", file=sys.stderr)
                 return 2
             if not 1 <= args.limit <= 100 or not 0 <= args.delay_seconds <= 20:
@@ -1299,6 +1299,7 @@ def main(argv: list[str] | None = None) -> int:
             from .habr_apply import inspect_habr_page
             from .multisource import resolve_source_account
             from .provider_sessions import ProviderSessionManager, _exclusive_profile_lock
+            from .yandex_apply import inspect_yandex_page, is_survey_read_request
 
             selected_config, _ = _track_config(
                 config, args.track, profile_override=bool(args.profile),
@@ -1328,13 +1329,16 @@ def main(argv: list[str] | None = None) -> int:
             with _exclusive_profile_lock(profile_dir.parent), sync_playwright() as playwright:
                 context = manager._context_factory(playwright, profile_dir, True)
                 try:
-                    # Page views only: even unexpected provider scripts must
-                    # not mutate a profile or submit a candidate application.
+                    # Yandex Forms loads a questionnaire using POST getSurvey;
+                    # this is an explicitly read-only endpoint. Every other
+                    # mutating request, including any submit, stays denied.
                     context.route(
                         "**/*",
                         lambda route: (
                             route.continue_()
-                            if route.request.method.upper() in {"GET", "HEAD", "OPTIONS"}
+                            if (route.request.method.upper() in {"GET", "HEAD", "OPTIONS"}
+                                or (args.source == "yandex.ru/jobs"
+                                    and is_survey_read_request(route.request)))
                             else route.abort()
                         ),
                     )
@@ -1343,10 +1347,11 @@ def main(argv: list[str] | None = None) -> int:
                             time.sleep(args.delay_seconds)
                         page = context.new_page()
                         try:
-                            audit = (
-                                inspect_habr_page if args.source == "career.habr.com"
-                                else inspect_geekjob_page
-                            )
+                            audit = {
+                                "career.habr.com": inspect_habr_page,
+                                "geekjob.ru": inspect_geekjob_page,
+                                "yandex.ru/jobs": inspect_yandex_page,
+                            }[args.source]
                             results.append(audit(page, row))
                         finally:
                             page.close()

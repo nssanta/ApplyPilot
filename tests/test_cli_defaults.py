@@ -45,3 +45,14 @@ def test_geekjob_audit_and_single_pilot_default_safe() -> None:
     assert pilot.allow_live is False
     assert pilot.confirm_id == ''
     assert pilot.letter_file is None
+
+
+def test_yandex_read_only_form_audit_arguments() -> None:
+    args = build_parser().parse_args([
+        "sources", "form-audit", "--track", "ai_core",
+        "--source", "yandex.ru/jobs", "--view", "review", "--limit", "10",
+        "--json",
+    ])
+    assert args.source == "yandex.ru/jobs"
+    assert args.limit == 10
+    assert args.json is True
