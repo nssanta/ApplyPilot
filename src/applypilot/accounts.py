@@ -51,6 +51,8 @@ def telegram_queue_plan(
     account: str = DEFAULT_TELEGRAM_ACCOUNT,
     track: str = "ai_core",
     limit: int = 50,
+    *,
+    ledger_account: str | None = None,
 ) -> dict[str, Any]:
     """Plan only relevant Getmatch callback candidates; never send anything.
 
@@ -59,12 +61,19 @@ def telegram_queue_plan(
     have a positive "Откликнуться" label; country-choice buttons are never apply.
     """
     messages = store.telegram_messages(account, limit)
+    queue_account = ledger_account or account
     planned: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     unmatched: list[dict[str, Any]] = []
     seen_vacancies: set[tuple[str, str]] = set()
     for message in messages:
         if not message.get("application_likely"):
+            continue
+        if message.get("outgoing") is not False:
+            unmatched.append({
+                "message_id": message.get("message_id"),
+                "reason": "unverified_incoming_message",
+            })
             continue
         if str(message.get("chat") or "").strip().casefold().lstrip("@") != "g_jobbot":
             unmatched.append({
@@ -109,7 +118,7 @@ def telegram_queue_plan(
             if key in seen_vacancies:
                 continue
             seen_vacancies.add(key)
-            vacancy = store.vacancy_track_row(account, source, vacancy_id, track)
+            vacancy = store.vacancy_track_row(queue_account, source, vacancy_id, track)
             if vacancy is None or vacancy.get("score_decision") is None:
                 unmatched.append({
                     "message_id": message.get("message_id"),
@@ -161,6 +170,7 @@ def telegram_queue_plan(
     planned.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("sent_at") or "")))
     return {
         "account": account,
+        "ledger_account": queue_account,
         "track": track,
         "messages": len(messages),
         "planned_count": len(planned),

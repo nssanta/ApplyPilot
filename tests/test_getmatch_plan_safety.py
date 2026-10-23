@@ -35,6 +35,7 @@ def _message(message_id: int, vacancy_id: str, buttons: list[tuple[str, str]]) -
     return {
         "message_id": message_id,
         "chat": "@g_jobbot",
+        "outgoing": False,
         "sent_at": f"2026-10-23T10:{message_id % 60:02}:00+00:00",
         "text": f"AI Engineer https://getmatch.ru/vacancies/{vacancy_id}",
         "buttons": [{"text": name, "kind": kind} for name, kind in buttons],
@@ -99,3 +100,17 @@ def test_getmatch_plan_never_accepts_callbacks_from_another_chat(tmp_path: Path)
     plan = telegram_queue_plan(store, "getmatch-primary", "ai_core", 10)
     assert plan["planned_count"] == 0
     assert plan["unmatched"][0]["reason"] == "unexpected_telegram_chat"
+
+
+def test_getmatch_plan_never_lists_outgoing_or_unknown_origin(tmp_path: Path) -> None:
+    store = Store(tmp_path / "data.sqlite3")
+    _seed(store, "36887", score_decision="pass")
+    sent = _message(105, "36887", [("Откликнуться", "callback")])
+    sent["outgoing"] = True
+    unknown = _message(106, "36887", [("Откликнуться", "callback")])
+    unknown.pop("outgoing")
+    store.save_telegram_messages("getmatch-primary", [sent, unknown])
+    plan = telegram_queue_plan(store, "getmatch-primary", "ai_core", 10)
+    assert plan["planned_count"] == 0
+    assert plan["unmatched_count"] == 2
+    assert {x["reason"] for x in plan["unmatched"]} == {"unverified_incoming_message"}

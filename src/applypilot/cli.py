@@ -359,6 +359,33 @@ def build_parser() -> argparse.ArgumentParser:
                            help="создать review-only placeholder для ещё не скачанной вакансии")
     tg_import.add_argument("--json", action="store_true")
 
+    tg_reconcile = accounts_sub.add_parser(
+        "telegram-reconcile",
+        help="сверить подтверждённые отклики из входящих сообщений @g_jobbot",
+    )
+    tg_reconcile.add_argument("--account", default=None)
+    tg_reconcile.add_argument("--track", default=None)
+    tg_reconcile.add_argument("--limit", type=int, default=1000)
+    tg_reconcile.add_argument("--json", action="store_true")
+
+    tg_pilot = accounts_sub.add_parser(
+        "telegram-pilot",
+        help="одна конкретная Getmatch-вакансия: dry-run по умолчанию",
+    )
+    tg_pilot.add_argument("--id", required=True)
+    tg_pilot.add_argument("--account", default=None)
+    tg_pilot.add_argument("--track", default=None)
+    tg_pilot.add_argument("--allow-live", action="store_true")
+    tg_pilot.add_argument(
+        "--probe-live", action="store_true",
+        help="заново проверить кнопку на Telegram без нажатия и отправки",
+    )
+    tg_pilot.add_argument(
+        "--confirm-id", default=None,
+        help="дополнительное точное подтверждение ID перед callback",
+    )
+    tg_pilot.add_argument("--json", action="store_true")
+
     hh_setup = accounts_sub.add_parser("hh-oauth-setup", help="сохранить client_id/secret HH OAuth")
     hh_setup.add_argument("--client-id")
     hh_setup.add_argument("--redirect-uri", default=None)
@@ -805,8 +832,21 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
             return 0
 
         if args.accounts_action == "telegram-sync":
+            from .getmatch_receipts import reconcile_getmatch_receipts
+            from .multisource import resolve_source_account
+
+            ledger_account = resolve_source_account(
+                config, config.load_profile(), "getmatch.ru",
+            )
             result = TelegramAccount(root, telegram_account).sync(store, args.limit)
-            result["plan"] = telegram_queue_plan(store, telegram_account, track, args.limit)
+            result["receipts"] = reconcile_getmatch_receipts(
+                store, telegram_account, ledger_account=ledger_account,
+                track=track, limit=args.limit,
+            )
+            result["plan"] = telegram_queue_plan(
+                store, telegram_account, track, args.limit,
+                ledger_account=ledger_account,
+            )
             store.save_external_account(
                 "telegram", telegram_account, "ok", "history synced",
                 {"messages": result.get("messages"), "saved": result.get("saved")},
@@ -819,7 +859,15 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
             return 0
 
         if args.accounts_action == "telegram-plan":
-            result = telegram_queue_plan(store, telegram_account, track, args.limit)
+            from .multisource import resolve_source_account
+
+            ledger_account = resolve_source_account(
+                config, config.load_profile(), "getmatch.ru",
+            )
+            result = telegram_queue_plan(
+                store, telegram_account, track, args.limit,
+                ledger_account=ledger_account,
+            )
             if args.json:
                 emit(result)
             else:
@@ -845,6 +893,84 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
                     f"created={result['created_count']} missing={result['missing_count']}"
                 )
             return 0
+
+        if args.accounts_action == "telegram-reconcile":
+            from .getmatch_receipts import reconcile_getmatch_receipts
+            from .multisource import resolve_source_account
+
+            if not 1 <= args.limit <= 1000:
+                print("telegram-reconcile: limit must be 1..1000", file=sys.stderr)
+                return 2
+            ledger_account = resolve_source_account(
+                config, config.load_profile(), "getmatch.ru",
+            )
+            result = reconcile_getmatch_receipts(
+                store, telegram_account, track=track, limit=args.limit,
+                ledger_account=ledger_account,
+            )
+            if args.json:
+                emit(result)
+            else:
+                print(
+                    f"Getmatch bot receipts: confirmed={result['confirmed_count']} "
+                    f"checked={result['checked_messages']} "
+                    f"skipped={len(result['skipped'])}"
+                )
+                for receipt in result["receipts"]:
+                    print(f"  {receipt['vacancy_id']}: {receipt['status']}")
+            return 0
+
+        if args.accounts_action == "telegram-pilot":
+            from .getmatch_apply import (
+                execute_getmatch_pilot,
+                plan_getmatch_pilot,
+                probe_getmatch_callback,
+            )
+            from .multisource import resolve_source_account
+
+            ledger_account = resolve_source_account(
+                config, config.load_profile(), "getmatch.ru",
+            )
+            if args.allow_live and args.probe_live:
+                print("telegram-pilot: choose --probe-live OR --allow-live", file=sys.stderr)
+                return 2
+            if args.allow_live:
+                if str(args.confirm_id or "") != str(args.id):
+                    print(
+                        "telegram-pilot: live mode requires --confirm-id matching --id",
+                        file=sys.stderr,
+                    )
+                    return 2
+                session = TelegramAccount(root, telegram_account).status()
+                if session.get("status") != "confirmed":
+                    print(
+                        "telegram-pilot: Telegram session not confirmed; check login",
+                        file=sys.stderr,
+                    )
+                    return 2
+            if args.probe_live:
+                plan = plan_getmatch_pilot(
+                    store, str(args.id), account=ledger_account,
+                    telegram_account=telegram_account, track=track,
+                )
+                result = (
+                    {**plan, "probe": probe_getmatch_callback(root, telegram_account, plan)}
+                    if plan.get("message_id") is not None else plan
+                )
+            else:
+                result = execute_getmatch_pilot(
+                    store, root, str(args.id), account=ledger_account,
+                    telegram_account=telegram_account, track=track,
+                    allow_live=bool(args.allow_live),
+                )
+            if args.json:
+                emit(result)
+            else:
+                print(
+                    f"Getmatch {args.id}: {result['status']} "
+                    f"mode={result['mode']} {result.get('reason', '')}"
+                )
+            return 0 if result["status"] not in {"unknown", "channel_conflict"} else 2
 
         if args.accounts_action == "hh-oauth-setup":
             client_id = args.client_id or input("HH OAuth client_id: ").strip()

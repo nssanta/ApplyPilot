@@ -64,6 +64,7 @@ class FakeMessage:
         self.text = text
         self.date = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
         self.buttons = buttons
+        self.out = False
 
 
 class FakeTelegramClient:
