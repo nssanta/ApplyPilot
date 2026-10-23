@@ -1709,18 +1709,20 @@ class Store:
                     "duplicate_of_vacancy_id": row["link_duplicate_of_vacancy_id"] or "",
                     "channel_duplicate": bool(row["link_duplicate_of_source"]),
                 })
-                lane = str(item.get("review_lane") or "").strip()
-                if lane not in {
-                    "FIT", "GOOD_UNKNOWN", "NEEDS_ENRICHMENT", "MANUAL_REVIEW",
-                    "SKIP", "APPLIED",
-                }:
-                    lane = review_lane_for(
-                        str(row["filter_status"] or ""), str(row["score_decision"] or ""),
-                        application_state=str(row["application_state"] or ""),
-                        description_status=str(item.get("description_status") or ""),
-                    )
+                # The payload is a historical snapshot. Review lanes must
+                # always derive from authoritative CURRENT track scores and
+                # application state; otherwise rescored rejects appear as FIT.
+                old_lane = str(item.get("review_lane") or "").strip()
+                lane = review_lane_for(
+                    str(row["filter_status"] or ""), str(row["score_decision"] or ""),
+                    application_state=str(row["application_state"] or ""),
+                    description_status=str(item.get("description_status") or ""),
+                )
                 item["review_lane"] = lane
-                item["lane_reasons"] = list(item.get("lane_reasons") or [])
+                item["lane_reasons"] = (
+                    list(item.get("lane_reasons") or [])
+                    if lane == old_lane else []
+                )
                 if not item["lane_reasons"]:
                     item["lane_reasons"] = list(dict.fromkeys(
                         [*item.get("filter_reasons", []), *item.get("problems", [])]

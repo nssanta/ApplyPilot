@@ -245,7 +245,8 @@ def _save_source_snapshot(config: AppConfig, source: str, campaign_id: str, item
 
 
 def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: dict[str, Any],
-                          search: dict[str, Any], cutoff: datetime, track_resume: str) -> list[dict[str, Any]]:
+                          search: dict[str, Any], cutoff: datetime, track_resume: str,
+                          track: str = "default") -> list[dict[str, Any]]:
     groups = search_groups(search)
     group = groups[0] if groups else dict(search)
     result: list[dict[str, Any]] = []
@@ -298,6 +299,26 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
             if filter_status == "pass":
                 filter_status = "unknown"
             filter_reasons.append("publication:time_not_verified")
+        if track == "ai_core":
+            title = str(item.get("name") or "").casefold()
+            description = str(item.get("description") or "").casefold()
+            # Foundation-model training is not applied agent engineering.
+            if re.search(
+                r"(?:обучени[а-яё]*.{0,45}модел|"
+                r"post.training.{0,25}llm|pre.train.{0,25}llm)",
+                title,
+            ):
+                item["score_decision"] = "reject"
+                filter_status = "reject"
+                filter_reasons.append("role:foundation_training_not_ai_core")
+            # Worldwide Remote does not imply eligible to work from Russia.
+            if re.search(
+                r"(?:already relocated from russia|already moved out of russia|"
+                r"only candidates outside russia|не рассматриваем.{0,30}из рф)",
+                description,
+            ):
+                filter_status = "reject"
+                filter_reasons.append("geo:requires_relocation_from_russia")
         item["filter_status"] = filter_status
         item["filter_reasons"] = list(dict.fromkeys(filter_reasons))
         item["filter_fields"] = list(filter_result.fields)
@@ -476,6 +497,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
         items = _prepare_scored_items(
             normalized, source=source, profile=profile, search=search,
             cutoff=cutoff, track_resume=str(profile.get("resume") or ""),
+            track=track,
         )
         _stamp_source_first_seen(
             items, config.data_dir / "seen" / source_slug(source) / f"{source_slug(account)}.json",
