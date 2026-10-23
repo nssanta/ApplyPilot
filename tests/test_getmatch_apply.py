@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from applypilot.getmatch_apply import (
+    GetmatchCallbackDriver,
     execute_getmatch_pilot,
     getmatch_profile_acceptance,
     plan_getmatch_pilot,
@@ -190,3 +191,134 @@ def test_pilot_rejects_stale_and_incoming_untrusted_acceptance(tmp_path: Path) -
         conn.execute("UPDATE telegram_messages SET sent_at=?,outgoing=1 WHERE message_id=101",
                      (datetime.now(UTC).isoformat(),))
     assert getmatch_profile_acceptance(store)["status"] == "unverified"
+
+
+
+def test_getmatch_verified_driver_dispatches_once_and_blocks_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from applypilot.dispatch import dispatch_apply, dispatch_plan
+
+    monkeypatch.setenv("APPLYPILOT_TELEGRAM_LIVE", "1")
+    store = seeded(tmp_path)
+    calls = []
+
+    def confirmed_transport(_root, _account, _store, plan):
+        calls.append(plan["vacancy_id"])
+        return {
+            "status": "success",
+            "reason": "new official bot proof for exact vacancy",
+            "receipt": {
+                "provider": "@g_jobbot",
+                "vacancy_id": plan["vacancy_id"],
+                "confirmation_message_id": 10111,
+            },
+        }
+
+    source_accounts = {"getmatch.ru": "getmatch-primary"}
+    no_driver = dispatch_plan(
+        store, "default", "ai_core", ["getmatch.ru"], 100,
+        accounts=source_accounts,
+    )
+    assert no_driver["planned_count"] == 0
+    assert no_driver["blocked_count"] == 1
+    driver = GetmatchCallbackDriver(
+        tmp_path, store, min_interval_seconds=0,
+        transport=confirmed_transport,
+    )
+    result = dispatch_apply(
+        store, "default", "ai_core", ["getmatch.ru"], 100,
+        allow_live=True, drivers={"getmatch.ru": driver},
+        accounts=source_accounts, run_id="getmatch-test-batch",
+    )
+    assert driver.submit_verified is True
+    assert result["summary"] == {"success": 1}
+    assert calls == ["35881"]
+    assert result["results"][0]["recorded"] is True
+    assert store.vacancy_track_row(
+        "getmatch-primary", "getmatch.ru", "35881", "ai_core",
+    )["application_state"] == "APPLIED_CONFIRMED"
+    result2 = dispatch_apply(
+        store, "default", "ai_core", ["getmatch.ru"], 100,
+        allow_live=True, drivers={"getmatch.ru": GetmatchCallbackDriver(
+            tmp_path, store, min_interval_seconds=0,
+            transport=confirmed_transport,
+        )},
+        accounts=source_accounts, run_id="getmatch-batch-2",
+    )
+    assert result2["planned_count"] == 0
+    assert calls == ["35881"]
+    assert len(store.source_attempts("getmatch-primary", "getmatch.ru")) == 1
+
+
+def test_getmatch_dispatch_pauses_after_unknown_without_resending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from applypilot.dispatch import dispatch_apply
+
+    monkeypatch.setenv("APPLYPILOT_TELEGRAM_LIVE", "1")
+    store = seeded(tmp_path)
+    stamp = datetime.now(UTC).isoformat()
+    with store.connect() as conn:
+        for vid, score in (("35882", 80), ("35883", 75)):
+            conn.execute(
+                """INSERT INTO vacancies
+                (account,source,vacancy_id,title,company,url,application_state,
+                 created_at,first_seen_at,last_seen_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                ("getmatch-primary", "getmatch.ru", vid, "LLM Developer",
+                 "Synthetic Inc", f"https://getmatch.ru/vacancies/{vid}",
+                 "READY_TO_APPLY", stamp, stamp, stamp, stamp),
+            )
+            conn.execute(
+                """INSERT INTO vacancy_track_scores
+                (account,source,vacancy_id,track,score,score_decision,filter_status,
+                 review_state,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                ("getmatch-primary", "getmatch.ru", vid, "ai_core", score,
+                 "pass", "pass", "APPROVED", stamp),
+            )
+    for vid in ("35882", "35883"):
+        store.save_telegram_messages("getmatch-primary", [{
+            "message_id": int(vid), "chat": "@g_jobbot", "outgoing": False,
+            "text": f"LLM Developer https://getmatch.ru/vacancies/{vid}",
+            "sent_at": stamp,
+            "buttons": [{"kind": "callback", "text": "👉 Откликнуться",
+                         "callback_sha256": "a" * 16, "callback_present": True}],
+            "vacancy_refs": [{"source": "getmatch.ru", "id": vid}],
+            "application_likely": True, "has_callback": True,
+        }])
+    calls = []
+
+    def simulated_transport(_root, _account, _store, plan):
+        calls.append(plan["vacancy_id"])
+        return {"status": "unknown", "reason": "bot confirmation delayed"}
+
+    driver = GetmatchCallbackDriver(
+        tmp_path, store, min_interval_seconds=0, transport=simulated_transport,
+    )
+    result = dispatch_apply(
+        store, "default", "ai_core", ["getmatch.ru"], 100,
+        allow_live=True, drivers={"getmatch.ru": driver},
+        accounts={"getmatch.ru": "getmatch-primary"}, run_id="getmatch-unknown",
+    )
+    assert result["summary"]["unknown"] == 1
+    assert result["summary"]["needs_manual"] == 2
+    assert len(calls) == 1
+    blocked_id = calls[0]
+    assert store.vacancy_track_row(
+        "getmatch-primary", "getmatch.ru", blocked_id, "ai_core",
+    )["application_state"] == "UNKNOWN"
+    assert len(store.source_attempts("getmatch-primary", "getmatch.ru")) == 1
+
+
+def test_getmatch_verified_driver_blocks_live_without_second_optin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("APPLYPILOT_TELEGRAM_LIVE", raising=False)
+    store = seeded(tmp_path)
+    driver = GetmatchCallbackDriver(tmp_path, store)
+    assert driver.preflight({
+        "id": "35881", "source": "getmatch.ru",
+        "review_state": "APPROVED", "application_state": "READY_TO_APPLY",
+    }).status == "needs_manual"
+    assert store.source_attempts("getmatch-primary", "getmatch.ru") == []

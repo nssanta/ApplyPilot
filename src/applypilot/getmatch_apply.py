@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .accounts import GETMATCH_APPLY_LABEL
+from .dispatch import ApplyOutcome
 from .getmatch_receipts import RECEIPT
 from .storage import Store
 from .telegram_client import (
@@ -402,3 +404,118 @@ def execute_getmatch_pilot(
         "reason": str(result.get("reason") or "")[:220],
         "mode": "single_live_pilot",
     }
+
+
+class GetmatchCallbackDriver:
+    """Verified Telegram callback driver for bounded source-aware dispatch.
+
+    The common dispatcher exclusively owns reservations, attempt transitions
+    and duplicate detection. This driver only performs the exact callback and
+    returns a bot-verifiable outcome. It must NEVER call execute_getmatch_pilot,
+    which owns its own ledger for the separate single-vacancy CLI workflow.
+    """
+
+    source = "getmatch.ru"
+    submit_verified = True
+
+    def __init__(
+        self,
+        root: Path,
+        store: Store,
+        *,
+        account: str = "getmatch-primary",
+        telegram_account: str = "getmatch-primary",
+        track: str = "ai_core",
+        min_interval_seconds: float = 2.0,
+        transport: Callable[..., dict[str, Any]] = click_and_confirm,
+    ) -> None:
+        if not 0 <= min_interval_seconds <= 30:
+            raise ValueError("Getmatch live interval must be between 0 and 30 seconds")
+        self.root = root
+        self.store = store
+        self.account = account
+        self.telegram_account = telegram_account
+        self.track = track
+        self.min_interval_seconds = float(min_interval_seconds)
+        self.transport = transport
+        self._plans: dict[str, dict[str, Any]] = {}
+        self._last_started: float | None = None
+        self._paused_after_unknown = False
+
+    def preflight(self, row: dict[str, Any]) -> ApplyOutcome:
+        vacancy_id = str(row.get("id") or "")
+        if self._paused_after_unknown:
+            return ApplyOutcome(
+                "needs_manual",
+                "Getmatch callback batch paused after UNKNOWN; reconcile before continuing",
+            )
+        if os.getenv("APPLYPILOT_TELEGRAM_LIVE") != "1":
+            return ApplyOutcome(
+                "needs_manual", "Getmatch live opt-in environment is missing",
+            )
+        if (row.get("source") != self.source
+                or not vacancy_id
+                or row.get("review_state") != "APPROVED"
+                or row.get("application_state") != "READY_TO_APPLY"
+                or row.get("channel_type") == "external_ats"):
+            return ApplyOutcome(
+                "needs_manual", "Getmatch vacancy is not explicitly approved or ready",
+            )
+        plan = plan_getmatch_pilot(
+            self.store, vacancy_id, account=self.account,
+            telegram_account=self.telegram_account, track=self.track,
+        )
+        if plan.get("status") != "ready_for_single_live_pilot":
+            return ApplyOutcome(
+                "needs_manual", str(plan.get("reason") or "Getmatch source not ready"),
+            )
+        self._plans[vacancy_id] = plan
+        return ApplyOutcome("ready")
+
+    def apply(self, row: dict[str, Any]) -> ApplyOutcome:
+        vacancy_id = str(row.get("id") or "")
+        if self._paused_after_unknown:
+            return ApplyOutcome(
+                "needs_manual", "Getmatch callback batch is paused after UNKNOWN",
+            )
+        if os.getenv("APPLYPILOT_TELEGRAM_LIVE") != "1":
+            return ApplyOutcome("needs_manual", "Getmatch Telegram live opt-in not set")
+        plan = self._plans.pop(vacancy_id, None)
+        if not plan:
+            return ApplyOutcome(
+                "needs_manual", "Getmatch callback plan was not preflight-verified",
+            )
+        if self._last_started is not None:
+            wait = self.min_interval_seconds - (time.monotonic() - self._last_started)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_started = time.monotonic()
+        try:
+            outcome = self.transport(
+                self.root, self.telegram_account, self.store, plan,
+            )
+        except Exception as exc:  # noqa: BLE001 - callback may have been dispatched
+            outcome = {
+                "status": "unknown",
+                "reason": f"Getmatch callback ambiguous: {type(exc).__name__}",
+            }
+        status = str(outcome.get("status") or "unknown")
+        receipt = outcome.get("receipt") or {}
+        if status == "success" and not (
+            isinstance(receipt, dict)
+            and receipt.get("provider") == BOT_USERNAME
+            and str(receipt.get("vacancy_id") or "") == vacancy_id
+            and str(receipt.get("confirmation_message_id") or "").isdigit()
+            and int(receipt["confirmation_message_id"]) > 0
+        ):
+            status = "unknown"
+        if status not in {"success", "already_applied", "failed_before_submit", "needs_manual"}:
+            status = "unknown"
+        if status == "unknown":
+            self._paused_after_unknown = True
+        return ApplyOutcome(
+            status,
+            str(outcome.get("reason") or "no verified official Getmatch receipt")[:240],
+            evidence=f"@g_jobbot:vacancy={vacancy_id}" if status == "success" else "",
+            receipt=receipt if status == "success" else {},
+        )

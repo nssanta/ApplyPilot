@@ -67,7 +67,13 @@ CLICKERS: dict[str, ClickerSpec] = {
         source="getmatch.ru", label="Getmatch / Telegram",
         login_url="https://getmatch.ru/",
         profile_required=False,
-        notes="Applications arrive through @g_jobbot WebView/callback; inspect the Telegram WebView first.",
+        submit_verified=True, apply_status="verified_telegram_callback",
+        notes=(
+            "Live native callback verified by official incoming @g_jobbot "
+            "confirmation for an exact native vacancy. Requires accepted candidate "
+            "profile, per-job APPROVED, ready state and explicit CLI live opt-in. "
+            "WebViews and forms remain manual."
+        ),
     ),
 }
 
@@ -156,6 +162,13 @@ def apply_with_clicker(source: str, row: Mapping[str, Any]) -> ApplyOutcome:
             "needs_live_validation",
             "Habr's verified live driver is enabled separately by "
             "'sources dispatch-apply --allow-live --enable-habr'; no click from inspector",
+        )
+    if source == "getmatch.ru":
+        return ApplyOutcome(
+            "needs_live_validation",
+            "Getmatch's verified callback driver is enabled separately by "
+            "'sources dispatch-apply --allow-live --enable-getmatch' with "
+            "APPLYPILOT_TELEGRAM_LIVE=1; no click from inspector",
         )
     return ApplyOutcome(
         "needs_live_validation",

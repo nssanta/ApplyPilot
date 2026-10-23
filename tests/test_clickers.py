@@ -11,7 +11,7 @@ from applypilot.clickers import (
 )
 
 
-def test_registry_exposes_guarded_habr_native_submit_only() -> None:
+def test_registry_exposes_guarded_habr_and_getmatch_verified_channels() -> None:
     assert set(CLICKERS) == {
         "career.habr.com", "geekjob.ru", "yandex.ru/jobs", "getmatch.ru",
     }
@@ -22,7 +22,10 @@ def test_registry_exposes_guarded_habr_native_submit_only() -> None:
     assert habr["selectors"] == [
         ".create-vacancy-response__apply button[type='submit']",
     ]
-    for source in ("geekjob.ru", "yandex.ru/jobs", "getmatch.ru"):
+    assert specs["getmatch.ru"]["submit_verified"] is True
+    assert specs["getmatch.ru"]["apply_status"] == "verified_telegram_callback"
+    assert specs["getmatch.ru"]["selectors"] == []
+    for source in ("geekjob.ru", "yandex.ru/jobs"):
         assert specs[source]["submit_verified"] is False
         assert specs[source]["apply_status"] == "needs_live_validation"
         assert specs[source]["selectors"] == []

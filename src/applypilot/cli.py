@@ -268,6 +268,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--habr-min-interval", type=float, default=2.0,
         help="Habr: минимальные секунды между отправками в одной сессии (0..30)",
     )
+    sources_dispatch_apply.add_argument(
+        "--enable-getmatch", action="store_true",
+        help="включить проверенный callback-драйвер @g_jobbot; требует --allow-live и APPLYPILOT_TELEGRAM_LIVE=1",
+    )
+    sources_dispatch_apply.add_argument(
+        "--getmatch-min-interval", type=float, default=2.0,
+        help="Getmatch: минимальные секунды между Telegram callback в одной сессии (0..30)",
+    )
     sources_dispatch_apply.add_argument("--json", action="store_true")
 
     sources_approve_batch = sources_sub.add_parser(
@@ -1323,11 +1331,22 @@ def main(argv: list[str] | None = None) -> int:
                     accounts=accounts, registry=registry,
                 )
             else:
-                if args.enable_habr and not args.allow_live:
-                    print("dispatch: --enable-habr requires --allow-live", file=sys.stderr)
+                if (args.enable_habr or args.enable_getmatch) and not args.allow_live:
+                    print("dispatch: --enable-habr/--enable-getmatch requires --allow-live",
+                          file=sys.stderr)
                     return 2
                 if not 0 <= args.habr_min_interval <= 30:
                     print("dispatch: --habr-min-interval must be 0..30", file=sys.stderr)
+                    return 2
+                if not 0 <= args.getmatch_min_interval <= 30:
+                    print("dispatch: --getmatch-min-interval must be 0..30", file=sys.stderr)
+                    return 2
+                if (args.enable_getmatch and "getmatch.ru" in selected
+                        and os.environ.get("APPLYPILOT_TELEGRAM_LIVE") != "1"):
+                    print(
+                        "dispatch: Getmatch live requires APPLYPILOT_TELEGRAM_LIVE=1",
+                        file=sys.stderr,
+                    )
                     return 2
                 drivers: dict[str, Any] = {}
                 with ExitStack() as cleanup:
@@ -1356,6 +1375,25 @@ def main(argv: list[str] | None = None) -> int:
                             print(
                                 f"Habr driver unavailable: login={auth.get('status', 'unknown')}; "
                                 "run sources login/check first",
+                                file=sys.stderr,
+                            )
+                    if args.allow_live and args.enable_getmatch and "getmatch.ru" in selected:
+                        from .getmatch_apply import GetmatchCallbackDriver
+                        from .telegram_client import TelegramAccount
+
+                        source_account = accounts["getmatch.ru"]
+                        telegram_account = "getmatch-primary"
+                        auth = TelegramAccount(config.root, telegram_account).status()
+                        if auth.get("status") == "confirmed":
+                            drivers["getmatch.ru"] = GetmatchCallbackDriver(
+                                config.root, store, account=source_account,
+                                telegram_account=telegram_account, track=args.track,
+                                min_interval_seconds=args.getmatch_min_interval,
+                            )
+                        else:
+                            print(
+                                f"Getmatch driver unavailable: Telegram={auth.get('status', 'unknown')}; "
+                                "run accounts telegram-status --online first",
                                 file=sys.stderr,
                             )
                     result = dispatch_apply(
