@@ -728,14 +728,31 @@ class GetMatchProvider:
     def _discover_urls(
         self, urls: list[str], filters: Mapping[str, Any]
     ) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
+        """Incrementally fetch linked jobs, preserving successful bounded coverage."""
         limit = _bounded_int(filters, ("details_limit", "max_details"), 20, 500, 0)
         budget = _Budget(_request_budget(filters))
+        seen, state_path = _load_seen(filters)
+        selected: list[str] = []
+        skipped_seen = 0
+        ids_this_pass: set[str] = set()
+        for url in urls:
+            native_id, _ = _native_and_slug(url)
+            if not native_id or native_id in ids_this_pass:
+                continue
+            ids_this_pass.add(native_id)
+            if native_id in seen:
+                skipped_seen += 1
+                continue
+            selected.append(url)
         items: list[dict[str, Any]] = []
+        new_seen: set[str] = set()
+        seen_urls: set[str] = set()
         errors: list[str] = []
         blocked = False
+        archived = 0
         requests_used = 0
         truncated = False
-        for url in urls[:limit]:
+        for url in selected[:limit]:
             if not budget.take():
                 truncated = True
                 break
@@ -745,24 +762,45 @@ class GetMatchProvider:
                 errors.append(f"{url}: {error}")
                 blocked = blocked or status == "blocked"
                 continue
+            native_id, _ = _native_and_slug(url)
+            if _is_archived(BeautifulSoup(html, "html.parser")):
+                archived += 1
+                new_seen.add(native_id)
+                seen_urls.add(url)
+                continue
             item = self._parse_detail(html, url)
-            if item is not None and item["native_id"] not in {
-                existing["native_id"] for existing in items
-            }:
-                items.append(item)
+            if item is not None:
+                if item["native_id"] not in {value["native_id"] for value in items}:
+                    items.append(item)
+                new_seen.add(native_id)
+                seen_urls.add(url)
+        if state_path is not None:
+            _persist_seen(state_path, seen | new_seen, seen_urls, filters)
         if items:
             status = "partial" if errors or truncated else "ok"
         elif blocked:
             status = "blocked"
-        else:
+        elif errors:
             status = "failed"
-        error_text = "; ".join(errors[:3])
+        elif not selected or archived:
+            status = "ok"
+        else:
+            status = "truncated" if truncated else "failed"
+        diagnostics = (
+            f"linked_urls={len(urls)} unique={len(ids_this_pass)} "
+            f"previously_seen={skipped_seen} remaining={len(selected)} "
+            f"archived={archived} fetched={requests_used}"
+        )
+        if errors:
+            diagnostics += "; " + "; ".join(errors[:3])
         if truncated:
-            error_text = f"{error_text}; request budget reached".strip("; ")
-        if not items and not error_text:
-            error_text = "no parseable active vacancy"
-        return items, [segment("detail_urls", status=status, items=len(items),
-                               requests=requests_used, error=error_text)]
+            diagnostics += "; request budget reached"
+        if not items and not errors and not archived and selected and not truncated:
+            diagnostics += "; no parseable active vacancy"
+        return items, [segment(
+            "detail_urls", status=status, items=len(items),
+            requests=requests_used, error=diagnostics,
+        )]
 
     def inspect(
         self, native_id: str, filters: Mapping[str, Any] | None = None

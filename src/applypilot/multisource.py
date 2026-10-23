@@ -37,6 +37,13 @@ SOURCE_LABELS = {
 }
 DEFAULT_SOURCES = list(SOURCE_LABELS)
 
+# Discovery priority only, not a rejection filter: after AI/LLM/agent roles
+# are fetched, subsequent incremental runs also cover every other linked job.
+GETMATCH_AI_TITLE_HINT = re.compile(
+    r"(?i)(?:\bllm\b|\bai\b|\brag\b|\bgpt\b|\bnlp\b|"
+    r"agent|агент|генератив|нейросет|разработчик\s+ии|инженер\s+ии)"
+)
+
 
 def source_slug(source: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", source.casefold()).strip("-") or "source"
@@ -420,18 +427,34 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
         # The user already owns these messages. Extract public job IDs only:
         # no bot commands are interpreted, no callbacks are executed.
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:
-            candidate_urls: list[str] = []
+            candidates: list[tuple[int, str]] = []
             seen_ids: set[str] = set()
             for message in store.telegram_messages(account, 1000):
+                # Role title is only an ordering hint. Full on-site text and
+                # ai_core scoring remain the eligibility source of truth.
+                headline = str(message.get("text") or "").splitlines()[0][:220]
+                priority = 0 if GETMATCH_AI_TITLE_HINT.search(headline) else 1
                 for ref in message.get("vacancy_refs", []):
                     native_id = str(ref.get("id") or "").strip()
                     if (ref.get("source") != source or not native_id.isdecimal()
                             or native_id in seen_ids):
                         continue
                     seen_ids.add(native_id)
-                    candidate_urls.append(f"https://getmatch.ru/vacancies/{native_id}")
-            if candidate_urls:
-                filters["detail_urls"] = candidate_urls
+                    candidates.append(
+                        (priority, f"https://getmatch.ru/vacancies/{native_id}")
+                    )
+            if candidates:
+                # Python's stable sort preserves newest-first within each tier.
+                filters["detail_urls"] = [
+                    url for _, url in sorted(candidates, key=lambda item: item[0])
+                ]
+                # Keep Telegram-linked vacancy coverage separate from sitemap
+                # coverage; successive bounded runs must advance, not reread
+                # the same top N URLs indefinitely.
+                filters["state_path"] = str(
+                    config.data_dir / "providers" / source_slug(source)
+                    / source_slug(account) / "telegram_seen.json"
+                )
         discovered = provider.discover(filters)
         if hasattr(discovered, "items"):
             raw_items = list(discovered.items)

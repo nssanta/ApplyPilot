@@ -205,6 +205,36 @@ def test_getmatch_sitemap_seen_state_accumulates_across_bounded_scans(tmp_path: 
     assert "unseen=0" in segments[-1].error
 
 
+def test_getmatch_direct_telegram_hints_advance_between_bounded_runs(
+    tmp_path: Path,
+) -> None:
+    # Use only the tracked synthetic public fixture; do not access the web.
+    html = GETMATCH_ACTIVE.read_text(encoding="utf-8")
+    session = _Session(html)
+    cursor = tmp_path / "telegram_seen.json"
+    urls = [
+        "https://getmatch.ru/vacancies/36887",
+        "https://getmatch.ru/vacancies/36789",
+    ]
+    filters = {
+        "detail_urls": urls,
+        "session": session,
+        "state_path": str(cursor),
+        "details_limit": 1,
+        "request_budget": 2,
+    }
+    provider = GetMatchProvider()
+    first, _ = provider.discover(filters)
+    second, _ = provider.discover(filters)
+    third, segments = provider.discover(filters)
+    assert [x["native_id"] for x in first] == ["36887"]
+    assert [x["native_id"] for x in second] == ["36789"]
+    assert third == []
+    assert "previously_seen=2" in segments[0].error
+    assert len(session.urls) == 2
+    assert set(json.loads(cursor.read_text())["seen_ids"]) == {"36887", "36789"}
+
+
 def test_getmatch_detail_json_ld_supplies_real_date_salary_and_location(
     tmp_path: Path,
 ) -> None:

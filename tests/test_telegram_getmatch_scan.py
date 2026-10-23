@@ -70,3 +70,34 @@ def test_telegram_hints_require_explicit_opt_in(tmp_path: Path) -> None:
     )
     assert provider.detail_urls == []
     assert result["telegram_links"] == 0
+
+
+def test_telegram_hints_prioritize_ai_titles_without_discarding_other_roles(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig(
+        tmp_path, tmp_path / "data", FIXTURES / "profile.toml",
+        FIXTURES / "search.toml",
+    )
+    store = Store(config.db_path)
+    for message_id, title, vacancy_id in (
+        (201, "Backend Python", "36789"),
+        (200, "LLM Agent Engineer", "36887"),
+    ):
+        store.save_telegram_messages("default", [{
+            "message_id": message_id, "chat": "@g_jobbot",
+            "sent_at": f"2026-10-22T10:{message_id % 60:02}:00+00:00",
+            "text": title,
+            "vacancy_refs": [{"source": "getmatch.ru", "id": vacancy_id}],
+            "buttons": [], "application_likely": False, "has_callback": False,
+        }])
+    provider = SpyGetmatch()
+    scan_source(
+        config, "ai_core", config.load_profile(), config.load_search(),
+        "getmatch.ru", registry=ProviderRegistry([provider]),
+        telegram_hints=True,
+    )
+    assert provider.detail_urls == [
+        "https://getmatch.ru/vacancies/36887",
+        "https://getmatch.ru/vacancies/36789",
+    ]
