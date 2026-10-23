@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
   vacancy_refs_json TEXT NOT NULL DEFAULT '[]',
   application_likely INTEGER NOT NULL DEFAULT 0,
   has_callback INTEGER NOT NULL DEFAULT 0,
+  outgoing INTEGER NOT NULL DEFAULT -1,
   first_seen_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(account, chat, message_id)
@@ -376,6 +377,9 @@ class Store:
         negotiation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(negotiation_statuses)")}
         if "resume" not in negotiation_columns:
             conn.execute("ALTER TABLE negotiation_statuses ADD COLUMN resume TEXT NOT NULL DEFAULT ''")
+        telegram_columns = {row["name"] for row in conn.execute("PRAGMA table_info(telegram_messages)")}
+        if "outgoing" not in telegram_columns:
+            conn.execute("ALTER TABLE telegram_messages ADD COLUMN outgoing INTEGER NOT NULL DEFAULT -1")
         score_columns = {row["name"] for row in conn.execute("PRAGMA table_info(vacancy_track_scores)")}
         added_review_state = "review_state" not in score_columns
         for column, definition in (
@@ -2258,20 +2262,22 @@ class Store:
                 conn.execute(
                     """INSERT INTO telegram_messages
                     (account,chat,message_id,sent_at,text,buttons_json,vacancy_refs_json,
-                     application_likely,has_callback,first_seen_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                     application_likely,has_callback,outgoing,first_seen_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(account,chat,message_id) DO UPDATE SET
                       sent_at=excluded.sent_at,text=excluded.text,
                       buttons_json=excluded.buttons_json,
                       vacancy_refs_json=excluded.vacancy_refs_json,
                       application_likely=excluded.application_likely,
                       has_callback=excluded.has_callback,
-                      updated_at=excluded.updated_at""",
+                      outgoing=excluded.outgoing,updated_at=excluded.updated_at""",
                     (
                         str(account), chat, message_id, str(message.get("sent_at") or ""),
                         str(message.get("text") or ""), buttons, refs,
                         1 if message.get("application_likely") else 0,
                         1 if message.get("has_callback") else 0,
+                        (1 if message["outgoing"] else 0)
+                        if isinstance(message.get("outgoing"), bool) else -1,
                         timestamp, timestamp,
                     ),
                 )
@@ -2298,6 +2304,10 @@ class Store:
                 item["vacancy_refs"] = []
             item["application_likely"] = bool(item.get("application_likely"))
             item["has_callback"] = bool(item.get("has_callback"))
+            item["outgoing"] = (
+                bool(item["outgoing"]) if item.get("outgoing") in (0, 1)
+                else None
+            )
             result.append(item)
         return result
 

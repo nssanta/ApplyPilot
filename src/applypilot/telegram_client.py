@@ -197,6 +197,9 @@ def message_to_dict(message: Any, chat: str = BOT_USERNAME) -> dict[str, Any]:
         "vacancy_refs": refs,
         "application_likely": application_likely,
         "has_callback": any(button["kind"] == "callback" for button in buttons),
+        # None = unknown for synthetic/legacy imports. Incoming bot receipts
+        # must have out=False; never trust a user's own copied confirmation.
+        "outgoing": getattr(message, "out", None),
     }
 
 
