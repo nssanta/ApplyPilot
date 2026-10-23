@@ -75,10 +75,14 @@ applypilot accounts telegram-sync --limit 50 --json
 applypilot accounts telegram-plan --json
 ```
 
-`telegram-sync` сохраняет сообщения и кнопки в SQLite и строит **dry-run** план:
-вакансии сопоставляются с очередью ApplyPilot по публичным ссылкам
-`getmatch.ru/vacancies/<id>` и `hh.ru/vacancy/<id>`. План всегда имеет
-`can_send=false` и `action=needs_live_validation`.
+`telegram-sync` сохраняет сообщения и кнопки в SQLite и строит **dry-run** план.
+`telegram-plan` рассматривает только ссылки `getmatch.ru/vacancies/<id>`
+из официального чата `@g_jobbot` с **положительной callback-кнопкой
+«Откликнуться»**. Кнопки выбора страны / отказа не считаются откликами.
+В `planned` включаются лишь вакансии FIT/GOOD_UNKNOWN, `SKIP` показываются
+отдельно в `blocked`, отсутствующие/неправильные кнопки — в `unmatched`.
+План не разрешает отправку: для каждого кандидата `can_send=false`
+и `action=needs_live_validation` до отдельной живой проверки.
 
 Что читается: текст сообщений, дата, inline-кнопки (текст, тип, URL,
 наличие callback), публичные ссылки на вакансии. Callback-данные не печатаются;
