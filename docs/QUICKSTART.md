@@ -63,7 +63,7 @@ applypilot sources accounts --track default
 
 ```bash
 applypilot sources scan --track default \
-  --fixture-dir tests/fixtures/public --limit 100
+  --fixture-dir tests/fixtures/public --limit 20
 applypilot queue list --track default --view top --limit 20
 applypilot queue list --track default --view review --limit 20
 ```
@@ -71,7 +71,7 @@ applypilot queue list --track default --view review --limit 20
 Живой поиск (без отправки откликов):
 
 ```bash
-applypilot sources scan --track default --limit 100
+applypilot sources scan --track default --limit 20
 applypilot sources status --track default
 ```
 
@@ -82,15 +82,15 @@ applypilot sources status --track default
 
 ```bash
 # Общий dry-run по всем источникам.
-applypilot sources dispatch-plan --track default --limit 100 --json
+applypilot sources dispatch-plan --track default --limit 20 --json
 
 # Пакетное одобрение до 100 ID (решение и причина обязательны).
 applypilot sources approve-batch --track default --source getmatch.ru \
-  --id 36887 --state APPROVED --reason 'подходит по стеку'
+  --id VACANCY_ID --state APPROVED --reason 'подходит по стеку'
 
 # По умолчанию это снова dry-run. Live требует --allow-live и проверенного
 # драйвера источника; без драйвера источник пропускается с needs_live_validation.
-applypilot sources dispatch-apply --track default --limit 100 --json
+applypilot sources dispatch-apply --track default --limit 20 --json
 ```
 
 Диспетчер атомарно резервирует канал `(account, canonical channel)`: DreamJob
@@ -105,7 +105,7 @@ applypilot sources dispatch-apply --track default --limit 100 --json
 ```bash
 applypilot accounts telegram-setup
 applypilot accounts telegram-login --phone +<номер>
-applypilot accounts telegram-sync --limit 100 --json
+applypilot accounts telegram-sync --limit 20 --json
 applypilot accounts telegram-import --track default --json
 ```
 
@@ -153,26 +153,26 @@ GeekJob имеет проверенную в браузере native-форму,
 applypilot accounts --help
 ```
 
-Для GeekJob в подтверждённом профиле доступны безопасная проверка форм
+Для GeekJob после локальной авторизации доступны безопасная проверка форм
 и одиночный пилот, но **массовый кликер намеренно не включён**:
 
 ```bash
 applypilot sources check --source geekjob.ru
-applypilot sources form-audit --track ai_core --source geekjob.ru \
-  --view review --limit 100 --json
+applypilot sources form-audit --track default --source geekjob.ru \
+  --view review --limit 20 --json
 
 # Без POST: статус выбранной вакансии
-applypilot sources geekjob-pilot --track ai_core --id VACANCY_ID --json
+applypilot sources geekjob-pilot --track default --id VACANCY_ID --json
 
 # Только для действительно подходящей вакансии, после APPROVED, READY_TO_APPLY
 # и сохранения отдельного письма:
-# private/data/providers/geekjob/geekjob-primary/letters/VACANCY_ID.txt
-# applypilot sources geekjob-pilot --track ai_core --id VACANCY_ID \
+# private/data/providers/geekjob/<account>/letters/VACANCY_ID.txt
+# applypilot sources geekjob-pilot --track default --id VACANCY_ID \
 #   --allow-live --confirm-id VACANCY_ID --visible
 ```
 
-Этот live-пилот использует один опубликованный AI/LLM CV, заполняет письмо,
-проверяет удалёнку из РФ и запрещает повтор после UNKNOWN. Успех требует
+Этот live-пилот использует один настроенный профиль кандидата, заполняет письмо,
+проверяет условия местоположения и запрещает повтор после UNKNOWN. Успех требует
 HTTP POST + запись с точным ID в GeekJob `/responses`; на реальных
 вакансиях такой receipt пока не подтверждён. Тесты браузера используют
 только синтетические страницы, без отправки работодателям.
@@ -183,15 +183,15 @@ HTTP POST + запись с точным ID в GeekJob `/responses`; на реа
 ```bash
 applypilot sources check --source career.habr.com
 # Проверить в одной команде до 100 реальных форм по review/TOP, без POST:
-applypilot sources form-audit --track ai_core --source career.habr.com \
-  --view review --limit 100 --json
-applypilot sources dispatch-plan --track ai_core --source career.habr.com --json
+applypilot sources form-audit --track default --source career.habr.com \
+  --view review --limit 20 --json
+applypilot sources dispatch-plan --track default --source career.habr.com --json
 
 # РЕАЛЬНАЯ ОТПРАВКА: только ранее APPROVED и READY_TO_APPLY,
 # с действующей сессией и независимым подтверждением в /responses.
 # Запускать осознанно, не использовать для тестирования без разрешения.
-applypilot sources dispatch-apply --track ai_core --source career.habr.com \
-  --limit 100 --allow-live --enable-habr --visible --habr-min-interval 2
+applypilot sources dispatch-apply --track default --source career.habr.com \
+  --limit 20 --allow-live --enable-habr --visible --habr-min-interval 2
 ```
 
 Habr driver поддерживает подтверждённую one-click форму; перед работой
@@ -206,15 +206,15 @@ Getmatch можно запускать отдельно после подклю�
 
 ```bash
 # Безопасное планирование (ничего не отправляет):
-applypilot sources dispatch-plan --track ai_core --source getmatch.ru --json
+applypilot sources dispatch-plan --track default --source getmatch.ru --json
 
 # Только при готовых, подходящих, явно одобренных Getmatch-кандидатах:
 APPLYPILOT_TELEGRAM_LIVE=1 applypilot sources dispatch-apply \
-  --track ai_core --source getmatch.ru --limit 100 \
+  --track default --source getmatch.ru --limit 20 \
   --allow-live --enable-getmatch --getmatch-min-interval 2
 ```
 
-Один live callback+receipt подтверждён; большой пакет пока
+Callback сверяется с ответом провайдера; большой пакет пока
 проверен только offline-тестами, а не десятками реальных отправок. При
 `UNKNOWN` драйвер останавливает новые Getmatch-кнопки и не повторяет
 старую. HR-чаты и дополнительные вопросы требуют отдельной проверки.

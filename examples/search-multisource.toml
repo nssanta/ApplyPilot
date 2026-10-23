@@ -1,5 +1,5 @@
 # Пример поисковой конфигурации Multi-Source.
-# Пределы 100/run и 300/day — техническая ёмкость, не обязательный объём.
+# Синтетический пример. Персональные критерии и пределы задаются локально.
 [search]
 queries = [
   "AI engineer", "LLM engineer", "AI agent", "RAG", "NLP",
@@ -12,7 +12,7 @@ details_limit = 120
 only_remote = true
 
 [salary]
-from = 120000
+from = 0
 currency = "RUR"
 missing = "include"
 

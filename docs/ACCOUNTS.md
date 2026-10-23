@@ -1,15 +1,13 @@
 # Локальные аккаунты: Telegram MTProto и HH OAuth
 
-Этот этап готовит ApplyPilot к подключению реальных аккаунтов. Оба клиента
-дополнительные: они не заменяют существующие сканеры, SQLite-очередь и
-Playwright-кликер HH. Реальные отклики и сообщения в этом этапе не отправляются.
+Документ описывает подключение собственных аккаунтов к локальной установке. Клиенты Telegram и HH OAuth дополняют сканеры, SQLite-очередь и браузерные драйверы. Профили, коды авторизации и реальные результаты работы не публикуются.
 
 ## Границы и статусы
 
 | Возможность | Статус | Что это значит |
 |---|---|---|
-| Telegram: вход, session, история @g_jobbot, кнопки | `documented_local` | Реализовано на Telethon; проверяется на реальном аккаунте владельцем |
-| Telegram: callback-отклик | `needs_live_validation` | Кнопка может требовать WebView/подтверждения; по умолчанию заблокирована |
+| Telegram: вход, session, история @g_jobbot, кнопки | локальный клиент | Telethon; требует собственной авторизации |
+| Telegram: native callback-отклик | guarded live driver | Требует принятого профиля, одобрения вакансии и отдельного opt-in; WebView — иной сценарий |
 | HH OAuth: токен, refresh, `/me`, `/negotiations`, сообщения | `documented_read` | Официальные read-методы; проверяются на живом токене |
 | HH OAuth: `POST /negotiations` (отклик) | `needs_live_validation` | Точная схема тела и допуск аккаунта не подтверждены; отправка заблокирована |
 | HH Playwright-кликер | без изменений | Остаётся основным путём отклика до отдельной проверки API |
@@ -53,18 +51,18 @@ ApplyPilot видит доказательство допуска. Live-пило
 applypilot accounts telegram-status --online
 # В официальном @g_jobbot: /profile (только чтение статуса)
 applypilot accounts telegram-sync --limit 500
-applypilot accounts telegram-import --track ai_core --limit 500
-applypilot sources scan --track ai_core --source getmatch.ru \
+applypilot accounts telegram-import --track default --limit 500
+applypilot sources scan --track default --source getmatch.ru \
   --telegram-hints --details-limit 80 --request-budget 85
 
 # Сверить подтверждённые прошлые отклики по официальным входящим сообщениям.
 # Это не создаёт новых откликов и не меняет неподтверждённые записи.
-applypilot accounts telegram-reconcile --track ai_core --limit 500
-applypilot accounts telegram-plan --track ai_core --limit 500 --json
+applypilot accounts telegram-reconcile --track default --limit 500
+applypilot accounts telegram-plan --track default --limit 500 --json
 
 # Одна конкретная вакансия: показывает статус и проверяет живую
 # кнопку/отпечаток callback, НИЧЕГО не отправляет.
-applypilot accounts telegram-pilot --track ai_core --id VACANCY_ID \
+applypilot accounts telegram-pilot --track default --id VACANCY_ID \
   --probe-live --json
 ```
 
@@ -75,24 +73,23 @@ applypilot accounts telegram-pilot --track ai_core --id VACANCY_ID \
 
 ```bash
 # Пример после самостоятельного решения владельца:
-applypilot sources approve-batch --track ai_core --source getmatch.ru \
+applypilot sources approve-batch --track default --source getmatch.ru \
   --id VACANCY_ID --state APPROVED --reason 'Подходящая AI/LLM-вакансия'
 
 APPLYPILOT_TELEGRAM_LIVE=1 applypilot accounts telegram-pilot \
-  --track ai_core --id VACANCY_ID --allow-live --confirm-id VACANCY_ID
+  --track default --id VACANCY_ID --allow-live --confirm-id VACANCY_ID
 ```
 
-**Это реальная отправка и не dry-run.** После одной подтверждённой
-живой отправки через нативный callback реализован и пакетный Getmatch-драйвер:
+**Это реальная отправка и не dry-run.** Пакетный Getmatch-драйвер включается только явно:
 
 ```bash
 # Только предварительно индивидуально APPROVED вакансии из ai_core:
-applypilot sources dispatch-plan --track ai_core --source getmatch.ru --json
+applypilot sources dispatch-plan --track default --source getmatch.ru --json
 
 # Реально нажимает сохранённые позитивные callback-кнопки @g_jobbot.
 # Отдельное opt-in, по умолчанию всё выключено.
 APPLYPILOT_TELEGRAM_LIVE=1 applypilot sources dispatch-apply \
-  --track ai_core --source getmatch.ru --limit 100 \
+  --track default --source getmatch.ru --limit 100 \
   --allow-live --enable-getmatch --getmatch-min-interval 2 --json
 ```
 

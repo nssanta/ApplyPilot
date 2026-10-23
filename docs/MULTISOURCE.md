@@ -1,121 +1,41 @@
 # ApplyPilot Multi-Source
 
-Единый конвейер поиска и откликов для HH.ru, Habr Career, Getmatch, GeekJob,
-Карьеры Яндекса и DreamJob. Каждая площадка остаётся отдельным модулем, но
-пользователь работает с одним рейтингом, одной очередью и одной историей.
+Источники вакансий подключаются независимо и используют общие схемы нормализации, скоринга, review и журналирования. Документ описывает **возможности приложения**, а не чьи-либо авторизованные аккаунты, заявки или персональные настройки.
 
-## Что уже работает
+## Матрица возможностей
 
-| Источник | Поиск | Детали | Аккаунт/сессия | Отклик |
-|---|---|---|---|---|
-| `hh.ru` | да, legacy `run campaign` | да | HH-профиль | проверенный legacy runner |
-| `career.habr.com` | да, список + пагинация | да, приоритетно | отдельный профиль | подтверждённый native one-click, только через CLI live opt-in |
-| `geekjob.ru` | да, каталог и пагинация, детали | да, приоритетно | подтверждённый профиль с опубликованным AI/LLM CV | native форма проинспектирована, read-only аудит + single pilot; реальный submit не подтверждён |
-| `getmatch.ru` | да, sitemap + Telegram-ссылки + delta | да, JSON-LD | локальная Telegram MTProto-сессия | native callback подтверждён; CLI batch-драйвер с live opt-in, устойчивость пачки протестирована offline |
-| `yandex.ru/jobs` | да, remote/GenAI URL | да | Яндекс ID подтверждён, PDF загружен | авторизованная Яндекс Форма read-only проверена, отправка `needs_live_validation` |
-| `dreamjob.ru` | да, company listing | да | без логина | `mirror_only`, канал HH |
+| Источник | Поиск и детали | Механизм отклика | Ограничение |
+|---|---|---|---|
+| `hh.ru` | публичный поиск и детали | Chrome/Playwright runner | требуется пользовательская авторизация для отклика |
+| `career.habr.com` | каталог и детали | native one-click с явным live opt-in | внешние ATS/анкеты отдельно |
+| `getmatch.ru` | sitemap, публичные детали и Telegram-ссылки | guarded Telegram callback с явным live opt-in | только callback официального бота и принятый профиль |
+| `geekjob.ru` | каталог и детали | read-only проверка native-формы и single-vacancy pilot | массовая отправка без подтверждения не активна |
+| `yandex.ru/jobs` | каталог/детали | read-only form audit | submit без отдельного подтверждения не активен |
+| `dreamjob.ru` | listings и зеркала | read-only HH mirror | второй отклик по зеркалу не создаётся |
 
-`needs_live_validation` — не ошибка поиска. Хабр подтверждён одним реальным откликом; для остальных источников это честный статус: карточка и
-описание разобраны, но авторизованная форма отклика ещё не подтверждена живой
-сессией. Такие вакансии видны в review-очереди, но не попадают в реальную
-отправку.
+Авторизация и состояние аккаунтов хранятся локально, вне Git. Записи `UNKNOWN` блокируют слепую повторную отправку.
 
-### Яндекс Карьера: безопасная проверка анкеты
-
-Профиль `yandex-primary` авторизован, файл AI-резюме прикреплён. Две
-активные AI-вакансии (48876, 48171) открывают одну встроенную
-`forms.yandex.ru`-анкету с полем сопроводительного письма и тремя
-независимыми согласиями. Из них два согласия на рассылки и мероприятия —
-необязательные. Запрос `POST /gateway/root/form/getSurvey` **только
-загружает** схему анкеты и разрешён в read-only режиме; все другие
-изменяющие HTTP-запросы запрещены.
-
-```bash
-.venv/bin/python -m applypilot sources form-audit \
-  --track default --source yandex.ru/jobs --view review --limit 10 --json
-```
-
-Реального submit, независимой квитанции и массового драйвера для Яндекса
-пока **нет**. `form-audit` не откликается и не меняет профиль. После
-верификации отправки можно будет отдельно добавить guarded live-драйвер.
-
-## Быстрый старт
+## Общий пример
 
 ```bash
 cd /path/to/ApplyPilot
 python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m applypilot doctor
-
-# 1. Явные метки аккаунтов (без паролей и cookies).
 cp examples/sources.toml private/config/sources.toml
 
-# 2. Список источников и их возможностей.
-.venv/bin/python -m applypilot sources list
-
-# 3. Офлайн-проверка на сохранённых публичных HTML-образцах.
+# Обезличенные публичные fixtures
 .venv/bin/python -m applypilot sources scan --track default \
   --fixture-dir tests/fixtures/public --json
-
-# 4. Живой поиск всех включённых источников (без откликов).
-.venv/bin/python -m applypilot sources scan --track default --limit 100
-
-# При необходимости обогатить вакансии из сохранённых сообщений Getmatch
-# (публичные страницы, без нажатия кнопок @g_jobbot):
-.venv/bin/python -m applypilot sources scan --track default \
-  --source getmatch.ru --telegram-hints --request-budget 40 --details-limit 40
-
-# 5. Вход и проверка конкретного источника.
-.venv/bin/python -m applypilot sources login --source career.habr.com
-.venv/bin/python -m applypilot sources check --source career.habr.com
-
-# Read-only аудит форм Habr, в том числе обязательных полей и внешних ATS:
-.venv/bin/python -m applypilot sources form-audit --track default \
-  --source career.habr.com --view review --limit 100 --json
-
-# Отдельный проверенный Habr native-one-click, без отправки при обычном dry-run:
+.venv/bin/python -m applypilot sources list
 .venv/bin/python -m applypilot sources dispatch-plan \
-  --track default --source career.habr.com --json
-
-# Для реальных Habr откликов только после проверки профиля и APPROVED:
-# .venv/bin/python -m applypilot sources dispatch-apply --track default \
-#   --source career.habr.com --limit 1 --allow-live --enable-habr --visible
-
-# 6. Единая очередь и dry-run выбранного источника.
-.venv/bin/python -m applypilot sources status --track default
-.venv/bin/python -m applypilot queue list --track default --source getmatch.ru --view review
-.venv/bin/python -m applypilot sources plan --track default --source getmatch.ru
+  --track default --limit 20 --json
 ```
 
-## Source accounts
+Для работы с реальными вакансиями пользователь настраивает свой `private/config/`, не коммитя профили, cookies, идентификаторы аккаунтов, журналы и статусы откликов.
 
-`private/config/sources.toml` содержит только метки:
+## Состояния провайдера
 
-```toml
-[accounts]
-"hh.ru" = "hh-primary"
-"career.habr.com" = "habr-primary"
-"getmatch.ru" = "getmatch-primary"
-"geekjob.ru" = "geekjob-primary"
-"yandex.ru/jobs" = "yandex-primary"
-"dreamjob.ru" = "hh-primary"
-```
-
-Cookies и browser storage лежат отдельно:
-`private/data/providers/<source>/<account>/profile/` и `storage_state.json`.
-DreamJob не имеет собственного канала отклика: он разделяет HH identity и
-канал `hh.ru:<id>`.
-
-## Особенности AI-only скоринга
-
-Для `default` приоритет — практическая AI/LLM/agent разработка с удалёнкой
-из РФ. Явная основная работа по обучению фундаментальных моделей, а также
-`Worldwide Remote` с требованием уже переехать из России, помечаются
-`SKIP`. Для других треков эти ограничения не применяются.
-
-При обновлении скоринга `top` / `review` используют актуальные
-значения track score из SQLite, а не `review_lane` из старой сохранённой
-страницы. Старые подтверждённые отклики и ручные APPROVED сохраняются.
+`needs_live_validation` означает, что соответствующий маршрут отправки ещё не прошёл необходимую проверку. Этот статус не препятствует поиску и предварительному чтению карточек. Callback и native-формы допускаются к отправке только через проверенные драйверы и явный live-флаг.
 
 ## Рейтинг и review lanes
 
@@ -129,7 +49,7 @@ DreamJob не имеет собственного канала отклика: �
 - `APPLIED` — уже есть подтверждённый отклик.
 
 `top` показывает `FIT` и `GOOD_UNKNOWN`, `review` — все reviewable lanes без
-`SKIP`/`APPLIED`. Поэтому перспективная AI-вакансия с неизвестной зарплатой не
+`SKIP`/`APPLIED`. Поэтому вакансия с неизвестной зарплатой не
 исчезает из выдачи и не выдаётся за подтверждённый FIT.
 
 ## SQLite
@@ -167,13 +87,6 @@ success / already_applied — терминальны
 .venv/bin/python -m applypilot sources attempts --source career.habr.com
 ```
 
-## Ограничения live-этапа
+## Безопасность live-операций
 
-Поиск, нормализация, рейтинг, SQLite и dry-run проверены офлайн. Реальные
-формы откликов Habr/Getmatch/GeekJob/Яндекса требуют отдельного прохода с
-авторизованными сессиями. До этого:
-
-- `queue apply --run --source <non-hh>` отказывает;
-- admin показывает `needs_live_validation`;
-- DreamJob никогда не создаёт второй канал;
-- никакие расписания и фоновые watcher'ы не включаются.
+Поиск, рейтинг и dry-run не отправляют отклики. Изменяющие действия допускаются только по явно выбранному источнику и одобренной вакансии. Несоответствие анкеты или невозможность доказать результат отправки переводит попытку в `needs_manual` или `unknown`; автоматический повтор запрещён. Код не раскрывает локальные секреты и историю пользователя.
