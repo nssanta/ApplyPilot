@@ -146,11 +146,36 @@ Telegram-импорт и статус кликеров. Live-отправка и
 нативный one-click (`HabrPageDriver`), для Getmatch подтверждён
 callback официального Telegram-бота (`GetmatchCallbackDriver`).
 Оба доступны лишь через отдельные live-флаги и предварительные одобрения.
-GeekJob и Яндекс пока имеют `apply_status=needs_live_validation`.
+GeekJob имеет проверенную в браузере native-форму, но ещё **нет**
+подтверждённого реального POST/receipt; Яндекс тоже в `needs_live_validation`.
 
 ```bash
 applypilot accounts --help
 ```
+
+Для GeekJob в подтверждённом профиле доступны безопасная проверка форм
+и одиночный пилот, но **массовый кликер намеренно не включён**:
+
+```bash
+applypilot sources check --source geekjob.ru
+applypilot sources form-audit --track ai_core --source geekjob.ru \
+  --view review --limit 100 --json
+
+# Без POST: статус выбранной вакансии
+applypilot sources geekjob-pilot --track ai_core --id VACANCY_ID --json
+
+# Только для действительно подходящей вакансии, после APPROVED, READY_TO_APPLY
+# и сохранения отдельного письма:
+# private/data/providers/geekjob/geekjob-primary/letters/VACANCY_ID.txt
+# applypilot sources geekjob-pilot --track ai_core --id VACANCY_ID \
+#   --allow-live --confirm-id VACANCY_ID --visible
+```
+
+Этот live-пилот использует один опубликованный AI/LLM CV, заполняет письмо,
+проверяет удалёнку из РФ и запрещает повтор после UNKNOWN. Успех требует
+HTTP POST + запись с точным ID в GeekJob `/responses`; на реальных
+вакансиях такой receipt пока не подтверждён. Тесты браузера используют
+только синтетические страницы, без отправки работодателям.
 
 Для проверенного **нативного** сценария Habr Career доступны отдельный
 браузерный профиль и явное разрешение запуска:
