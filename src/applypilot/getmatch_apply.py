@@ -16,6 +16,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -30,6 +31,53 @@ from .telegram_client import (
     _run,
     message_to_dict,
 )
+
+
+def getmatch_profile_acceptance(
+    store: Store,
+    telegram_account: str = "getmatch-primary",
+    *,
+    max_age_days: int = 7,
+) -> dict[str, Any]:
+    """Require a recent official incoming /profile acceptance reply.
+
+    Acceptance, according to @g_jobbot, means this profile may send a
+    one-click application. Trust badges are a separate provider feature.
+    """
+    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+    messages = store.telegram_messages(telegram_account, 1000)
+    for item in messages:
+        if (str(item.get("chat") or "").casefold().lstrip("@") != "g_jobbot"
+                or item.get("outgoing") is not False):
+            continue
+        text = str(item.get("text") or "").casefold()
+        accepted = (
+            "ваш профиль принят" in text
+            and "можно откликаться на вакансии" in text
+        )
+        rejected = any(marker in text for marker in (
+            "профиль не принят", "профиль не прошёл верификацию",
+            "профиль не прошел верификацию",
+        ))
+        if not (accepted or rejected):
+            continue
+        stamp = str(item.get("sent_at") or "")
+        try:
+            sent = datetime.fromisoformat(stamp)
+            if sent.tzinfo is None:
+                sent = sent.replace(tzinfo=UTC)
+        except ValueError:
+            return {"status": "unverified", "reason": "bot acceptance timestamp invalid"}
+        if sent < cutoff:
+            return {"status": "stale", "reason": "repeat official /profile verification"}
+        if rejected:
+            return {"status": "not_accepted", "reason": "bot rejected candidate profile"}
+        return {
+            "status": "accepted", "source": BOT_USERNAME,
+            "message_id": int(item["message_id"]), "sent_at": stamp,
+            "reason": "bot confirms candidate profile can apply in one click",
+        }
+    return {"status": "unverified", "reason": "no recent incoming bot profile acceptance"}
 
 
 def _getmatch_url_matches(url: str, vacancy_id: str) -> bool:
@@ -248,6 +296,7 @@ def plan_getmatch_pilot(
         vacancy["review_state"] == "APPROVED"
         and vacancy["application_state"] == "READY_TO_APPLY"
     )
+    profile_status = getmatch_profile_acceptance(store, telegram_account)
     for message in store.telegram_messages(telegram_account, 1000):
         if (str(message.get("chat") or "").casefold().lstrip("@") != "g_jobbot"
                 or message.get("outgoing") is not False):
@@ -265,12 +314,21 @@ def plan_getmatch_pilot(
         callback_hash = str(buttons[index].get("callback_sha256") or "")
         if len(callback_hash) != 16:
             continue
+        ready = approved and profile_status["status"] == "accepted"
+        status = (
+            "ready_for_single_live_pilot" if ready else
+            "needs_profile_acceptance" if profile_status["status"] != "accepted"
+            else "needs_approval"
+        )
         return {
-            **result,
-            "status": "ready_for_single_live_pilot" if approved else "needs_approval",
+            **result, "status": status,
+            "profile_acceptance": profile_status,
             "reason": (
-                "exact approved vacancy and official bot apply callback found"
-                if approved else "callback present; owner must approve this vacancy first"
+                "exact approved vacancy, accepted profile, official apply callback found"
+                if ready else
+                "official bot profile acceptance must be refreshed"
+                if profile_status["status"] != "accepted"
+                else "callback present; owner must approve this vacancy first"
             ),
             "message_id": int(message["message_id"]),
             "button_index": index,

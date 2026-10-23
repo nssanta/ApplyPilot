@@ -39,13 +39,19 @@ export APPLYPILOT_HH_REDIRECT_URI=http://localhost:8765/callback
 
 ## Getmatch — синхронизация и проверка одиночного отклика
 
-Сначала нужно убедиться, что профиль кандидата **прошёл верификацию Getmatch**
+Сначала нужно убедиться, что профиль кандидата **принят Getmatch**
 и открыт для необходимых работодателей. Наличие резюме и Telegram-сессии
 само по себе **не доказывает** доставку откликов компаниям.
+Штатная команда `/profile` в @g_jobbot показывает статус: в ответе
+**«Ваш профиль принят» / «С ним можно откликаться на вакансии в один клик»**
+ApplyPilot видит доказательство допуска. Live-пилот требует свежего
+подтверждения от бота не старше 7 суток; после изменения профиля статус
+нужно проверить ещё раз и повторно синхронизировать Telegram.
 
 ```bash
 # Получить последние 500 сообщений, обогатить и пересчитать вакансии.
 applypilot accounts telegram-status --online
+# В официальном @g_jobbot: /profile (только чтение статуса)
 applypilot accounts telegram-sync --limit 500
 applypilot accounts telegram-import --track ai_core --limit 500
 applypilot sources scan --track ai_core --source getmatch.ru \

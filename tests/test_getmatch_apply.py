@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from applypilot.getmatch_apply import execute_getmatch_pilot, plan_getmatch_pilot
+from applypilot.getmatch_apply import (
+    execute_getmatch_pilot,
+    getmatch_profile_acceptance,
+    plan_getmatch_pilot,
+)
 from applypilot.storage import Store
 from applypilot.telegram_client import LiveActionDisabled
 
@@ -35,6 +40,13 @@ def seeded(tmp_path: Path, *, approved: bool = True,
              "pass", "unknown", "APPROVED" if approved else "UNREVIEWED", stamp),
         )
     store.save_telegram_messages("getmatch-primary", [{
+        "message_id": 101,
+        "chat": "@g_jobbot", "outgoing": False,
+        "text": "**Ваш профиль принят**🤘\nС ним можно откликаться на вакансии в один клик",
+        "sent_at": datetime.now(UTC).isoformat(),
+        "buttons": [], "vacancy_refs": [], "application_likely": False,
+        "has_callback": False,
+    }, {
         "message_id": 100,
         "chat": "@g_jobbot", "outgoing": outgoing,
         "text": "LLM Developer https://getmatch.ru/vacancies/35881",
@@ -155,3 +167,26 @@ def test_getmatch_pilot_rejects_invalid_success_receipt(
     )
     assert result["status"] == "unknown"
     assert store.source_attempts("getmatch-primary", "getmatch.ru")[0]["status"] == "unknown"
+
+
+def test_pilot_blocks_when_official_profile_acceptance_missing(tmp_path: Path) -> None:
+    store = seeded(tmp_path)
+    with store.connect() as conn:
+        conn.execute("DELETE FROM telegram_messages WHERE message_id=101")
+    assert getmatch_profile_acceptance(store)["status"] == "unverified"
+    assert plan_getmatch_pilot(store, "35881")["status"] == "needs_profile_acceptance"
+
+
+def test_pilot_rejects_stale_and_incoming_untrusted_acceptance(tmp_path: Path) -> None:
+    store = seeded(tmp_path)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE telegram_messages SET sent_at=? WHERE message_id=101",
+            ((datetime.now(UTC) - timedelta(days=8)).isoformat(),),
+        )
+    assert getmatch_profile_acceptance(store)["status"] == "stale"
+    assert plan_getmatch_pilot(store, "35881")["status"] == "needs_profile_acceptance"
+    with store.connect() as conn:
+        conn.execute("UPDATE telegram_messages SET sent_at=?,outgoing=1 WHERE message_id=101",
+                     (datetime.now(UTC).isoformat(),))
+    assert getmatch_profile_acceptance(store)["status"] == "unverified"
