@@ -58,11 +58,21 @@ cp examples/sources.toml private/config/sources.toml
 `needs_live_validation`. DreamJob — зеркало HH без второго отклика.
 По умолчанию `dispatch-apply` всегда dry-run.
 
-Сохранённые сообщения `@g_jobbot` связываются с очередью без повторного логина:
+Сохранённые сообщения `@g_jobbot` связываются с очередью без повторного логина.
+Getmatch умеет отдельно читать подтверждённые прошлые отклики и проводить
+строго одиночную проверку Telegram-кнопки без отправки:
 
 ```bash
-.venv/bin/python -m applypilot accounts telegram-import --track default --json
+.venv/bin/python -m applypilot accounts telegram-sync --limit 500
+.venv/bin/python -m applypilot accounts telegram-import --track default --limit 500
+.venv/bin/python -m applypilot accounts telegram-reconcile --track default --limit 500
+.venv/bin/python -m applypilot accounts telegram-pilot --track default \
+  --id VACANCY_ID --probe-live --json
 ```
+
+Для реального одиночного пилота нужен отдельно подтверждённый профиль
+кандидата, APPROVED в очереди, точный ID и явное live-разрешение.
+Массовый Getmatch-кликер пока не прошёл реальную валидацию отправки.
 
 Нативный Habr-кликер проверен одним реальным откликом с HTTP 200, сообщением
 «Отклик отправлен» и точным совпадением ID в /responses. Для него доступен

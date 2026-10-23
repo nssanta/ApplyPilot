@@ -11,7 +11,7 @@
 | `hh.ru` | да, legacy `run campaign` | да | HH-профиль | проверенный legacy runner |
 | `career.habr.com` | да, список + пагинация | да, приоритетно | отдельный профиль | подтверждённый native one-click, только через CLI live opt-in |
 | `geekjob.ru` | да, `/vacancies` + `/vacancies/2` | да, приоритетно | отдельный профиль | `needs_live_validation` |
-| `getmatch.ru` | да, публичный sitemap + delta | да, JSON-LD | отдельный профиль | `needs_live_validation` |
+| `getmatch.ru` | да, sitemap + Telegram-ссылки + delta | да, JSON-LD | локальная Telegram MTProto-сессия | одиночный guarded pilot, массовая отправка `needs_live_validation` |
 | `yandex.ru/jobs` | да, подтверждённые remote/GenAI URL | да | отдельный профиль | `needs_live_validation` |
 | `dreamjob.ru` | да, company listing | да | без логина | `mirror_only`, канал HH |
 

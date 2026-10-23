@@ -37,6 +37,52 @@ export APPLYPILOT_HH_CLIENT_SECRET=...
 export APPLYPILOT_HH_REDIRECT_URI=http://localhost:8765/callback
 ```
 
+## Getmatch — синхронизация и проверка одиночного отклика
+
+Сначала нужно убедиться, что профиль кандидата **прошёл верификацию Getmatch**
+и открыт для необходимых работодателей. Наличие резюме и Telegram-сессии
+само по себе **не доказывает** доставку откликов компаниям.
+
+```bash
+# Получить последние 500 сообщений, обогатить и пересчитать вакансии.
+applypilot accounts telegram-status --online
+applypilot accounts telegram-sync --limit 500
+applypilot accounts telegram-import --track ai_core --limit 500
+applypilot sources scan --track ai_core --source getmatch.ru \
+  --telegram-hints --details-limit 80 --request-budget 85
+
+# Сверить подтверждённые прошлые отклики по официальным входящим сообщениям.
+# Это не создаёт новых откликов и не меняет неподтверждённые записи.
+applypilot accounts telegram-reconcile --track ai_core --limit 500
+applypilot accounts telegram-plan --track ai_core --limit 500 --json
+
+# Одна конкретная вакансия: показывает статус и проверяет живую
+# кнопку/отпечаток callback, НИЧЕГО не отправляет.
+applypilot accounts telegram-pilot --track ai_core --id VACANCY_ID \
+  --probe-live --json
+```
+
+Только после проверки профиля, источника и пригодности конкретной вакансии
+владелец может одобрить её. Одиночный live-пилот требует трёх независимых
+действий: `APPROVED` в источниковой очереди, точного `--confirm-id` и
+`APPLYPILOT_TELEGRAM_LIVE=1` вместе с `--allow-live`.
+
+```bash
+# Пример после самостоятельного решения владельца:
+applypilot sources approve-batch --track ai_core --source getmatch.ru \
+  --id VACANCY_ID --state APPROVED --reason 'Подходящая AI/LLM-вакансия'
+
+APPLYPILOT_TELEGRAM_LIVE=1 applypilot accounts telegram-pilot \
+  --track ai_core --id VACANCY_ID --allow-live --confirm-id VACANCY_ID
+```
+
+**Это реальная отправка и не dry-run.** До проверки первого живого пилота
+не запускать массовую отправку через Getmatch. При отсутствии подтверждения
+от официального бота с точным ID вакансия попадает в `UNKNOWN`; повтор
+запрещён. Кнопки выбора страны и отклики на `SKIP` не допускаются.
+`telegram-reconcile` использует только входящие подтверждения, а не
+непроверенные сообщения или один факт нажатия callback.
+
 ## Telegram MTProto для @g_jobbot
 
 1. Создайте приложение на <https://my.telegram.org> → API development tools.
