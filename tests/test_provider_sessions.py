@@ -453,3 +453,29 @@ def test_habr_hidden_dom_without_logout_does_not_confirm(tmp_path: Path) -> None
     manager, _context, _ = manager_with_context(tmp_path, page)
     write_state(manager)
     assert manager.check("career.habr.com")["status"] == SessionStatus.UNKNOWN.value
+
+
+def test_yandex_confirmed_resume_attachment_and_edit_control(tmp_path: Path) -> None:
+    page = FakePage("https://yandex.ru/jobs/profile", "Профиль Файл резюме Редактировать")
+    observed: list[str] = []
+
+    def evaluate(script: str) -> bool:
+        observed.append(script)
+        return "location.pathname !== '/jobs/profile'" in script and "/attachments/" in script
+
+    page.evaluate = evaluate
+    manager, context, _ = manager_with_context(tmp_path, page)
+    write_state(manager, source="yandex")
+    result = manager.check("yandex.ru/jobs")
+    assert result["status"] == SessionStatus.CONFIRMED.value
+    assert result["detail"] == "Яндекс Карьера account controls verified"
+    assert observed
+    assert context.closed
+
+
+def test_yandex_unproven_profile_remains_unknown(tmp_path: Path) -> None:
+    page = FakePage("https://yandex.ru/jobs/profile", "Вакансии Все вакансии")
+    page.evaluate = lambda script: False
+    manager, _context, _ = manager_with_context(tmp_path, page)
+    write_state(manager, source="yandex")
+    assert manager.check("yandex.ru/jobs")["status"] == SessionStatus.UNKNOWN.value

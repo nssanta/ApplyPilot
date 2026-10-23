@@ -304,6 +304,25 @@ HABR_ACCOUNT_DOM_PROOF = """() => {
 }"""
 
 
+# Yandex Career /jobs/profile renders an authenticated resume attachment
+# and an account-only edit control, but does not show a generic "Выйти" label.
+# Require both DOM indicators on the exact profile path, avoiding login
+# misclassification based on generic words from a job description.
+YANDEX_CAREER_DOM_PROOF = """() => {
+  if (location.hostname !== 'yandex.ru' || location.pathname !== '/jobs/profile') return false;
+  const attachment = [...document.querySelectorAll('a[href]')].some(a => {
+    try {
+      const u = new URL(a.href, location.href);
+      return u.protocol === 'https:' && u.pathname.startsWith('/attachments/') && (u.origin === location.origin || u.hostname.endsWith('.yandex.net'));
+    } catch { return false; }
+  });
+  const edit = [...document.querySelectorAll('button')].some(b =>
+    (b.textContent || '').trim().toLowerCase().includes('редактировать')
+  );
+  return attachment && edit;
+}"""
+
+
 def classify_provider_page(
     config: ProviderSessionConfig, url: str, body: str
 ) -> tuple[SessionStatus, str]:
@@ -823,27 +842,35 @@ class ProviderSessionManager:
                         status, _detail = classify_provider_page(
                             config, getattr(page, "url", config.check_url), body
                         )
-                        if status == SessionStatus.UNKNOWN and config.source == "habr":
-                            # Habr's personal menu is hidden until opened; the
-                            # visible body text alone cannot establish login.
+                        if status == SessionStatus.UNKNOWN and config.source in {"habr", "yandex"}:
+                            # Some providers render confirmed applicant controls
+                            # without generic sign-out text in the visible body.
+                            probe = (
+                                HABR_ACCOUNT_DOM_PROOF if config.source == "habr"
+                                else YANDEX_CAREER_DOM_PROOF
+                            )
                             evaluate = getattr(page, "evaluate", None)
                             if callable(evaluate):
                                 try:
-                                    proved = bool(evaluate(HABR_ACCOUNT_DOM_PROOF))
+                                    proved = bool(evaluate(probe))
                                     if not proved and callable(getattr(page, "wait_for_function", None)):
                                         try:
-                                            page.wait_for_function(HABR_ACCOUNT_DOM_PROOF, timeout=2000)
+                                            page.wait_for_function(probe, timeout=2000)
                                         except Exception as exc:  # noqa: BLE001
                                             LOGGER.debug(
-                                                "Habr account controls were not ready: %s",
-                                                type(exc).__name__,
+                                                "%s profile proof was not ready: %s",
+                                                config.source, type(exc).__name__,
                                             )
-                                        proved = bool(evaluate(HABR_ACCOUNT_DOM_PROOF))
+                                        proved = bool(evaluate(probe))
                                     if proved:
                                         status = SessionStatus.CONFIRMED
-                                        _detail = "Habr account controls verified"
+                                        _detail = (
+                                            "Habr account controls verified"
+                                            if config.source == "habr"
+                                            else f"{config.label} account controls verified"
+                                        )
                                 except Exception:
-                                    LOGGER.debug("Habr DOM auth check failed", exc_info=True)
+                                    LOGGER.debug("%s DOM auth check failed", config.source, exc_info=True)
                         return self._result(
                             config,
                             account_id,
