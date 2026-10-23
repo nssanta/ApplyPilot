@@ -1,92 +1,80 @@
-# ApplyPilot Multi-Source
+# ApplyPilot — Multi-Source
 
-Источники вакансий подключаются независимо и используют общие схемы нормализации, скоринга, review и журналирования. Документ описывает **возможности приложения**, а не чьи-либо авторизованные аккаунты, заявки или персональные настройки.
+Каждый источник предоставляет независимый поиск и, когда поддерживается, отдельный драйвер отклика. Центральный слой объединяет карточки, рейтинг, review-очередь и SQLite-журнал, не смешивая вакансии разных платформ.
 
 ## Матрица возможностей
 
-| Источник | Поиск и детали | Механизм отклика | Ограничение |
-|---|---|---|---|
-| `hh.ru` | публичный поиск и детали | Chrome/Playwright runner | требуется пользовательская авторизация для отклика |
-| `career.habr.com` | каталог и детали | native one-click с явным live opt-in | внешние ATS/анкеты отдельно |
-| `getmatch.ru` | sitemap, публичные детали и Telegram-ссылки | guarded Telegram callback с явным live opt-in | только callback официального бота и принятый профиль |
-| `geekjob.ru` | каталог и детали | read-only проверка native-формы и single-vacancy pilot | массовая отправка без подтверждения не активна |
-| `yandex.ru/jobs` | каталог/детали | read-only form audit | submit без отдельного подтверждения не активен |
-| `dreamjob.ru` | listings и зеркала | read-only HH mirror | второй отклик по зеркалу не создаётся |
+| Площадка | Discovery | Отклик |
+|---|---|---|
+| `hh.ru` | Поиск и загрузка деталей | Браузерный HH runner |
+| `career.habr.com` | Каталог, карточки, form-audit | Нативный one-click при opt-in |
+| `getmatch.ru` | Sitemap, Telegram-ссылки, инкрементальная загрузка | Callback через официальный бот при opt-in |
+| `geekjob.ru` | Каталог, карточки, form-audit | Ограниченный пилот; не массовая отправка |
+| `yandex.ru/jobs` | Вакансии и read-only анкеты | Отправка не подтверждена |
+| `dreamjob.ru` | Каталог компаний | Только `mirror_only` без второго отклика |
 
-Авторизация и состояние аккаунтов хранятся локально, вне Git. Записи `UNKNOWN` блокируют слепую повторную отправку.
+Матрица описывает **реализованные компоненты**, а не какие-либо реальные профили, проверки кандидата или историю найма.
 
-## Общий пример
+## Безопасный запуск
 
-```bash
-cd /path/to/ApplyPilot
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-cp examples/sources.toml private/config/sources.toml
+~~~bash
+# Публичные синтетические fixtures, не требуют аккаунтов
+.venv/bin/python -m applypilot sources scan \
+  --track default --fixture-dir tests/fixtures/public --json
 
-# Обезличенные публичные fixtures
-.venv/bin/python -m applypilot sources scan --track default \
-  --fixture-dir tests/fixtures/public --json
-.venv/bin/python -m applypilot sources list
+# Живой поиск без отправки
+.venv/bin/python -m applypilot sources scan --track default --limit 50
+
+# Просмотр и dry-run выбранных записей
+.venv/bin/python -m applypilot sources status --track default
 .venv/bin/python -m applypilot sources dispatch-plan \
-  --track default --limit 20 --json
-```
+  --track default --limit 50 --json
 
-Для работы с реальными вакансиями пользователь настраивает свой `private/config/`, не коммитя профили, cookies, идентификаторы аккаунтов, журналы и статусы откликов.
+# Аудит форм без отправки
+.venv/bin/python -m applypilot sources form-audit \
+  --track default --source career.habr.com --view review --limit 10 --json
+~~~
 
-## Состояния провайдера
+В индивидуальном `private/config/sources.toml` задаются лишь метки аккаунтов. Сами cookies, токены, профили браузера, отклики и снимки не входят в публичный репозиторий. Реальные параметры поиска задаются отдельно.
 
-`needs_live_validation` означает, что соответствующий маршрут отправки ещё не прошёл необходимую проверку. Этот статус не препятствует поиску и предварительному чтению карточек. Callback и native-формы допускаются к отправке только через проверенные драйверы и явный live-флаг.
+## Скоринг и review
 
-## Рейтинг и review lanes
+- `FIT` — совпадение роли и подтверждённых условий.
+- `GOOD_UNKNOWN` — роль подходит, но условия требуют уточнения.
+- `NEEDS_ENRICHMENT` — данных пока недостаточно.
+- `MANUAL_REVIEW` — требуется участие оператора.
+- `SKIP` — обнаружено несоответствие.
+- `APPLIED` — отклик уже учтён по истории источника.
 
-Каждая запись получает `review_lane`:
+`TOP` и `review` используют актуальную оценку трека из SQLite, а не старую метку HTML-снимка. Порог зарплаты, допустимая география, опыт и другие условия принадлежат локальному профилю пользователя, а не публичной документации.
 
-- `FIT` — роль и условия подтверждены;
-- `GOOD_UNKNOWN` — роль/стек прошли, но зарплата, дата или remote не подтверждены;
-- `NEEDS_ENRICHMENT` — не хватает описания/деталей;
-- `MANUAL_REVIEW` — требует ручного разбора;
-- `SKIP` — жёсткое несоответствие;
-- `APPLIED` — уже есть подтверждённый отклик.
+Решение `APPROVED` не эквивалентно `FIT`: оно требует отдельного осознанного действия для конкретной вакансии.
 
-`top` показывает `FIT` и `GOOD_UNKNOWN`, `review` — все reviewable lanes без
-`SKIP`/`APPLIED`. Поэтому вакансия с неизвестной зарплатой не
-исчезает из выдачи и не выдаётся за подтверждённый FIT.
+## Source-aware хранилище
 
-## SQLite
+- `vacancies` — нормализованные записи по `(account, source, vacancy_id)`;
+- `vacancy_track_scores` — независимые оценки по трекам;
+- `vacancy_links` — канонический канал, mirror и внешний ATS;
+- `source_application_attempts` — состояния откликов;
+- `source_reservations` и `channel_reservations` — блокировка конкурентной отправки.
 
-Source-aware таблицы:
+Ключ канала предотвращает дубли между источниками, ведущими в одну внешнюю форму. DreamJob может зеркалировать HH и не создаёт нового канала.
 
-- `vacancies` — нормализованные размещения, уникальны по `(account, source, vacancy_id)`;
-- `vacancy_links` — группа роли, канал, ATS/mirror и снимок duplicate-флагов;
-- `source_application_attempts` — история попыток по источнику/аккаунту/каналу;
-- `source_reservations` и `channel_reservations` — транзитные writer-locks.
+Пример жизненного цикла:
 
-Канал (`channel_key`) — единица защиты от дублей. Один ATS-URL блокируется для
-всех площадок; нативные формы HH и Habr остаются разными каналами. DreamJob
-использует `hh.ru:<id>`, поэтому повторный отклик через зеркало невозможен.
+~~~text
+prepared -> submitting -> success
+                      -> unknown (карантин, без автоматического повтора)
+                      -> failed_before_submit
+                      -> needs_manual
+~~~
 
-### State machine
+`reconcile` требует независимого подтверждения провайдера, а `recover` не повторяет потенциально выполненные действия вслепую.
 
-```
-None -> submitting -> success
-                   -> unknown -> (reconcile with evidence) -> success
-                   -> failed_before_submit -> submitting
-                   -> needs_manual
-success / already_applied — терминальны
-```
+## Границы Live
 
-`unknown` — карантин: автоматический retry запрещён. `reconcile` требует
-непустое evidence. `recover` переводит зависшие `submitting` в `unknown` и
-освобождает locks, не повторяя отправку вслепую.
+`scan`, `inspect`, `form-audit` и `dispatch-plan` — read-only или dry-run. Драйвер может отправлять заявки только при наличии разрешённой авторизованной сессии, источникового `APPROVED`, готового состояния вакансии и явного live-режима.
 
-```bash
-.venv/bin/python -m applypilot sources recover --max-age-seconds 900
-.venv/bin/python -m applypilot sources reconcile --track default \
-  --source career.habr.com --id 123 --channel career.habr.com:123 \
-  --evidence 'страница истории откликов показывает заявку'
-.venv/bin/python -m applypilot sources attempts --source career.habr.com
-```
+Нативная форма, Telegram callback, WebView и внешняя ATS — разные способы подачи. Успех одного способа не подтверждает остальные. Результат отправки должен сверяться с историей или квитанцией самого источника.
 
-## Безопасность live-операций
-
-Поиск, рейтинг и dry-run не отправляют отклики. Изменяющие действия допускаются только по явно выбранному источнику и одобренной вакансии. Несоответствие анкеты или невозможность доказать результат отправки переводит попытку в `needs_manual` или `unknown`; автоматический повтор запрещён. Код не раскрывает локальные секреты и историю пользователя.
+См. [быстрый старт](QUICKSTART.md), [аккаунты](ACCOUNTS.md) и [архитектуру](ARCHITECTURE.md).
