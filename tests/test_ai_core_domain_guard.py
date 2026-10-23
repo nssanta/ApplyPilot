@@ -92,3 +92,33 @@ def test_review_view_uses_live_score_instead_of_cached_fit_lane(tmp_path: Path) 
     assert not store.list_campaign_vacancies(
         "default", "ai_core", "review", 20, source="getmatch.ru",
     )
+
+
+def test_geekjob_mad_devs_explicit_location_exclusion_trumps_remote_badge() -> None:
+    raw = {
+        "id": "6ac37fb023481b12a406c4a5",
+        "name": "Applied AI / LLM Engineer (Python)",
+        "description": (
+            "LLM pipelines, agents, RAG, and production Python. "
+            "Location: any, except Russia and Belarus."
+        ),
+        "is_remote": True, "area": "Бишкек, Кыргызстан",
+        "published": "2026-10-05T12:00:00+00:00",
+    }
+    scored = _score(raw, "ai_core")
+    assert scored["filter_status"] == "reject"
+    assert "geo:remote_excludes_russia" in scored["filter_reasons"]
+
+
+def test_regular_remote_from_russia_never_trips_geographic_exclusion() -> None:
+    raw = {
+        "id": "geography-positive",
+        "name": "Python LLM Engineer",
+        "description": (
+            "Location: Russia. Remote worldwide, including Russia. "
+            "Building APIs, RAG and LLM agents."
+        ),
+        "is_remote": True, "area": "Россия",
+    }
+    scored = _score(raw, "ai_core")
+    assert "geo:remote_excludes_russia" not in scored["filter_reasons"]

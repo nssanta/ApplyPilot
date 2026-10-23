@@ -319,6 +319,20 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
             ):
                 filter_status = "reject"
                 filter_reasons.append("geo:requires_relocation_from_russia")
+            # Some job listings advertise 'Remote' in their header while the
+            # actual description explicitly excludes applicants in Russia.
+            # Job eligibility comes from that detailed condition, not the badge.
+            if re.search(
+                r"(?:location\s*:\s*any\s*,?\s*except\s+(?:russia|russian federation)|"
+                r"(?:location|candidates|applicants)\s*:\s*[^.\n]{0,90}"
+                r"(?:except|excluding)\s+(?:russia|russian federation)|"
+                r"(?:remote|work|location)\s+[^.\n]{0,90}"
+                r"(?:except|excluding)\s+(?:russia|russian federation)|"
+                r"удал[её]нн[^.\n]{0,80}(?:кроме|за исключением)\s+(?:рф|росси))",
+                description,
+            ):
+                filter_status = "reject"
+                filter_reasons.append("geo:remote_excludes_russia")
         item["filter_status"] = filter_status
         item["filter_reasons"] = list(dict.fromkeys(filter_reasons))
         item["filter_fields"] = list(filter_result.fields)
