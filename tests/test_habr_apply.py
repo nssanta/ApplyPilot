@@ -99,6 +99,7 @@ class StubHabrPage:
         self.url = ""
         self.click_count = 0
         self.listeners: dict[str, list] = {"request": [], "response": []}
+        self.routes: list[tuple[str, object]] = []
         self.closed = False
         self.visited: list[str] = []
 
@@ -123,6 +124,9 @@ class StubHabrPage:
 
     def on(self, event: str, callback) -> None:
         self.listeners[event].append(callback)
+
+    def route(self, pattern: str, handler) -> None:
+        self.routes.append((pattern, handler))
 
     def remove_listener(self, event: str, callback) -> None:
         self.listeners[event].remove(callback)
@@ -192,6 +196,7 @@ def test_habr_driver_checks_approval_and_closes_browser_page() -> None:
     driver = HabrPageDriver(lambda: page)
     assert driver.submit_verified
     assert driver.preflight(ROW).status == "ready"
+    assert page.routes and page.routes[0][0] == "**/*"
     assert driver.preflight({**ROW, "application_state": "NEEDS_FORM"}).status == "needs_manual"
     result = driver.apply(ROW)
     assert result.status == "success"
@@ -334,7 +339,9 @@ def test_habr_multi_job_dispatch_pauses_after_unknown(tmp_path, monkeypatch) -> 
 
     def simulated_apply(page, row, **kwargs):
         if row["id"] == ids[0]:
-            return ApplyOutcome("success", "confirmed", receipt={"id": "receipt-1"})
+            return ApplyOutcome("success", "confirmed", receipt={"provider": "career.habr.com", "vacancy_id": row["id"],
+                    "post_status": 200, "verified_history": True,
+                    "post_path": f"/api/frontend/vacancies/{row['id']}/responses"})
         return ApplyOutcome("unknown", "after click, confirmation missing")
 
     monkeypatch.setattr("applypilot.habr_apply.apply_habr_page", simulated_apply)
@@ -354,7 +361,10 @@ def test_habr_multi_job_dispatch_pauses_after_unknown(tmp_path, monkeypatch) -> 
     assert result["summary"] == {
         "success": 1, "unknown": 1, "needs_manual": 1,
     }
-    assert len(pages) == 2
+    # All three candidates were checked read-only before the first submit;
+    # only two pages were then opened for actual application attempts.
+    assert len(pages) == 5
+    assert all(page.routes for page in pages[:3])
     assert all(page.closed for page in pages)
     attempts = {item["vacancy_id"]: item["status"] for item in store.source_attempts(
         "habr-primary", "career.habr.com",

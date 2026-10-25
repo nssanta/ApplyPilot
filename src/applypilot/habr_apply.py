@@ -80,6 +80,9 @@ def inspect_habr_page(
         body = page.locator("body").inner_text(timeout=7000)
         if "отклик отправлен" in body.casefold():
             return {**result, "status": "already_applied_on_site"}
+        expected_title = str(row.get("name") or "").strip()
+        if not expected_title or expected_title.casefold() not in body.casefold():
+            return {**result, "status": "title_mismatch"}
         # Similar vacancies can mention remote work even if the target role
         # is office-only; trust only the current vacancy header's chips.
         header = page.locator(".vacancy-header")
@@ -288,6 +291,29 @@ class HabrPageDriver:
             return ApplyOutcome("needs_manual", "Habr vacancy not approved or ready")
         if row.get("channel_type") == "external_ats":
             return ApplyOutcome("needs_manual", "external ATS requires a separate verified driver")
+        page = self.page_factory()
+        try:
+            route = getattr(page, "route", None)
+            if not callable(route):
+                return ApplyOutcome("needs_manual", "read-only Habr preflight cannot block writes")
+
+            def read_only(route_handler: Any) -> None:
+                if route_handler.request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+                    route_handler.continue_()
+                else:
+                    route_handler.abort()
+
+            route("**/*", read_only)
+            inspection = inspect_habr_page(page, row, timeout_ms=self.timeout_ms)
+        finally:
+            close = getattr(page, "close", None)
+            if callable(close):
+                close()
+        if inspection.get("status") != "native_ready_for_approval":
+            return ApplyOutcome(
+                "needs_manual",
+                f"Habr source preflight: {inspection.get('status') or 'unknown'!s}",
+            )
         return ApplyOutcome("ready")
 
     def apply(self, row: Mapping[str, Any]) -> ApplyOutcome:

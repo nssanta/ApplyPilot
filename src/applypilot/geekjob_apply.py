@@ -9,6 +9,7 @@ vacancy, exact resume selection and a supplied per-vacancy cover letter.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,6 @@ SOURCE = "geekjob.ru"
 ACCOUNT_HOSTS = {"geekjob.ru", "my.geekjob.ru"}
 HISTORY_URL = "https://my.geekjob.ru/responses"
 ID_PATTERN = re.compile(r"^/vacancy/([0-9a-fA-F]{24})/?$")
-RESUME_NAME = "AI/LLM Engineer / AI Agent Engineer"
 
 def vacancy_id(url: str) -> str:
     parsed = urlparse(str(url or ""))
@@ -43,6 +43,9 @@ def _history_contains(page: Any, vid: str, timeout_ms: int) -> bool:
 def _load_form(page: Any, row: Mapping[str, Any], timeout_ms: int) -> dict[str, Any]:
     vid = str(row.get("id") or "")
     url = str(row.get("url") or "")
+    expected_resume = str(row.get("resume") or "").strip()
+    if not expected_resume:
+        return {"status": "resume_not_configured"}
     if not vid or vacancy_id(url) != vid.lower():
         return {"status": "invalid_id_or_url"}
     response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -79,7 +82,7 @@ def _load_form(page: Any, row: Mapping[str, Any], timeout_ms: int) -> dict[str, 
         return {"status": "form_ambiguous"}
     selected = form.locator("#mycvlist")
     options = selected.locator("option").all_inner_texts()
-    matches = [i for i, name in enumerate(options) if name.strip() == RESUME_NAME]
+    matches = [i for i, name in enumerate(options) if name.strip() == expected_resume]
     if len(matches) != 1:
         return {"status": "resume_missing_or_ambiguous", "resume_count": len(options)}
     extra = form.locator("input:visible,textarea:visible,select:visible")
@@ -94,7 +97,7 @@ def _load_form(page: Any, row: Mapping[str, Any], timeout_ms: int) -> dict[str, 
         return {"status": "submit_unavailable"}
     if not re.search("откликнуться", submit.first.inner_text(), re.IGNORECASE):
         return {"status": "unexpected_submit"}
-    return {"status": "native_form", "selected_resume": RESUME_NAME,
+    return {"status": "native_form", "selected_resume": expected_resume,
             "resume_option_index": matches[0], "letter_required": True,
             "remote_verified": True, "fields": ["mycvlist", "respond-text"]}
 
@@ -158,6 +161,7 @@ def apply_geekjob_page(page: Any, row: Mapping[str, Any], letter: str, *,
                                 evidence=f"{HISTORY_URL} vacancy={vid}",
                                 receipt={"provider": SOURCE, "vacancy_id": vid,
                                          "post_paths": [x[0] for x in posts],
+                                         "post_statuses": [x[1] for x in posts],
                                          "history_verified": True})
         return ApplyOutcome("unknown", "GeekJob submit clicked; exact history + POST receipt not confirmed")
     except Exception as exc:  # noqa: BLE001 - clicked but uncertain must never retry
@@ -184,6 +188,7 @@ class GeekJobPageDriver:
         self.letter_dir = Path(letter_dir)
         self.min_interval_seconds = float(min_interval_seconds)
         self._paused = False
+        self._last_started: float | None = None
 
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome:
         vid = str(row.get("id") or "")
@@ -204,6 +209,11 @@ class GeekJobPageDriver:
         if check.status != "ready":
             return check
         text = (self.letter_dir / f"{vid}.txt").read_text(encoding="utf-8")
+        if self._last_started is not None:
+            remaining = self.min_interval_seconds - (time.monotonic() - self._last_started)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_started = time.monotonic()
         page = self.page_factory()
         try:
             result = apply_geekjob_page(page, row, text)

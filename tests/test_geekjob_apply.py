@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-from playwright.sync_api import sync_playwright
+
+playwright_api = pytest.importorskip("playwright.sync_api")
+sync_playwright = playwright_api.sync_playwright
 
 from applypilot.geekjob_apply import (
     apply_geekjob_page,
@@ -27,6 +29,7 @@ ROW = {
     "score": 77,
     "review_state": "APPROVED",
     "application_state": "READY_TO_APPLY",
+    "resume": "Example AI Engineer",
 }
 LETTER = "Здравствуйте! Разрабатываю AI/LLM-сервисы на Python, интегрирую API и агентные инструменты. Буду рад обсудить задачу."
 
@@ -48,7 +51,7 @@ class BrowserScenario:
             desc += " Удалённо кроме РФ."
         form = ""
         if self.show_form:
-            cv = ('<option value="0">AI/LLM Engineer / AI Agent Engineer</option>'
+            cv = ('<option value="0">Example AI Engineer</option>'
                   if self.has_cv else "<option>Other resume</option>")
             additional = '<input id="secret-question" required>' if self.extra_question else ""
             form = f"""<form>
@@ -90,7 +93,12 @@ class BrowserScenario:
 @pytest.fixture()
 def page_with_scenario():
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome",headless=True)
+        try:
+            browser = p.chromium.launch(channel="chrome",headless=True)
+        except playwright_api.Error as exc:
+            if "is not found" in str(exc) or "Executable doesn't exist" in str(exc):
+                pytest.skip("optional Google Chrome browser is not installed")
+            raise
         ctx = browser.new_context()
         created = []
         def factory(scenario: BrowserScenario):
@@ -108,7 +116,7 @@ def test_geekjob_readonly_inspector_finds_actual_form(page_with_scenario) -> Non
     page = page_with_scenario(scene)
     result = inspect_geekjob_page(page, ROW)
     assert result["status"] == "native_form"
-    assert result["selected_resume"] == "AI/LLM Engineer / AI Agent Engineer"
+    assert result["selected_resume"] == "Example AI Engineer"
     assert result["letter_required"] is True
     assert scene.post_count == 0
 
@@ -174,3 +182,10 @@ def test_only_canonical_24_digit_hex_vacancy_ids_allowed() -> None:
                 "https://geekjob.ru/vacancy/notanid",
                 "https://geekjob.ru/vacancy/" + VID + "/apply"):
         assert vacancy_id(url) == ""
+
+
+def test_geekjob_never_guesses_a_resume_title():
+    row = {**ROW, "resume": ""}
+    result = inspect_geekjob_page(None, row)
+    assert result["status"] == "resume_not_configured"
+    assert result["submitted"] is False

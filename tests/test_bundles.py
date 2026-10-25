@@ -194,13 +194,13 @@ def test_ai_coding_tools_and_higher_salary_are_ranking_bonuses(tmp_path):
         {"id": "codex", "company": "A", "name": "Python Developer",
          "score": 76, "score_decision": "pass", "filter_status": "pass",
          "salary": {"currency": "RUR", "from": 200000},
-         "problems": ["salary:lower_bound_meets_threshold"],
+         "salary_confidence": "lower_bound_meets_threshold",
          "description_status": "ok",
          "description": "Python FastAPI APIs, пишем код совместно с Claude Code и Codex"},
         {"id": "ordinary", "company": "B", "name": "Python Developer",
          "score": 76, "score_decision": "pass", "filter_status": "pass",
          "salary": {"currency": "RUR", "from": 120000},
-         "problems": ["salary:lower_bound_meets_threshold"],
+         "salary_confidence": "lower_bound_meets_threshold",
          "description_status": "ok", "description": "Python FastAPI APIs"},
     ]
     report = _save(store, tmp_path, "ai", items)

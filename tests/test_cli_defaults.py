@@ -16,6 +16,26 @@ def test_queue_apply_accepts_explicit_bulk_limit() -> None:
     assert args.visible is True
 
 
+def test_campaign_preserves_track_sort_mode_unless_overridden() -> None:
+    parser = build_parser()
+    configured = parser.parse_args([
+        "run", "campaign", "--track", "ai_core",
+    ])
+    explicit = parser.parse_args([
+        "run", "campaign", "--track", "ai_core", "--sort-mode", "newest",
+    ])
+    assert configured.sort_mode is None
+    assert explicit.sort_mode == "newest"
+
+
+def test_campaign_can_explicitly_run_headless() -> None:
+    args = build_parser().parse_args([
+        "run", "campaign", "--track", "ai_core", "--headless",
+    ])
+    assert args.headless is True
+    assert args.visible is False
+
+
 def test_habr_form_audit_and_live_pacing_arguments() -> None:
     audit = build_parser().parse_args([
         "sources", "form-audit", "--track", "ai_core", "--source", "career.habr.com",

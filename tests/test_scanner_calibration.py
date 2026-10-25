@@ -73,12 +73,13 @@ def test_hh_adapter_visits_all_first_pages_before_second_page(monkeypatch):
          "pages": 2, "remote": True, "request_budget": 5, "order_by": "publication_time",
          "pause_seconds": 0},
     )
-    assert calls[0][0] == ("AI Agents", "Вайбкодер", "RAG")
-    assert calls[0][2] == 1
-    assert calls[1][0] == ("AI Agents",) and calls[1][1] == 1
-    assert calls[2][0] == ("Вайбкодер",) and calls[2][1] == 1
+    assert [(row[0], row[1], row[2]) for row in calls] == [
+        (("AI Agents",), 0, 1), (("Вайбкодер",), 0, 1), (("RAG",), 0, 1),
+        (("AI Agents",), 1, 1), (("Вайбкодер",), 1, 1),
+    ]
+    assert [row[3] for row in calls] == [5, 4, 3, 2, 1]
     assert len(segments) == 5
-    assert len({x["id"] for x in got}) == 3
+    assert len({x["id"] for x in got}) == 5
 
 
 def test_bundle_includes_preliminary_title_evidence_without_authorizing_apply(tmp_path):

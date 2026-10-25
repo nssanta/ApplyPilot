@@ -183,6 +183,26 @@ def _explicit_empty(soup: BeautifulSoup) -> bool:
     )
 
 
+def _past_last_page(soup: BeautifulSoup, requested_page: int) -> bool:
+    """Recognizes GeekJob's HTTP-200 empty page after its disabled last link."""
+    pagination = soup.select_one("ul.pagination")
+    if pagination is None:
+        return False
+    page_numbers: list[int] = []
+    next_disabled = False
+    for item in pagination.select("li"):
+        anchor = item.select_one("a[href]")
+        if anchor is None:
+            continue
+        path = urlparse(str(anchor.get("href") or "")).path.rstrip("/")
+        match = re.fullmatch(r"/vacancies(?:/(\d+))?", path)
+        if match:
+            page_numbers.append(int(match.group(1) or 1))
+        if "chevron_right" in anchor.get_text(" ", strip=True).casefold():
+            next_disabled = "disabled" in (item.get("class") or [])
+    return bool(page_numbers and next_disabled and requested_page > max(page_numbers))
+
+
 def _geekjob_id(value: str) -> str:
     value = clean_text(value)
     if not value:
@@ -359,6 +379,7 @@ class GeekJobProvider:
         filters = dict(filters or {})
         self.description_cache = {}
         max_pages = _bounded_int(filters, ("max_pages", "pages"), 1, _MAX_PAGES, 1)
+        start_page = _bounded_int(filters, ("start_page",), 1, 100_000, 1)
         max_details = _bounded_int(
             filters, ("max_details", "details_limit"), 0, _MAX_DETAILS, 0
         )
@@ -373,7 +394,8 @@ class GeekJobProvider:
         collected: dict[str, dict[str, Any]] = {}
         segments: list[ScanSegment] = []
 
-        for page in range(1, max_pages + 1):
+        page_window_exhausted = True
+        for page in range(start_page, start_page + max_pages):
             if fixture_mode:
                 path = _list_fixture(filters, page)
                 if path is None:
@@ -395,6 +417,7 @@ class GeekJobProvider:
                                 pages=page,
                             )
                         )
+                    page_window_exhausted = False
                     break
                 html = path.read_text(encoding="utf-8")
                 used = 0
@@ -408,6 +431,7 @@ class GeekJobProvider:
                             pages=page,
                         )
                     )
+                    page_window_exhausted = False
                     break
                 page_url = self._list_url(page)
                 html, status, error, used = _fetch(session, page_url, timeout)
@@ -421,9 +445,10 @@ class GeekJobProvider:
                             requests=used,
                         )
                     )
+                    page_window_exhausted = False
                     break
 
-            parsed, failures, parse_status = self._parse_list(html)
+            parsed, failures, parse_status = self._parse_list(html, requested_page=page)
             for item in parsed:
                 item["list_page"] = page
                 _merge_item(collected, item)
@@ -441,7 +466,15 @@ class GeekJobProvider:
                 )
             )
             if parse_status in {"failed", "blocked", "empty_verified"}:
+                page_window_exhausted = False
                 break
+
+        if (page_window_exhausted and max_pages > 0 and not fixture_mode
+                and bool(filters.get("until_complete"))):
+            segments.append(segment(
+                "geekjob", status="truncated", error="maximum page window reached",
+                pages=start_page + max_pages - 1,
+            ))
 
         self._add_detail(
             filters,
@@ -459,13 +492,15 @@ class GeekJobProvider:
         return self.base_url + "/vacancies" if page <= 1 else f"{self.base_url}/vacancies/{page}"
 
     def _parse_list(
-        self, html: str
+        self, html: str, *, requested_page: int | None = None
     ) -> tuple[list[dict[str, Any]], int, str]:
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select("li.collection-item")
         if not cards:
             if _challenge(html):
                 return [], 0, "blocked"
+            if requested_page is not None and _past_last_page(soup, requested_page):
+                return [], 0, "empty_verified"
             if _explicit_empty(soup):
                 return [], 0, "empty_verified"
             return [], 0, "failed"
@@ -585,6 +620,7 @@ class GeekJobProvider:
         blocked = 0
         failed = 0
         budget_hit = False
+        cached_details = filters.get("known_descriptions") or {}
         for item in _prioritized(collected):
             if attempted >= max_details:
                 break
@@ -594,6 +630,10 @@ class GeekJobProvider:
             if item.get("description_status") == "ok" and item.get("description"):
                 continue
             cached = self.description_cache.get(native_id)
+            if cached is None and isinstance(cached_details, Mapping):
+                value = cached_details.get(native_id)
+                if isinstance(value, Mapping) and str(value.get("description") or "").strip():
+                    cached = dict(value)
             if cached is not None:
                 collected[native_id] = _merge_detail(item, cached)
                 continue
@@ -638,6 +678,16 @@ class GeekJobProvider:
                     requests=attempted,
                 )
             )
+        remaining = sum(
+            1 for item in collected.values()
+            if item.get("description_status") != "ok" or not str(item.get("description") or "").strip()
+        )
+        if remaining and attempted >= max_details and not budget_hit:
+            segments.append(segment(
+                "detail", status="truncated",
+                error=f"detail limit reached; {remaining} descriptions remain",
+                requests=attempted,
+            ))
 
     def parse_detail(
         self, html: str, *, url: str = "", native_id: str = ""

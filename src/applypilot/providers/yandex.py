@@ -13,7 +13,7 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -96,24 +96,46 @@ def _request_budget(filters: Mapping[str, Any]) -> int | None:
 
 
 def _fetch(
-    filters: Mapping[str, Any], url: str, timeout: float
+    filters: Mapping[str, Any], url: str, timeout: float, budget: _Budget | None = None,
 ) -> tuple[str | None, str, str, int]:
     client = filters.get("session") or requests.Session()
+    used = 0
     try:
-        response = client.get(url, timeout=timeout, headers={"User-Agent": _USER_AGENT})
+        for _ in range(6):
+            # The caller charged the first request; charge every redirect too.
+            if used and budget is not None and not budget.take():
+                return None, "truncated", "request budget reached during redirect", used
+            used += 1
+            response = client.get(url, timeout=timeout, headers={"User-Agent": _USER_AGENT},
+                                  allow_redirects=False)
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status not in {301, 302, 303, 307, 308}:
+                break
+            location = getattr(response, "headers", {}).get("Location", "")
+            target = urljoin(url, location)
+            parsed = urlparse(target)
+            if (not location or parsed.scheme != "https"
+                    or parsed.hostname not in {"yandex.ru", "www.yandex.ru"}
+                    or parsed.username or parsed.password):
+                return None, "failed", "unexpected redirect destination", used
+            url = target
+        else:
+            return None, "failed", "redirect limit reached", used
+        if status == 403:
+            return None, "blocked", "HTTP 403 access limited", used
+        if status == 429:
+            return None, "blocked", "HTTP 429 rate limited", used
+        if status >= 400 or status < 200:
+            return None, "failed", f"HTTP {status}", used
+        text = getattr(response, "text", "") or ""
+        if not clean_text(text):
+            return None, "failed", "empty response", used
+        return text, "ok", "", used
     except requests.RequestException:
-        return None, "failed", "network error", 1
-    status = int(getattr(response, "status_code", 0) or 0)
-    if status == 403:
-        return None, "blocked", "HTTP 403 access limited", 1
-    if status == 429:
-        return None, "blocked", "HTTP 429 rate limited", 1
-    if status >= 400:
-        return None, "failed", f"HTTP {status}", 1
-    text = getattr(response, "text", "") or ""
-    if not clean_text(text):
-        return None, "failed", "empty response", 1
-    return text, "ok", "", 1
+        return None, "failed", "network error", used
+    finally:
+        if not filters.get("session"):
+            client.close()
 
 
 def _is_archived_text(text: str) -> bool:
@@ -226,7 +248,7 @@ class YandexProvider:
 
     def _native_id(self, url: str) -> str:
         path = urlparse(clean_text(url)).path.rstrip("/")
-        match = re.search(r"-(\d+)$", path)
+        match = re.fullmatch(r"/jobs/vacancies/(?:[^/]+-)?(\d+)", path)
         return match.group(1) if match else ""
 
     def _url(self, native_id: str) -> str:
@@ -385,12 +407,25 @@ class YandexProvider:
             company = clean_text(brand.get_text(" ", strip=True)) if brand is not None else ""
         if not description:
             main = soup.select_one("main") or soup
-            paragraphs = [
-                clean_text(node.get_text(" ", strip=True))
-                for node in main.select("p")
-                if clean_text(node.get_text(" ", strip=True))
-            ]
-            description = " ".join(paragraphs[:30])
+            # Requirements are list items on the real career page. Reading
+            # only paragraphs silently dropped mandatory skills and grade.
+            parts = []
+            for node in main.select("h2,h3,p,li"):
+                if node.find_parent(["li", "p", "nav", "footer"]):
+                    continue
+                value = clean_text(node.get_text(" ", strip=True))
+                if value:
+                    parts.append(value)
+            description = " ".join(parts)
+        header = (soup.select_one("[class*=TagsList_tagsList]")
+                  or soup.select_one("[class*=CareerHeader_]"))
+        experience_match = re.search(
+            r"\bот\s+\d+\s+(?:лет|года?|месяц(?:ев|а)?)\b",
+            header.get_text(" ", strip=True) if header else "", re.IGNORECASE,
+        )
+        experience = experience_match.group(0) if experience_match else ""
+        if experience:
+            description = f"Опыт: {experience}. {description}"
         if not area:
             location = soup.select_one("[class*=location], [class*=Location]")
             if location is not None:
@@ -415,6 +450,7 @@ class YandexProvider:
             url=final_url,
             description=description,
             salary=salary,
+            experience=experience,
             area=area,
             remote_text=text,
             published=published,
@@ -478,7 +514,7 @@ class YandexProvider:
                                         error="request budget reached",
                                         order_by="confirmed_endpoint"))
                 continue
-            html, status, error, used = _fetch(filters, url, _timeout(filters))
+            html, status, error, used = _fetch(filters, url, _timeout(filters), budget)
             if html is None:
                 segments.append(segment(label, status=status, items=0, requests=used,
                                         error=error, order_by="confirmed_endpoint"))
@@ -507,6 +543,44 @@ class YandexProvider:
                 detail = f"{detail}; unrecognized listing HTML"
             segments.append(segment(label, status=seg_status, items=added, requests=used,
                                     error=detail, order_by="confirmed_endpoint"))
+        detail_limit = _bounded_int(filters, ("details_limit",), 0, 1000)
+        enriched = 0
+        detail_requests = 0
+        detail_status = "ok"
+        detail_errors: list[str] = []
+        query_words = {
+            word.casefold() for query in filters.get("queries", [])
+            for word in re.findall(r"[\w]+", str(query)) if len(word) > 2
+        }
+        ordered = sorted(items, key=lambda item: -sum(
+            word in item["name"].casefold() for word in query_words
+        ))
+        for item in ordered[:detail_limit]:
+            if not budget.take():
+                detail_status = "truncated"
+                detail_errors.append("request budget reached")
+                break
+            html, status, error, used = _fetch(filters, item["url"], _timeout(filters), budget)
+            detail_requests += used
+            if html is None:
+                detail_status = "truncated" if status == "truncated" else "partial"
+                detail_errors.append(error)
+                continue
+            full = self._parse_detail(html, item["url"], item["native_id"])
+            if not full or full["name"].casefold() != item["name"].casefold():
+                detail_status = "partial"
+                detail_errors.append("detail unavailable or title changed")
+                continue
+            # Preserve listing-only metadata when the detail page omits it.
+            merged = {**item, **full}
+            for key in ("company", "area", "published", "experience", "salary"):
+                if not full.get(key):
+                    merged[key] = item.get(key)
+            item.update(merged)
+            enriched += 1
+        if detail_limit and items:
+            segments.append(segment("details", status=detail_status, items=enriched,
+                                    requests=detail_requests, error="; ".join(detail_errors)))
         return items, segments
 
     def inspect(

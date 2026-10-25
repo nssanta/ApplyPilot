@@ -36,6 +36,7 @@ def test_hh_scan_routes_through_legacy_campaign(monkeypatch, tmp_path):
         pages=2, request_budget=50, details_limit=20, limit=100,
     )
     assert called["track"] == "ai_core"
+    assert called["kwargs"]["sort_mode"] == "relevance"
     assert result["legacy_hh"] is True
     assert result["items"] == 4
     assert result["status"] == "ok"

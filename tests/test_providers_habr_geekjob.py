@@ -280,6 +280,22 @@ def test_habr_unknown_html_is_failed_not_empty_verified() -> None:
     assert len(segments) == 1
     assert segments[0].status == "failed"
     assert segments[0].status != "empty_verified"
+    assert segments[0].error == "no vacancy cards or verified empty-state marker"
+
+
+def test_habr_page_49_no_results_banner_is_verified_empty() -> None:
+    url = "https://career.habr.com/vacancies/skills/llm?page=49"
+    html = "<html><body><div>Поиск не дал результатов</div></body></html>"
+    items, segments = HabrProvider().discover({
+        "queries": ["LLM"], "start_page": 49, "max_pages": 1,
+        "until_complete": True, "session": _MappedSession({url: html}),
+    })
+
+    assert items == []
+    assert len(segments) == 1
+    assert segments[0].pages == 49
+    assert segments[0].status == "empty_verified"
+    assert "maximum page window reached" not in segments[0].error
 
 
 def test_habr_missing_fixture_is_failed_without_network() -> None:
@@ -410,6 +426,22 @@ def test_geekjob_unknown_html_is_failed_not_empty_verified() -> None:
     assert segments[0].status != "empty_verified"
 
 
+def test_geekjob_page_past_disabled_last_page_is_empty_verified() -> None:
+    html = """<html><body><ul class="pagination">
+      <li><a href="/vacancies/12">12</a></li>
+      <li><a href="/vacancies/13">13</a></li>
+      <li class="disabled"><a href="/vacancies/13"><i>chevron_right</i></a></li>
+    </ul></body></html>"""
+    session = _MappedSession({"https://geekjob.ru/vacancies/14": html})
+    items, segments = GeekJobProvider().discover({
+        "start_page": 14, "max_pages": 1, "until_complete": True, "session": session,
+    })
+
+    assert items == []
+    assert [segment.status for segment in segments] == ["empty_verified"]
+    assert "maximum page window reached" not in segments[0].error
+
+
 def test_providers_do_not_touch_network_when_fixtures_are_supplied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,14 +482,14 @@ def test_normalize_rebuilds_non_hh_urls_and_rejects_invalid_rows() -> None:
     assert habr.normalize({}) == {}
     assert geek.normalize({"name": "no id"}) == {}
 
-def test_habr_ai_core_phrases_are_deduplicated_to_confirmed_catalogues() -> None:
+def test_habr_generic_ai_queries_are_deduplicated_to_confirmed_catalogues() -> None:
     llm_session = _Session(HABR_LIST.read_text(encoding="utf-8"))
     llm_items, llm_segments = HabrProvider().discover(
         {
             "queries": [
                 "AI Agent Engineer",
-                "LLM Engineer",
-                "AI Engineer",
+                "MCP Developer",
+                "Generative AI Engineer",
                 "Разработчик ИИ агентов",
             ],
             "max_pages": 1,

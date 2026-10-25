@@ -1,102 +1,75 @@
 # ApplyPilot — Quickstart
 
-Инструкция для **чистого публичного клона**, без реальных аккаунтов и локальных операционных данных.
+Инструкция для чистого публичного клона. Реальные критерии, резюме, ответы, аккаунты и история заявок хранятся только в локальном `private/`.
 
-## Установка
+## Установка и офлайн-проверка
 
-Нужен Python 3.12+.
+Нужны Python 3.12+, Playwright/Chrome для браузерных действий и optional `telethon` для Telegram.
 
-~~~bash
+```bash
 git clone https://github.com/nssanta/ApplyPilot.git
 cd ApplyPilot
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 .venv/bin/python -m applypilot doctor
-~~~
-
-Для браузерных функций дополнительно требуется установленный браузер и Playwright; для работы через Telegram используется optional-зависимость `telethon`.
-
-## Тестирование без сети и откликов
-
-~~~bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m ruff check src tests scripts
-.venv/bin/python scripts/check_public.py
-.venv/bin/python scripts/offline_multisource_smoke.py
-
 .venv/bin/python -m applypilot sources scan \
   --track default --fixture-dir tests/fixtures/public --json
-~~~
+```
 
-Все тестовые примеры содержат синтетические вакансии; их результат не описывает личную кампанию пользователя.
+Fixtures синтетические. Они проверяют обработку данных и не подтверждают полноту рынка или отправку.
 
-## Локальные настройки
+## Локальная конфигурация
 
-~~~bash
+```bash
 mkdir -p private/config
 cp examples/profile.example.toml private/config/profile.toml
 cp examples/search.example.toml private/config/search.toml
 cp examples/sources.toml private/config/sources.toml
-~~~
+```
 
-Откройте скопированные файлы и задайте собственные критерии, резюме и метки аккаунтов. Не коммитьте `private/`, cookies, session-файлы, ключи или реальные отчёты.
+Настройте треки ролей, поисковые условия, названия резюме и source-аккаунты. Ролевой `--preset` заменяет словарь поиска и выбирает соответствующий ключ резюме из `profile.toml`; зарплата, регионы и прочие фильтры остаются настройками пользователя. Параметры источников можно задавать отдельно в `[source_limits]`.
 
 ## Поиск и очередь
 
-~~~bash
-.venv/bin/python -m applypilot sources list
+Обычный поиск ничего не отправляет. Для bounded-прохода с возобновляемыми курсорами:
 
-# Живой поиск — без отправки работодателям
-.venv/bin/python -m applypilot sources scan \
-  --track default --limit 50
+```bash
+.venv/bin/python -m applypilot run campaign \
+  --track default \
+  --source hh.ru --source career.habr.com \
+  --source getmatch.ru --source geekjob.ru \
+  --days 30 --until-complete --resume --max-passes 100 --limit 100
+```
 
-# Состояние и dry-run
-.venv/bin/python -m applypilot sources status --track default
-.venv/bin/python -m applypilot sources dispatch-plan \
-  --track default --limit 50 --json
-~~~
+Итог отдельно показывает полноту и число уникальных карточек по каждому источнику. `partial`, `truncated`, `blocked` и `failed` сохраняют незавершённость; `--resume` продолжает с сохранённого запроса/страницы или курсора. Полнота означает завершение доступного обхода с текущими запросами и фильтрами, а не всех вакансий в интернете.
 
-Подходящую вакансию следует оценивать по реальному описанию и ограничениям, а не только по score. Операционные решения хранятся в SQLite выбранного пользователя.
+## Явный live-запуск
 
-## Одобрение и диспетчер
+Сначала проверьте `sources status` и `sources dispatch-plan`. Когда профиль и очередь готовы, тот же запуск включает отправку явными флагами:
 
-~~~bash
-# VACANCY_ID — пример заполнителя, не настоящая вакансия
-.venv/bin/python -m applypilot sources approve-batch \
-  --track default --source career.habr.com \
-  --id VACANCY_ID --state APPROVED --reason 'роль и условия проверены'
+```bash
+.venv/bin/python -m applypilot run campaign \
+  --track default \
+  --source hh.ru --source career.habr.com \
+  --source getmatch.ru --source geekjob.ru \
+  --days 30 --until-complete --resume --max-passes 100 --limit 100 \
+  --apply --allow-live --headless
+```
 
-# Dry-run: отправка выключена
-.venv/bin/python -m applypilot sources dispatch-apply \
-  --track default --limit 10 --json
-~~~
+HH использует пределы `[limits]`; остальные источники имеют отдельные бюджеты и могут быть переопределены в `[source_limits."career.habr.com"]`, `[source_limits."getmatch.ru"]` и других таблицах профиля. Скорость также ограничивается паузой драйвера. `DreamJob` остаётся зеркалом HH и не получает отдельную отправку.
 
-Live-действия включаются отдельными флагами. Они требуют авторизованной сессии, точного канала, одобрения и проверенного драйвера. `UNKNOWN` после возможной отправки не допускает автоматического повтора.
+Драйверы изолируют сбой вакансии, сохраняют каждую попытку в SQLite и подтверждают успех только по ответу источника. `UNKNOWN` помещается в карантин до сверки. Для простых screening-вопросов используются только явно сохранённые факты профиля. Неизвестные ответы и неподдерживаемые поля остаются в ручном разборе.
 
-## Примеры read-only проверок
+Живой driver одной площадки не означает пакетную готовность всех площадок. Проверьте сессию, форму и receipt конкретного источника перед расширением размера очереди. GeekJob и Яндекс пока требуют подтверждённого живого пилота.
 
-~~~bash
-# Аудит формы Habr или GeekJob без submit
-.venv/bin/python -m applypilot sources form-audit \
-  --track default --source career.habr.com --view review --limit 10 --json
+## Локальная проверка проекта
 
-# Telegram: проверка статуса, синхронизация и preview без callback
-.venv/bin/python -m applypilot accounts telegram-status --online
-.venv/bin/python -m applypilot accounts telegram-sync --limit 50
-.venv/bin/python -m applypilot accounts telegram-plan \
-  --track default --json
-~~~
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m ruff check src tests scripts
+.venv/bin/python scripts/check_public.py
+.venv/bin/python scripts/offline_multisource_smoke.py
+git diff --check
+```
 
-Детали подключения Telegram, HH OAuth и живых драйверов находятся в [аккаунтах](ACCOUNTS.md) и [Multi-Source](MULTISOURCE.md). Не переносите в публичные инструкции данные своего профиля или фактические отчёты по откликам.
-
-## Веб-панель
-
-~~~bash
-./run.sh
-~~~
-
-Панель использует ту же локальную очередь, что и CLI, и предназначена для loopback-доступа.
-
-## Безопасность публикации
-
-Проверяйте отсутствие приватных файлов и переменных окружения в Git, а также кодовые тесты и `scripts/check_public.py`. Исправление `main` не удаляет данные из ранее опубликованной истории коммитов.
+CI/CD не используется; проверки и сборку запускают локально. Подробнее: [источники](MULTISOURCE.md), [аккаунты](ACCOUNTS.md), [архитектура](ARCHITECTURE.md).

@@ -1,4 +1,4 @@
--r requirements.lock
+-r requirements-browser.lock
 Pygments==2.21.0
 build==1.6.0
 iniconfig==2.3.0

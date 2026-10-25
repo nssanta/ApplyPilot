@@ -169,6 +169,58 @@ def has_screening_form(page_or_dialog) -> bool:
     return False
 
 
+def screening_answer_for(question: str, answers: dict | None) -> str:
+    """Return only an explicitly configured private answer for a known prompt."""
+    text = " ".join(str(question or "").casefold().split())
+    answers = answers or {}
+    if re.search(r"salary|compensation|зарплат|доход|оклад", text):
+        key = "salary"
+    elif re.search(r"english|английск|уровень владения языком", text):
+        key = "english"
+    elif re.search(r"why|мотивац|почему|заинтерес|интерес к вакансии", text):
+        key = "motivation"
+    else:
+        return ""
+    return str(answers.get(key) or "").strip()
+
+
+def _fill_known_screening_answers(root, answers: dict | None) -> tuple[bool, list[str]]:
+    """Fill simple text questions from private facts; leave unknown fields for review."""
+    try:
+        tasks = root.locator("[data-qa='task-body']")
+        count = tasks.count()
+    except Exception:
+        LOGGER.debug("Could not inspect HH screening tasks", exc_info=True)
+        return False, ["screening fields could not be inspected"]
+    if count == 0:
+        return False, ["screening form has no readable questions"]
+    unresolved: list[str] = []
+    for index in range(count):
+        task = tasks.nth(index)
+        try:
+            question = " ".join(task.inner_text(timeout=1000).split())
+            answer = screening_answer_for(question, answers)
+            fields = task.locator("textarea, input[type='text'], input:not([type]), input[type='number']")
+            if not answer or fields.count() != 1:
+                unresolved.append(question[:240] or f"question {index + 1}")
+                continue
+            field = fields.first
+            if not field.is_visible(timeout=1000) or not field.is_enabled(timeout=1000):
+                unresolved.append(question[:240] or f"question {index + 1}")
+                continue
+            field.fill(answer)
+        except Exception:
+            LOGGER.debug("Could not fill HH screening task %s", index, exc_info=True)
+            unresolved.append(f"question {index + 1}")
+    return not unresolved, unresolved
+
+
+def _screening_manual_note(unresolved: list[str], answers: dict | None) -> str:
+    if not answers:
+        return "screening questions require manual review"
+    return "unanswered screening questions: " + "; ".join(unresolved)
+
+
 def _select_resume(page, dialog, resume: str) -> str:
     """Выбирает точное резюме; единственное видимое резюме принимает только при совпадении."""
     root = dialog or page
@@ -241,7 +293,9 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
               confirmation_timeout_seconds: float = 15.0,
               visibility_verified: bool = False,
               manual_captcha_timeout: float = 0.0,
-              interactive: bool = False) -> ApplyResult:
+              interactive: bool = False,
+              screening_answers: dict | None = None) -> ApplyResult:
+    item["cover_letter_submitted"] = False
     if not allowed_hh_url(str(item.get("url", ""))):
         return ApplyResult("needs_manual", "URL is not an allowed HH hostname")
     if not resume.strip():
@@ -334,10 +388,23 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("needs_manual",
                                    f"{CAPTCHA_NOTE_PREFIX} in full-page response; no submit attempted")
         dialog = _response_dialog(page, submit)
+        screening_resolved = False
         if dialog is None and not submit.is_visible(timeout=2000):
             if has_screening_form(page):
-                return ApplyResult("needs_manual", "screening questions require manual review")
-            return ApplyResult("unknown", "first response action had no follow-up dialog")
+                screening_resolved, unresolved = _fill_known_screening_answers(page, screening_answers)
+                if not screening_resolved:
+                    return ApplyResult(
+                        "needs_manual", _screening_manual_note(unresolved, screening_answers),
+                    )
+                try:
+                    submit.wait_for(state="visible", timeout=5000)
+                except Exception:
+                    LOGGER.debug("HH screening submit did not appear after known answers", exc_info=True)
+                if not submit.is_visible(timeout=1000):
+                    return ApplyResult("needs_manual", "screening answers filled; submit control is unavailable")
+                dialog = _response_dialog(page, submit)
+            else:
+                return ApplyResult("unknown", "first response action had no follow-up dialog")
         response_root = dialog or page
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
         if _contains_captcha(response_text):
@@ -354,15 +421,32 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         if resume_error:
             return ApplyResult("needs_manual", resume_error)
         if has_screening_form(response_root):
-            return ApplyResult("needs_manual", "screening questions require manual review")
+            screening_resolved, unresolved = _fill_known_screening_answers(
+                response_root, screening_answers,
+            )
+            if not screening_resolved:
+                return ApplyResult(
+                    "needs_manual", _screening_manual_note(unresolved, screening_answers),
+                )
         if cover_letter:
             field = response_root.locator(LETTER_SELECTOR).first
-            if field.count() == 0 or not field.is_visible(timeout=2000):
-                return ApplyResult("needs_manual", "cover letter field is missing")
-            field.fill(cover_letter)
-            page.wait_for_timeout(random.randint(500, 1200))
-        if has_screening_form(response_root):
-            return ApplyResult("needs_manual", "screening questions require manual review")
+            has_letter_field = field.count() > 0 and field.is_visible(timeout=2000)
+            if not has_letter_field and letter_required:
+                return ApplyResult(
+                    "needs_manual", "required cover letter field is missing",
+                )
+            if has_letter_field:
+                field.fill(cover_letter)
+                item["cover_letter_submitted"] = True
+                page.wait_for_timeout(random.randint(500, 1200))
+        if has_screening_form(response_root) and not screening_resolved:
+            screening_resolved, unresolved = _fill_known_screening_answers(
+                response_root, screening_answers,
+            )
+            if not screening_resolved:
+                return ApplyResult(
+                    "needs_manual", _screening_manual_note(unresolved, screening_answers),
+                )
         if not submit.is_visible(timeout=8000):
             return ApplyResult("needs_manual", "confirmation button not found")
         # A disabled HH submit cannot complete a response. Diagnose it before

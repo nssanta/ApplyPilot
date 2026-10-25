@@ -124,6 +124,21 @@ def normalize_vacancy(raw: dict[str, Any]) -> Candidate:
     )
 
 
+def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any]) -> bool:
+    """Apply an optional private title gate before automatically approving a FIT."""
+    terms = [
+        re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(value).casefold())).strip()
+        for value in search.get("auto_apply_title_terms", [])
+        if str(value).strip()
+    ]
+    if not terms:
+        return True
+    title = re.sub(
+        r"\s+", " ", re.sub(r"[^\w]+", " ", str(item.get("name") or "").casefold()),
+    ).strip()
+    return any(f" {term} " in f" {title} " for term in terms)
+
+
 def choose_resume(title: str, profile: dict[str, Any]) -> str:
     resumes = profile.get("resumes", {})
     low = title.lower()

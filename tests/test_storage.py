@@ -336,10 +336,25 @@ def test_confirmed_apply_marks_approved_letter_task_sent(tmp_path):
                                          draft_text="Одобренный текст")
     store.update_workflow_task(task_id, "account", action="approve")
 
-    store.record({**_campaign_item("one"), "track": "ai", "cover_letter": "Одобренный текст"},
+    store.record({**_campaign_item("one"), "track": "ai", "cover_letter": "Одобренный текст",
+                  "cover_letter_submitted": True},
                  "success", "HH confirmed", account="account")
 
     assert store.workflow_task(task_id, "account")["status"] == "SENT_CONFIRMED"
+
+
+def test_confirmed_apply_does_not_mark_omitted_letter_as_sent(tmp_path):
+    store = Store(tmp_path / "state.sqlite3")
+    _save_campaign(store, "first", "ai", [_campaign_item("one")])
+    task_id = store.create_workflow_task("account", "hh.ru", "one", "ai", "letter", "DRAFT",
+                                         draft_text="Одобренный текст")
+    store.update_workflow_task(task_id, "account", action="approve")
+
+    store.record({**_campaign_item("one"), "track": "ai", "cover_letter": "Одобренный текст",
+                  "cover_letter_submitted": False},
+                 "success", "HH confirmed", account="account")
+
+    assert store.workflow_task(task_id, "account")["status"] == "APPROVED"
 
 
 def test_approved_optional_letter_is_attached_to_ready_campaign_item(tmp_path):

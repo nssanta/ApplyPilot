@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
@@ -188,6 +189,15 @@ def validate_search(search: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("salary.policy must be possible or guaranteed")
     if int(salary.get("from", 0) or 0) < 0:
         raise ConfigError("salary.from must be non-negative")
+    for key in ("exclude_title_patterns", "exclude_description_patterns", "exclude_location_patterns"):
+        patterns = values.get(key, []) or []
+        if not isinstance(patterns, list) or any(not isinstance(pattern, str) for pattern in patterns):
+            raise ConfigError(f"{key} must be an array of regular-expression strings")
+        for pattern in patterns:
+            try:
+                re.compile(pattern, re.IGNORECASE)
+            except re.error as exc:
+                raise ConfigError(f"invalid {key} expression: {exc}") from exc
     groups = values.get("groups")
     if groups is not None:
         if not isinstance(groups, list) or not groups:
@@ -241,6 +251,24 @@ def effective_search(raw: dict[str, Any], preset_name: str | None = None,
     return validate_search(values)
 
 
+def application_limits(profile: dict[str, Any], source: str) -> dict[str, int]:
+    """Resolve independent source budgets; the 300/day legacy cap belongs to HH."""
+    limits = profile.get("limits", {}) or {}
+    configured = profile.get("source_limits", {}) or {}
+    override = configured.get(source, {}) if isinstance(configured, dict) else {}
+    if not isinstance(override, dict):
+        raise ConfigError(f"source_limits.{source} must be a table")
+    try:
+        per_run = int(override.get("per_run", limits.get("per_run", 100)))
+        default_daily = limits.get("per_day", 300) if source == "hh.ru" else per_run
+        per_day = int(override.get("per_day", default_daily))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid application limit for {source}") from exc
+    if per_run < 1 or per_day < 1:
+        raise ConfigError(f"application limits for {source} must be positive")
+    return {"per_run": per_run, "per_day": per_day}
+
+
 def search_origins(raw: dict[str, Any], preset_name: str | None = None) -> dict[str, str]:
     preset = preset_name or raw.get("preset")
     origins = {key: "default" for key in DEFAULT_SEARCH}
@@ -248,7 +276,9 @@ def search_origins(raw: dict[str, Any], preset_name: str | None = None) -> dict[
     origins.update({key: "toml" for key in raw if key != "preset"})
     if preset_name:
         for key in ("queries", "include_terms", "exclude_titles", "role_terms", "required_role_terms",
-                    "title_role_terms"):
+                    "title_role_terms", "incompatible_title_terms", "resume_key",
+                    "exclude_title_patterns", "exclude_description_patterns",
+                    "exclude_location_patterns"):
             if key in ROLE_PRESETS.get(preset_name, {}):
                 origins[key] = "cli preset"
     return origins

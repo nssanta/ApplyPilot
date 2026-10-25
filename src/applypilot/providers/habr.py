@@ -115,47 +115,14 @@ _SKILL_ALIASES = {
     "ts": "typescript",
     "typescript developer": "typescript",
 }
-# Exact normalized phrases from private/config/search-ai-core-20261022.toml.
-# Habr has confirmed public skill catalogues only for python/llm/golang/typescript;
-# every AI-only phrase uses the confirmed LLM catalogue instead of inventing a
-# /vacancies/skills/<arbitrary-slug> endpoint.  Phrases with an explicit Python
-# token are resolved to the confirmed python catalogue before this map is read.
-_AI_CORE_SKILLS = {
-    "ai agent engineer": "llm",
-    "llm engineer": "llm",
-    "ai engineer": "llm",
-    "разработчик ии агентов": "llm",
-    "rag engineer": "llm",
-    "llm разработчик": "llm",
-    "genai engineer": "llm",
-    "ai platform engineer": "llm",
-    "ai agent": "llm",
-    "ai разработчик": "llm",
-    "agentic ai": "llm",
-    "llmops engineer": "llm",
-    "инженер ии": "llm",
-    "ai automation engineer": "llm",
-    "mcp разработчик": "llm",
-    "ии разработчик": "llm",
-    "разработчик ии решений": "llm",
-    "инженер ai интеграций": "llm",
-    "инженер по автоматизации ai агентов": "llm",
-    "ai native developer": "llm",
-    "ai first developer": "llm",
-    "вайбкодер": "llm",
-    "вайб кодер": "llm",
-    "vibe coding": "llm",
-    "vibe coder": "llm",
-    "ai product engineer": "llm",
-    "разработчик ai автоматизации": "llm",
-    "ai solutions engineer": "llm",
-    "агентная разработка": "llm",
-    "voice ai engineer": "llm",
-    "разработчик llm агентов": "llm",
-    "ai agent automation": "llm",
-    "langgraph developer": "llm",
-    "ai integrations engineer": "llm",
-}
+# Habr exposes a confirmed LLM catalogue but no catalogue for arbitrary role
+# phrases. Route generic AI/agent query terms there instead of encoding any
+# user's private search vocabulary or inventing URL slugs.
+_LLM_QUERY_TERMS = frozenset({
+    "ai", "llm", "rag", "mcp", "genai", "agent", "agents", "agentic",
+    "ии", "нейросеть", "нейросети", "нейросетевой", "агент", "агенты",
+    "агентный", "агентная", "генеративный", "генеративная",
+})
 
 
 def _query_key(value: str) -> str:
@@ -185,7 +152,11 @@ def _skill_slug(value: str) -> str:
         return "golang"
     if "typescript" in tokens or "ts" in tokens:
         return "typescript"
-    return _AI_CORE_SKILLS.get(key, "")
+    if tokens & _LLM_QUERY_TERMS or any(
+        token.startswith(("нейросет", "агент", "генератив")) for token in tokens
+    ):
+        return "llm"
+    return ""
 
 
 def _query_targets(filters: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -302,6 +273,7 @@ def _explicit_empty(soup: BeautifulSoup) -> bool:
         marker in text
         for marker in (
             "ничего не найдено",
+            "поиск не дал результатов",
             "вакансий не найдено",
             "нет вакансий",
             "no vacancies",
@@ -495,7 +467,7 @@ class HabrProvider:
         login=True,
         check=True,
         apply=False,
-        apply_status="needs_live_validation",
+        apply_status="verified_native_one_click",
     )
 
     def discover(
@@ -504,6 +476,7 @@ class HabrProvider:
         filters = dict(filters or {})
         targets = _query_targets(filters)
         max_pages = _bounded_int(filters, ("max_pages", "pages"), 1, _MAX_PAGES, 1)
+        start_page = _bounded_int(filters, ("start_page",), 1, 100_000, 1)
         max_details = _bounded_int(
             filters, ("max_details", "details_limit"), 0, _MAX_DETAILS, 0
         )
@@ -521,7 +494,8 @@ class HabrProvider:
 
         for slug, phrases in targets.items():
             label = phrases[0] if len(phrases) == 1 and phrases[0] else (slug or "/vacancies")
-            for page in range(1, max_pages + 1):
+            page_window_exhausted = True
+            for page in range(start_page, start_page + max_pages):
                 if fixture_mode:
                     path = _list_fixture(filters, slug, page)
                     if path is None:
@@ -543,6 +517,7 @@ class HabrProvider:
                                     pages=page,
                                 )
                             )
+                        page_window_exhausted = False
                         break
                     html = path.read_text(encoding="utf-8")
                     used = 0
@@ -557,6 +532,7 @@ class HabrProvider:
                             )
                         )
                         budget_exhausted = True
+                        page_window_exhausted = False
                         break
                     page_url = self._list_url(slug, page)
                     html, status, error, used = _fetch(session, page_url, timeout)
@@ -570,6 +546,7 @@ class HabrProvider:
                                 requests=used,
                             )
                         )
+                        page_window_exhausted = False
                         break
 
                 parsed, failures, parse_status = self._parse_list(html)
@@ -580,6 +557,8 @@ class HabrProvider:
                 if failures and parsed:
                     parse_status = "partial"
                 error = f"{failures} card(s) could not be parsed" if failures else ""
+                if parse_status == "failed" and not error:
+                    error = "no vacancy cards or verified empty-state marker"
                 segments.append(
                     segment(
                         label,
@@ -591,7 +570,14 @@ class HabrProvider:
                     )
                 )
                 if parse_status in {"failed", "blocked", "empty_verified"}:
+                    page_window_exhausted = False
                     break
+            if (page_window_exhausted and max_pages > 0 and not fixture_mode
+                    and bool(filters.get("until_complete"))):
+                segments.append(segment(
+                    label, status="truncated", error="maximum page window reached",
+                    pages=start_page + max_pages - 1,
+                ))
             if budget_exhausted:
                 break
 
@@ -720,6 +706,7 @@ class HabrProvider:
         blocked = 0
         failed = 0
         budget_hit = False
+        cached_details = filters.get("known_descriptions") or {}
         for item in _prioritized(collected):
             if attempted >= max_details:
                 break
@@ -727,6 +714,10 @@ class HabrProvider:
             if not native_id:
                 continue
             if item.get("description_status") == "ok" and item.get("description"):
+                continue
+            cached = cached_details.get(native_id) if isinstance(cached_details, Mapping) else None
+            if isinstance(cached, Mapping) and str(cached.get("description") or "").strip():
+                collected[native_id] = _merge_detail(item, cached)
                 continue
             if not budget.take():
                 budget_hit = True
@@ -768,6 +759,16 @@ class HabrProvider:
                     requests=attempted,
                 )
             )
+        remaining = sum(
+            1 for item in collected.values()
+            if item.get("description_status") != "ok" or not str(item.get("description") or "").strip()
+        )
+        if remaining and attempted >= max_details and not budget_hit:
+            segments.append(segment(
+                "detail", status="truncated",
+                error=f"detail limit reached; {remaining} descriptions remain",
+                requests=attempted,
+            ))
 
     def parse_detail(
         self, html: str, *, url: str = "", native_id: str = ""

@@ -5,6 +5,7 @@ from typing import Any
 
 ROLE_PRESETS: dict[str, dict[str, Any]] = {
     "ai-llm": {
+        "resume_key": "ai_agent",
         "queries": ["AI Agent", "LLM Engineer", "RAG Engineer", "GenAI Engineer",
                      "Prompt Engineer", "AI Automation"],
         "include_terms": ["llm", "rag", "agent", "genai", "python", "openai", "langchain"],
@@ -15,6 +16,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "title_role_terms": ["ai", "llm", "agent", "rag", "genai", "prompt", "nlp"],
     },
     "ai-agents-llmops": {
+        "resume_key": "ai_agent",
         "queries": [
             "AI Agent Engineer", "LLM Engineer", "AI-разработчик", "Вайбкодер",
             "Разработчик ИИ-решений", "RAG Engineer", "AI-native Developer",
@@ -50,6 +52,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         ],
     },
     "ml-engineering": {
+        "resume_key": "ml",
         "queries": ["ML Engineer", "Machine Learning Engineer", "NLP Engineer", "MLOps", "Computer Vision"],
         "include_terms": ["python", "machine learning", "ml", "pytorch", "tensorflow", "nlp", "mlops"],
         "exclude_titles": ["продаж", "ассистент", "тренер", "маркетолог", "аналитик продаж"],
@@ -61,6 +64,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
                               "computer vision", "applied scientist"],
     },
     "python-backend": {
+        "resume_key": "python",
         "queries": ["Python Backend", "Python Developer", "FastAPI Developer", "Django Developer"],
         "include_terms": ["python", "fastapi", "django", "backend", "api", "postgresql"],
         "exclude_titles": ["продаж", "ассистент", "тренер", "маркетолог", "аналитик", "support",
@@ -72,6 +76,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "title_role_terms": ["python", "fastapi", "django", "backend"],
     },
     "go-backend": {
+        "resume_key": "go",
         "queries": ["Go Developer", "Golang Developer", "Go Backend", "Go Engineer"],
         "include_terms": ["go", "golang", "backend", "grpc", "microservices", "kubernetes"],
         "exclude_titles": ["продаж", "ассистент", "тренер", "маркетолог", "аналитик", "support"],
@@ -82,6 +87,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "title_role_terms": ["go", "golang"],
     },
     "software-general": {
+        "resume_key": "default",
         "queries": ["Software Engineer", "Backend Developer", "Python Developer", "Go Developer"],
         "include_terms": ["python", "go", "golang", "backend", "api", "software", "developer"],
         "exclude_titles": ["продаж", "ассистент", "тренер", "маркетолог", "рекрутер"],
@@ -98,6 +104,8 @@ def resolve_search(search: dict[str, Any], preset_name: str | None = None) -> di
     preset_fields = {
         "queries", "include_terms", "exclude_titles", "role_terms", "primary_role_terms",
         "required_role_terms", "title_role_terms", "incompatible_title_terms",
+        "resume_key",
+        "exclude_title_patterns", "exclude_description_patterns", "exclude_location_patterns",
     }
     for key, value in search.items():
         if key != "preset" and not (preset_name and key in preset_fields):

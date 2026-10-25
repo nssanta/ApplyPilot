@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -48,8 +49,14 @@ class HhSearchAdapter:
 
     source = "hh.ru"
 
+    @staticmethod
+    def page_key(query: str, area: int, order: str) -> str:
+        """Stable cursor key for one HH query, region and sort order."""
+        return json.dumps([str(query), int(area), str(order)], ensure_ascii=False,
+                          separators=(",", ":"))
+
     def discover(self, filters: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
-        """Сначала первая страница КАЖДОЙ фразы, затем глубина при остатке бюджета."""
+        """Scan saved page offsets, covering each query before adding depth."""
         queries = list(filters.get("queries", []))
         areas = list(filters.get("areas", [113]))
         pages = max(1, int(filters.get("pages", 1)))
@@ -58,40 +65,65 @@ class HhSearchAdapter:
         pause = float(filters.get("pause_seconds", 1.0))
         budget = None if filters.get("request_budget") is None else int(filters["request_budget"])
         order = str(filters.get("order_by", "relevance"))
+        start_pages = filters.get("start_pages", {}) or {}
         base = {
             "only_remote": remote, "date_from": date_from,
             "pause_seconds": pause, "order_by": order,
         }
-        items, segments = scan_many(queries, areas, 1, request_budget=budget, **base)
-        total_used = sum(segment.requests for segment in segments)
-        result = {str(item["id"]): self.normalize(item) for item in items if item.get("id")}
-        if pages > 1 and not any(segment.status in {"failed", "captcha"} for segment in segments):
-            # HH commonly uses two HTTP requests (redirect) for one search page.
-            # Never spend a whole limited budget on just the first two phrases.
-            for segment in list(segments):
-                if budget is not None and total_used >= budget:
-                    break
-                if segment.pages != 1 or segment.status != "truncated" or segment.error:
+        remaining = budget
+        unique: dict[str, dict[str, Any]] = {}
+        segments: list[ScanSegment] = []
+        continuations: list[tuple[str, int, int]] = []
+
+        def collect(rows: list[dict[str, Any]]) -> None:
+            for raw in rows:
+                vacancy_id = str(raw.get("id") or "")
+                if not vacancy_id:
                     continue
-                extra, extra_segments = scan_many(
-                    [segment.query], [segment.area], pages - 1, start_page=1,
-                    request_budget=None if budget is None else budget - total_used, **base,
+                if vacancy_id not in unique:
+                    unique[vacancy_id] = self.normalize(raw)
+                    continue
+                current = unique[vacancy_id]
+                for field in ("query_sources", "area_sources", "sort_sources"):
+                    current[field] = sorted(set(current.get(field, [])) | set(raw.get(field, [])))
+
+        # Cover the saved page for every query/area before spending budget on
+        # deeper pages. Null cursors mean that segment was already completed.
+        for query in queries:
+            for area in areas:
+                key = self.page_key(str(query), int(area), order)
+                configured_start = start_pages.get(key, 0)
+                if configured_start is None:
+                    continue
+                start = max(0, int(configured_start))
+                rows, parts = scan_many(
+                    [query], [area], 1, start_page=start,
+                    request_budget=remaining, **base,
                 )
-                total_used += sum(part.requests for part in extra_segments)
-                segments.extend(extra_segments)
-                for raw in extra:
-                    key = str(raw.get("id") or "")
-                    if not key:
-                        continue
-                    if key not in result:
-                        result[key] = self.normalize(raw)
-                        continue
-                    current = result[key]
-                    for source in ("query_sources", "area_sources", "sort_sources"):
-                        current[source] = sorted(set(current.get(source, [])) | set(raw.get(source, [])))
-                if any(part.status in {"failed", "captcha"} for part in extra_segments):
+                collect(rows)
+                segments.extend(parts)
+                used = sum(part.requests for part in parts)
+                if remaining is not None:
+                    remaining = max(0, remaining - used)
+                if parts and parts[0].status == "truncated" and not parts[0].error and parts[0].pages:
+                    continuations.append((str(query), int(area), start + 1))
+
+        # Continue after first-page coverage. A later invocation can resume at
+        # the next page without replaying pages that already yielded results.
+        if pages > 1:
+            for query, area, next_page in continuations:
+                if remaining is not None and remaining <= 0:
                     break
-        return list(result.values()), segments
+                rows, parts = scan_many(
+                    [query], [area], pages - 1, start_page=next_page,
+                    request_budget=remaining, **base,
+                )
+                collect(rows)
+                segments.extend(parts)
+                used = sum(part.requests for part in parts)
+                if remaining is not None:
+                    remaining = max(0, remaining - used)
+        return list(unique.values()), segments
 
     def normalize(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         item = dict(raw)

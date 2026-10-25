@@ -11,9 +11,14 @@ from typing import Any
 
 from .config import AppConfig, search_groups, validate_search
 from .parser import ScanSegment, enrich_items, save_snapshot, stamp_first_seen
-from .scoring import evaluate_search_filter, prioritize_for_enrichment, score_vacancy
+from .scoring import (
+    auto_apply_title_eligible,
+    evaluate_search_filter,
+    prioritize_for_enrichment,
+    score_vacancy,
+)
 from .sources import HhSearchAdapter
-from .storage import Store, campaign_fit_bucket
+from .storage import Store, campaign_fit_bucket, needs_manual_reapproval
 
 
 def _published_status(value: Any, cutoff: datetime) -> str:
@@ -52,6 +57,34 @@ def _merge_known_fields(previous: dict[str, Any], current: dict[str, Any]) -> di
     return merged
 
 
+def _salary_confidence(item: dict[str, Any], search: dict[str, Any]) -> str:
+    raw = item.get("salary")
+    if not isinstance(raw, dict) or not raw:
+        return "unpublished"
+    salary_cfg = search.get("salary") or {}
+    try:
+        minimum = int(salary_cfg.get("from", 0) or 0)
+        lower = int(raw["from"]) if raw.get("from") is not None else None
+        upper = int(raw["to"]) if raw.get("to") is not None else None
+    except (TypeError, ValueError):
+        return "malformed"
+    wanted = str(salary_cfg.get("currency") or "").upper()
+    currency = str(raw.get("currency") or "").upper()
+    if wanted and not currency:
+        return "currency_unknown"
+    if wanted and wanted != currency:
+        return "currency_mismatch"
+    if minimum <= 0:
+        return "published"
+    if lower is not None and lower >= minimum:
+        return "lower_bound_meets_threshold"
+    if upper is not None and upper >= minimum:
+        return "range_overlaps_threshold"
+    if lower is None and upper is None:
+        return "range_unknown"
+    return "below_or_unverified"
+
+
 def _review_problems(item: dict[str, Any], search: dict[str, Any]) -> list[str]:
     """Возвращает сигналы для ручной проверки, а не вердикты о кандидате."""
     problems: list[str] = []
@@ -78,9 +111,13 @@ def _review_problems(item: dict[str, Any], search: dict[str, Any]) -> list[str]:
         if wanted and currency and wanted != currency:
             problems.append("salary:currency_mismatch")
         elif lower_value is not None and lower_value >= minimum:
-            problems.append("salary:lower_bound_meets_threshold")
+            # Positive salary verification belongs in salary_confidence, not
+            # the unresolved-problem list that blocks auto-approval.
+            pass
         elif upper_value is not None and upper_value >= minimum:
-            problems.append("salary:range_overlaps_threshold")
+            # The configured `possible` policy accepts an overlapping range;
+            # a `guaranteed` policy is already rejected by the filter itself.
+            pass
         else:
             problems.append("salary:below_or_unverified")
     if re.search(r"\b(senior|lead|principal|staff|head|chief)\b|старш\w+|ведущ\w+|руководител\w+|архитектор", title, re.IGNORECASE):
@@ -103,7 +140,8 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                  details_limit: int | None = None, limit: int = 100,
                  only_remote: bool | None = None, salary_from: int | None = None,
                  salary_currency: str | None = None, sort_mode: str = "newest",
-                 track_resume: str = "", preset: str | None = None) -> dict[str, Any]:
+                 track_resume: str = "", preset: str | None = None,
+                 start_pages: dict[str, int | None] | None = None) -> dict[str, Any]:
     """Запускает один bounded HH scan, сохраняет snapshot и актуализирует SQLite очередь."""
     if days < 1 or days > 365 or limit < 1 or limit > 100:
         raise ValueError("days must be 1-365 and limit must be 1-100")
@@ -248,6 +286,7 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                     "pages": spec["pages"], "remote": spec["remote"],
                     "date_from": spec["date_from"], "pause_seconds": 1.0,
                     "request_budget": remaining, "order_by": order_by,
+                    "start_pages": start_pages or {},
                 })
                 remaining -= sum(segment.requests for segment in group_segments)
                 for item in group_items:
@@ -320,6 +359,9 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             item["score"] = candidate.score
             item["resume"] = track_resume or candidate.resume
             group = group_search.get(str(item.get("search_group") or "default"), search)
+            item["auto_apply_eligible"] = auto_apply_title_eligible(item, group)
+            if not item["auto_apply_eligible"]:
+                item["auto_apply_reason"] = "title_requires_manual_role_review"
             filter_result = evaluate_search_filter(item, group)
             filter_status = filter_result.status
             filter_reasons = list(filter_result.reasons)
@@ -347,10 +389,7 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                     item["filter_status"] = "unknown"
                 item["filter_reasons"] = [*item["filter_reasons"], "publication:time_not_verified"]
             item["problems"] = _review_problems(item, group)
-            item["salary_confidence"] = next(
-                (value.split(":", 1)[1] for value in item["problems"] if value.startswith("salary:")),
-                "unknown",
-            )
+            item["salary_confidence"] = _salary_confidence(item, group)
             campaign_items.append(item)
 
         stamp_first_seen(campaign_items, config.data_dir / "seen.json")
@@ -391,9 +430,15 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             "account": account, "track": track, "status": status, "snapshot": str(snapshot_path),
             "query_count": len(query_list), "covered_query_count": len(covered_queries),
             "uncovered_queries": uncovered_queries, "segment_count": len(segments),
+            "segments": [{
+                "query": segment.query, "area": segment.area, "pages": segment.pages,
+                "status": segment.status, "requests": segment.requests,
+                "error": segment.error, "order_by": segment.order_by,
+            } for segment in segments],
             "cached_descriptions": cached_descriptions,
             "detail_fetch_attempts": len(enrichment_items),
             "segment_errors": errors, "summary": summary, "score_counts": score_counts,
+            "candidate_ids": [str(item.get("id") or "") for item in campaign_items if item.get("id")],
             "top": store.list_campaign_vacancies(account, track, "top", limit),
         }
     except BaseException as exc:
@@ -402,9 +447,13 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
 
 
 def write_approved_input(config: AppConfig, track: str, account: str,
-                         limit: int = 10) -> tuple[Path | None, list[dict[str, Any]]]:
+                         limit: int = 10, vacancy_ids: set[str] | None = None
+                         ) -> tuple[Path | None, list[dict[str, Any]]]:
     """Создаёт приватный apply snapshot только из одобренных и ещё не отправленных строк."""
     rows = Store(config.db_path).approved_campaign_items(account, track, limit)
+    rows = [row for row in rows if not needs_manual_reapproval(row)]
+    if vacancy_ids is not None:
+        rows = [row for row in rows if str(row.get("id") or "") in vacancy_ids]
     if not rows:
         return None, []
     path = config.snapshots_dir / f"approved-apply-{track}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"

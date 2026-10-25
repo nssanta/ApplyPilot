@@ -54,6 +54,37 @@ class ApplyDriver(Protocol):
     def apply(self, row: Mapping[str, Any]) -> ApplyOutcome: ...
 
 
+def verified_success_receipt(source: str, vacancy_id: str, receipt: Mapping[str, Any]) -> bool:
+    """Validate the source-native evidence contract, not a driver's status alone.
+
+    Drivers still own independent observation of the server/history. Unknown
+    sources must define a receipt contract here before joining live dispatch.
+    """
+    if not isinstance(receipt, Mapping) or str(receipt.get("vacancy_id") or "") != vacancy_id:
+        return False
+    if source == "career.habr.com":
+        return (receipt.get("provider") == source
+                and receipt.get("post_status") == 200
+                and receipt.get("post_path") == f"/api/frontend/vacancies/{vacancy_id}/responses"
+                and receipt.get("verified_history") is True)
+    if source == "getmatch.ru":
+        message_id = receipt.get("confirmation_message_id")
+        return (receipt.get("provider") == "@g_jobbot"
+                and isinstance(message_id, (int, str)) and not isinstance(message_id, bool)
+                and len(str(message_id)) <= 20 and str(message_id).isascii()
+                and str(message_id).isdigit() and int(message_id) > 0)
+    if source == "geekjob.ru":
+        paths = receipt.get("post_paths")
+        statuses = receipt.get("post_statuses")
+        return (receipt.get("provider") == source
+                and receipt.get("history_verified") is True
+                and isinstance(paths, list) and bool(paths)
+                and all(isinstance(path, str) and path.startswith("/") for path in paths)
+                and isinstance(statuses, list) and len(statuses) == len(paths)
+                and any(type(status) is int and 200 <= status < 300 for status in statuses))
+    return False
+
+
 def _capabilities(registry: ProviderRegistry, source: str) -> dict[str, Any]:
     try:
         capabilities = registry.get(source).capabilities
@@ -144,6 +175,7 @@ def dispatch_apply(
     allow_live: bool = False,
     drivers: Mapping[str, ApplyDriver] | None = None,
     accounts: Mapping[str, str] | None = None,
+    source_limits: Mapping[str, Mapping[str, int]] | None = None,
     registry: ProviderRegistry | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -166,82 +198,146 @@ def dispatch_apply(
         return {**plan, "executed": 0, "results": [], "summary": {"dry_run": plan["planned_count"]}}
 
     run_id = str(run_id or uuid.uuid4().hex[:12])
-    results: list[dict[str, Any]] = []
-    for row in plan["planned"]:
+    preflight_results: dict[int, dict[str, Any]] = {}
+    ready_rows: list[tuple[int, Mapping[str, Any], ApplyDriver, ApplyOutcome]] = []
+    # Validate the complete prepared pool before the first external submit.
+    # This catches expired sessions, changed forms, and missing Getmatch
+    # callbacks without leaving a partially sent queue due to late preflight.
+    for index, row in enumerate(plan["planned"]):
         source = str(row.get("source") or "")
-        source_account = str(row.get("account") or account)
-        vacancy_id = str(row.get("id") or "")
-        channel_key = str(row.get("channel_key") or f"{source}:{vacancy_id}")
         driver = drivers.get(source)
         if driver is None:
-            results.append({
+            preflight_results[index] = {
                 **row, "action": "skipped", "status": "needs_live_validation",
                 "reason": "no verified driver for this source",
-            })
+            }
             continue
         try:
             preflight = (
                 driver.preflight(row) if hasattr(driver, "preflight")
                 else ApplyOutcome("ready")
             )
-        except Exception as exc:  # noqa: BLE001 - a driver must not stop the batch
-            results.append({
+        except Exception as exc:  # noqa: BLE001 - isolate a failing candidate or source
+            preflight_results[index] = {
                 **row, "action": "skipped", "status": "preflight_failed",
                 "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
-            })
+            }
             continue
         if preflight.status != "ready":
-            results.append({
+            preflight_results[index] = {
                 **row, "action": "skipped", "status": preflight.status,
                 "reason": preflight.note or preflight.evidence or "preflight blocked",
-            })
+            }
+            continue
+        ready_rows.append((index, row, driver, preflight))
+
+    live_results: dict[int, dict[str, Any]] = {}
+    paused_sources: set[str] = set()
+    limited_sources: set[str] = set()
+    for index, row, driver, preflight in ready_rows:
+        source = str(row.get("source") or "")
+        source_account = str(row.get("account") or account)
+        vacancy_id = str(row.get("id") or "")
+        channel_key = str(row.get("channel_key") or f"{source}:{vacancy_id}")
+        if source in paused_sources:
+            live_results[index] = {
+                **row, "action": "skipped", "status": "needs_manual",
+                "reason": "source paused after UNKNOWN; reconcile before continuing",
+            }
+            continue
+        if source in limited_sources:
+            live_results[index] = {
+                **row, "action": "skipped", "status": "limit_reached",
+                "reason": "source application budget reached; remaining queue preserved",
+            }
             continue
 
+        source_budget = (source_limits or {}).get(source, {})
+        try:
+            per_run = int(source_budget.get("per_run", 100))
+            per_day = int(source_budget.get("per_day", 100))
+        except (TypeError, ValueError):
+            per_run = per_day = 0
         reserved, reservation_note = store.reserve_source_application(
             source_account, source, vacancy_id, track, channel_key, run_id,
+            per_run=per_run, per_day=per_day,
         )
         if not reserved:
-            results.append({
+            if reservation_note.startswith((
+                "source per-run limit reached", "source per-day limit reached",
+            )):
+                limited_sources.add(source)
+                live_results[index] = {
+                    **row, "action": "blocked", "status": "limit_reached",
+                    "reason": reservation_note,
+                }
+                continue
+            live_results[index] = {
                 **row, "action": "blocked", "status": "channel_conflict",
                 "reason": reservation_note,
-            })
+            }
             continue
         if not store.record_source_application(
             source_account, source, vacancy_id, track, channel_key, "submitting",
             note=preflight.note, run_id=run_id,
         ):
-            results.append({
+            live_results[index] = {
                 **row, "action": "blocked", "status": "transition_rejected",
                 "reason": "could not record submitting state",
-            })
+            }
             continue
 
         try:
             outcome = driver.apply(row)
         except Exception as exc:  # noqa: BLE001 - ambiguous outcome is quarantined
             outcome = ApplyOutcome("unknown", f"{type(exc).__name__}: {str(exc)[:200]}")
+        if outcome.status == "success" and not verified_success_receipt(
+            source, vacancy_id, outcome.receipt,
+        ):
+            outcome = ApplyOutcome("unknown", "success rejected: missing or mismatched source receipt")
         ledger_status = LIVE_STATUS_MAP.get(outcome.status, "unknown")
+        if ledger_status == "unknown":
+            paused_sources.add(source)
         note = outcome.note or outcome.evidence
         if outcome.receipt:
             note = f"{note} | receipt={dict(outcome.receipt)}".strip(" |")
-        recorded = store.record_source_application(
-            source_account, source, vacancy_id, track, channel_key, ledger_status,
-            note=note, run_id=run_id, mode="run",
-        )
-        results.append({
+        try:
+            recorded = store.record_source_application(
+                source_account, source, vacancy_id, track, channel_key, ledger_status,
+                note=note, run_id=run_id, mode="run",
+            )
+        except Exception:  # noqa: BLE001 - submit may have reached the source
+            recorded = False
+        if not recorded:
+            # Keep the durable submitting lock quarantined; never advertise a
+            # successful delivery that could not be persisted locally.
+            paused_sources.add(source)
+            outcome = ApplyOutcome("unknown", "outcome persistence failed; reconcile submitting attempt")
+            ledger_status = "submitting"
+        live_results[index] = {
             **row, "action": "applied" if outcome.status == "success" else "attempted",
             "status": outcome.status, "ledger_status": ledger_status,
             "note": outcome.note, "evidence": outcome.evidence,
             "receipt": dict(outcome.receipt), "recorded": bool(recorded),
-        })
+        }
 
+    results = [
+        preflight_results.get(index) or live_results.get(index) or {
+            **row, "action": "skipped", "status": "preflight_failed",
+            "reason": "candidate was not prepared for live execution",
+        }
+        for index, row in enumerate(plan["planned"])
+    ]
     summary: dict[str, int] = {}
     for row in results:
         status = str(row.get("status") or "unknown")
         summary[status] = summary.get(status, 0) + 1
     return {
         **plan, "mode": "live", "run_id": run_id,
-        "executed": len(results), "results": results, "summary": summary,
+        "executed": len(results),
+        "preflight_ready": len(ready_rows),
+        "send_attempts": sum(row.get("action") in {"applied", "attempted"} for row in results),
+        "results": results, "summary": summary,
     }
 
 

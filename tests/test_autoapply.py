@@ -1,8 +1,17 @@
-from applypilot.autoapply import apply_one, verify_resume_visibility
+from applypilot.autoapply import apply_one, screening_answer_for, verify_resume_visibility
 from applypilot.cli import _run_apply, _submission_preflight
 from applypilot.config import AppConfig
 from applypilot.session import SessionCheck
 from applypilot.storage import Store
+
+
+def test_screening_answers_use_only_configured_private_facts():
+    answers = {"salary": "140000", "english": "A2", "motivation": "AI products"}
+
+    assert screening_answer_for("Ваши зарплатные ожидания?", answers) == "140000"
+    assert screening_answer_for("What is your English level?", answers) == "A2"
+    assert screening_answer_for("Why are you interested in this role?", answers) == "AI products"
+    assert screening_answer_for("How many years of Kubernetes experience?", answers) == ""
 
 
 class _Locator:
@@ -39,6 +48,8 @@ class _Locator:
         if "vacancy-response-link" in selector:
             return 1 if self.page.state == "initial" else 0
         if "vacancy-response-letter-input" in selector:
+            if not self.page.letter_field_present:
+                return 0
             return 1 if self.page.dialog or (
                 self.page.full_page_response and self.page.state in {"after_response", "submitted"}
             ) else 0
@@ -125,6 +136,7 @@ class _Page:
         self.resume_titles = ["Python", "Python", "Python"]
         self.resume_visible = True
         self.question_count = 0
+        self.letter_field_present = True
         self.submit_enabled = True
         self.enable_submit_on_resume_selection = False
         self.resume_filter = ""
@@ -199,13 +211,41 @@ def test_ambiguous_resume_stops_before_submit():
 
 def test_confirmed_two_step_submission_has_one_submit():
     page = _Page()
+    item = _item()
 
-    result = apply_one(page, _item(), "Python", "Здравствуйте")
+    result = apply_one(page, item, "Python", "Здравствуйте")
 
     assert result.status == "success"
+    assert item["cover_letter_submitted"] is True
     assert sum("vacancy-response-link" in selector for selector in page.clicks) == 1
     assert sum("submit-popup" in selector for selector in page.clicks) == 1
     assert page.fills == ["Здравствуйте"]
+
+
+def test_optional_letter_is_skipped_when_hh_has_no_letter_field():
+    page = _Page()
+    page.letter_field_present = False
+    item = _item()
+
+    result = apply_one(page, item, "Python", "Здравствуйте")
+
+    assert result.status == "success"
+    assert item["cover_letter_submitted"] is False
+    assert page.fills == []
+    assert sum("submit-popup" in selector for selector in page.clicks) == 1
+
+
+def test_required_letter_without_hh_field_stops_before_submit():
+    page = _Page(body_after_response="Сопроводительное письмо обязательно")
+    page.letter_field_present = False
+    item = _item()
+
+    result = apply_one(page, item, "Python", "Здравствуйте")
+
+    assert result.status == "needs_manual"
+    assert result.note == "required cover letter field is missing"
+    assert item["cover_letter_submitted"] is False
+    assert not any("submit-popup" in selector for selector in page.clicks)
 
 
 def test_global_resume_duplicates_do_not_make_popup_selection_ambiguous():

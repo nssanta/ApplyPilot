@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,40 @@ from applypilot.storage import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/public"
+
+
+@pytest.mark.parametrize("operation", ["set", "batch-set"])
+def test_cli_queue_routes_independent_source_accounts(tmp_path, monkeypatch, capsys, operation):
+    config = AppConfig(tmp_path, tmp_path / "private/data",
+                       FIXTURES / "profile.toml", FIXTURES / "search.toml")
+    config_dir = tmp_path / "private/config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "sources.toml").write_text(
+        '[accounts]\n"hh.ru"="default"\n"career.habr.com"="habr-owner"\n',
+    )
+    store = Store(config.db_path)
+    _vacancy(store, "default", "hh.ru", "101", score=80)
+    _vacancy(store, "habr-owner", "career.habr.com", "101", score=95)
+    _vacancy(store, "other-owner", "career.habr.com", "999", score=100)
+    monkeypatch.setattr(cli, "_config", lambda args: config)
+    monkeypatch.setattr(cli, "_track_config", lambda *args, **kwargs: (config, {}))
+    assert cli.main(["queue", "list", "--track", "ai_core", "--view", "review", "--json"]) == 0
+    combined = json.loads(capsys.readouterr().out)
+    assert {(x["source"], x["id"]) for x in combined["items"]} == {
+        ("hh.ru", "101"), ("career.habr.com", "101"),
+    }
+    assert cli.main(["queue", "list", "--track", "ai_core", "--source", "career.habr.com",
+                     "--view", "review", "--json"]) == 0
+    source = json.loads(capsys.readouterr().out)
+    assert source["account"] == "habr-owner" and source["count"] == 1
+    assert cli.main(["queue", operation, "--track", "ai_core", "--source", "career.habr.com",
+                     "--id", "101", "--state", "APPROVED", "--reason", "source review"]) == 0
+    capsys.readouterr()
+    assert store.list_campaign_vacancies("default", "ai_core", "approved", 10) == []
+    assert len(store.list_campaign_vacancies("habr-owner", "ai_core", "approved", 10)) == 1
+    assert cli.main(["queue", "apply", "--track", "ai_core", "--source", "career.habr.com",
+                     "--dry-run"]) == 0
+    assert "blocked=1" in capsys.readouterr().out
 
 
 def _store(tmp_path: Path) -> Store:

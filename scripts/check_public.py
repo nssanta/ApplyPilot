@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import re
 import subprocess
 import tarfile
@@ -7,6 +8,7 @@ import zipfile
 from pathlib import Path
 
 FORBIDDEN_PATHS = ("private/", ".hh_session", "session.json")
+CI_PATHS = (".github/workflows/", ".circleci/")
 SECRET_PATTERNS = (
     re.compile(r"OPENROUTER_API_KEY\s*=\s*['\"]?sk-or-v1-[A-Za-z0-9_-]+"),
     # Classic GitHub tokens have exactly 36 alphanumerics after the prefix;
@@ -14,31 +16,59 @@ SECRET_PATTERNS = (
     re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
 )
+PRIVATE_CONTEXT_PATTERNS = (
+    re.compile(r"/home/(?!user(?:/|\b)|example(?:/|\b))[^\s/]+/"),
+    re.compile(r"private/config/(?:profile|search)-[^\s`\"']*-20\d{6}\.toml"),
+    re.compile(r"private/research/[^\s`\"']*20\d{2}-\d{2}-\d{2}"),
+    re.compile(r"Действующее решение владельца|Актуальный AI-only конвейер"),
+)
+PUBLIC_TEXT_SUFFIXES = {".md", ".toml", ".html", ".xml", ".json", ".txt", ".csv"}
 
 
-def forbidden_paths(paths: list[str]) -> list[str]:
+def forbidden_paths(paths: list[str], *, allow_historical_ci: bool = False) -> list[str]:
     return [path for path in paths if any(token in path for token in FORBIDDEN_PATHS)
-            or (path.startswith(".env") and path != ".env.example")]
+            or (Path(path).name.startswith(".env") and Path(path).name != ".env.example")
+            or Path(path).suffix in {".session", ".sqlite3"}
+            or (not allow_historical_ci and (Path(path).name == ".gitlab-ci.yml"
+                                            or any(token in path for token in CI_PATHS)))
+            or Path(path).name in {"credentials.json", "token.json", "storage_state.json"}]
 
 
 def content_has_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
 
-def check_history(repo: str) -> list[str]:
-    commits = subprocess.run(["git", "-c", f"safe.directory={repo}", "rev-list", "--all"],
+def content_has_private_context(name: str, text: str) -> bool:
+    return (Path(name).suffix in PUBLIC_TEXT_SUFFIXES
+            and any(pattern.search(text) for pattern in PRIVATE_CONTEXT_PATTERNS))
+
+
+def check_history(repo: str, *, private_context: bool = False) -> list[str]:
+    # Codex creates temporary refs outside normal Git branches/remotes/tags.
+    # Some checkpoints can outlive their objects; they are not public project
+    # history and must not make the repository privacy check unusable.
+    commits = subprocess.run(["git", "-c", f"safe.directory={repo}", "rev-list",
+                              "--branches", "--remotes", "--tags"],
                              check=True, text=True, capture_output=True).stdout.splitlines()
     errors: list[str] = []
     for commit in commits:
         paths = subprocess.run(["git", "-c", f"safe.directory={repo}", "ls-tree", "-r", "--name-only", commit],
                                check=True, text=True, capture_output=True).stdout.splitlines()
-        for path in forbidden_paths(paths):
+        for path in forbidden_paths(paths, allow_historical_ci=True):
             errors.append(f"{commit[:12]}:{path}")
         for pattern in SECRET_PATTERNS:
             found = subprocess.run(["git", "-c", f"safe.directory={repo}", "grep", "-I", "-l", "-E",
                                     pattern.pattern, commit, "--"], check=False, text=True,
                                    capture_output=True).stdout.splitlines()
             errors.extend(f"{commit[:12]}:{path}" for path in found)
+        if private_context:
+            for path in paths:
+                if Path(path).suffix not in PUBLIC_TEXT_SUFFIXES:
+                    continue
+                value = subprocess.run(["git", "-c", f"safe.directory={repo}", "show",
+                                        f"{commit}:{path}"], check=True, capture_output=True).stdout
+                if content_has_private_context(path, value.decode("utf-8", errors="ignore")):
+                    errors.append(f"{commit[:12]}:{path}")
     return sorted(set(errors))
 
 
@@ -52,9 +82,10 @@ def check_artifacts() -> list[str]:
                     if forbidden_paths(names):
                         errors.extend(f"{path}:{name}" for name in forbidden_paths(names))
                     for name in names:
-                        if not name.endswith((".py", ".toml", ".md", ".txt")):
+                        if Path(name).suffix not in PUBLIC_TEXT_SUFFIXES | {".py"}:
                             continue
-                        if content_has_secret(archive.read(name).decode("utf-8", errors="ignore")):
+                        text = archive.read(name).decode("utf-8", errors="ignore")
+                        if content_has_secret(text) or content_has_private_context(name, text):
                             errors.append(f"{path}:{name}")
             elif path.name.endswith((".tar.gz", ".tar")):
                 with tarfile.open(path) as archive:
@@ -62,21 +93,29 @@ def check_artifacts() -> list[str]:
                     if forbidden_paths(names):
                         errors.extend(f"{path}:{name}" for name in forbidden_paths(names))
                     for member in archive.getmembers():
-                        if not member.isfile() or not member.name.endswith((".py", ".toml", ".md", ".txt")):
+                        if not member.isfile() or Path(member.name).suffix not in PUBLIC_TEXT_SUFFIXES | {".py"}:
                             continue
                         handle = archive.extractfile(member)
-                        if handle and content_has_secret(handle.read().decode("utf-8", errors="ignore")):
-                            errors.append(f"{path}:{member.name}")
+                        if handle:
+                            text = handle.read().decode("utf-8", errors="ignore")
+                            if (content_has_secret(text)
+                                    or content_has_private_context(member.name, text)):
+                                errors.append(f"{path}:{member.name}")
         except (OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
             errors.append(f"{path}:unreadable-artifact:{type(exc).__name__}")
     return errors
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Check public files, history and built artifacts")
+    parser.add_argument("--audit-history-privacy", action="store_true",
+                        help="report historical personal context; never rewrite history")
+    args = parser.parse_args()
     repo = str(Path.cwd().resolve())
-    result = subprocess.run(["git", "-c", f"safe.directory={repo}", "ls-files"],
+    result = subprocess.run(["git", "-c", f"safe.directory={repo}", "ls-files",
+                             "--cached", "--others", "--exclude-standard"],
                             check=True, text=True, capture_output=True)
-    paths = result.stdout.splitlines()
+    paths = sorted(set(result.stdout.splitlines()))
     bad_paths = forbidden_paths(paths)
     if bad_paths:
         print("forbidden tracked paths:")
@@ -91,13 +130,13 @@ def main() -> int:
             text = file_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        if content_has_secret(text):
+        if content_has_secret(text) or content_has_private_context(path, text):
             bad_content.append(path)
     if bad_content:
         print("possible secrets in tracked files:")
         print("\n".join(bad_content))
         return 1
-    history_errors = check_history(repo)
+    history_errors = check_history(repo, private_context=args.audit_history_privacy)
     artifact_errors = check_artifacts()
     if history_errors or artifact_errors:
         print("public history/artifact check failed:")

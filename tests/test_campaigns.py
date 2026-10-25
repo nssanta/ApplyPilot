@@ -3,10 +3,23 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from applypilot.campaigns import _published_status, run_campaign
+import pytest
+
+from applypilot.campaigns import _published_status, run_campaign, write_approved_input
 from applypilot.config import AppConfig, effective_search
 from applypilot.parser import ScanSegment
-from applypilot.storage import Store
+from applypilot.storage import AUTO_APPROVAL_REASON, Store
+
+
+@pytest.fixture(autouse=True)
+def fixed_campaign_clock(monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 10, 22, 12, tzinfo=UTC)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+
+    monkeypatch.setattr("applypilot.campaigns.datetime", Clock)
 
 
 def test_published_window_uses_exact_utc_cutoff_and_unknown_is_not_pass():
@@ -85,6 +98,42 @@ def test_campaign_scan_persists_queue_and_keeps_review_state_on_partial_retry(tm
     assert store.campaign_history("default", "ai", 10)[0]["campaign_id"] == fifth["campaign_id"]
 
 
+def test_hh_campaign_persists_private_auto_apply_title_gate(tmp_path, monkeypatch):
+    config = AppConfig.discover(root=tmp_path, data_dir=str(tmp_path / "private/data"))
+    search = effective_search({
+        "queries": ["AI agents"], "areas": [113], "max_pages": 1,
+        "request_budget": 1, "details_limit": 0,
+        "auto_apply_title_terms": ["agent", "llm", "rag"],
+    })
+    profile = {
+        "role_terms": ["llm"], "primary_role_terms": ["llm"],
+        "title_role_terms": ["ai"], "required_role_terms": ["engineer"],
+        "resumes": {"default": "Example"},
+    }
+    raw = {
+        "id": "generic-ai-role", "name": "AI Engineer",
+        "description": "Build production LLM agent applications with RAG.",
+        "description_status": "ok", "is_remote": True,
+        "published": "2026-10-21T10:00:00Z",
+        "salary": {"from": 200000, "currency": "RUR"},
+    }
+    monkeypatch.setattr("applypilot.sources.HhSearchAdapter.discover", lambda *_args, **_kwargs: (
+        [dict(raw)], [ScanSegment("AI agents", 113, 1, "ok", 1, requests=1)],
+    ))
+
+    result = run_campaign(
+        config, "ai_core", profile, search, days=30, request_budget=1, limit=10,
+        track_resume="Example",
+    )
+    rows = Store(config.db_path).list_campaign_vacancies(
+        "default", "ai_core", "all", 10, source="hh.ru",
+    )
+
+    assert result["status"] == "ok"
+    assert rows[0]["review_lane"] == "FIT"
+    assert rows[0]["auto_apply_eligible"] is False
+
+
 def test_malformed_salary_and_search_signals_stay_manual_review(tmp_path, monkeypatch):
     from applypilot.campaigns import _review_problems
 
@@ -93,6 +142,36 @@ def test_malformed_salary_and_search_signals_stay_manual_review(tmp_path, monkey
     })
     assert "salary:malformed" in problems
     assert "geo:remote_not_verified" in problems
+
+
+def test_salary_that_satisfies_configured_policy_is_not_an_open_problem():
+    from applypilot.campaigns import _review_problems, _salary_confidence
+
+    search = {"salary": {"from": 120000, "currency": "RUR", "policy": "possible"}}
+    guaranteed = {"salary": {"currency": "RUR", "from": 130000}}
+    overlapping = {"salary": {"currency": "RUR", "from": 100000, "to": 140000}}
+
+    assert "salary:lower_bound_meets_threshold" not in _review_problems(guaranteed, search)
+    assert _salary_confidence(guaranteed, search) == "lower_bound_meets_threshold"
+    assert "salary:range_overlaps_threshold" not in _review_problems(overlapping, search)
+    assert _salary_confidence(overlapping, search) == "range_overlaps_threshold"
+
+
+def test_stale_automatic_title_approval_is_filtered_from_hh_apply_input(tmp_path, monkeypatch):
+    config = AppConfig.discover(root=tmp_path, data_dir=str(tmp_path / "private/data"))
+    rows = [
+        {"id": "stale-auto", "review_state": "APPROVED", "review_reason": AUTO_APPROVAL_REASON,
+         "auto_apply_eligible": False},
+        {"id": "manual-override", "review_state": "APPROVED",
+         "review_reason": "operator reviewed full description", "auto_apply_eligible": False},
+        {"id": "current-auto", "review_state": "APPROVED", "review_reason": AUTO_APPROVAL_REASON,
+         "auto_apply_eligible": True},
+    ]
+    monkeypatch.setattr(Store, "approved_campaign_items", lambda *_args, **_kwargs: rows)
+
+    _path, prepared = write_approved_input(config, "ai_core", "default")
+
+    assert [item["id"] for item in prepared] == ["manual-override", "current-auto"]
 
 
 def test_unpublished_salary_is_maybe_until_owner_approves_it(tmp_path, monkeypatch):

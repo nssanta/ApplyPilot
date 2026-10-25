@@ -195,6 +195,9 @@ def compile_bundle(
                 skipped["screening_rejected"] += 1
                 continue
             flags = list(dict.fromkeys([*item.get("filter_reasons", []), *item.get("problems", [])]))
+            salary_confidence = str(item.get("salary_confidence") or "")
+            if salary_confidence in {"lower_bound_meets_threshold", "range_overlaps_threshold"}:
+                flags.append(f"salary:{salary_confidence}")
             new_risks = _description_risks(
                 str(item.get("description") or ""), str(item.get("name") or ""),
             )
@@ -391,5 +394,5 @@ def compile_bundle(
         ),
         "skipped": skipped,
         "items": ranked,
-        "note": "FIT и NEEDS_ENRICHMENT разделены. Только подтверждённый FIT допускается до отдельного согласованного apply.",
+        "note": "FIT и NEEDS_ENRICHMENT разделены. FIT допускается к apply после настроенного одобрения, проверок источника и лимитов.",
     }

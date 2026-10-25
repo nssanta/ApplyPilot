@@ -8,6 +8,7 @@ until a real authenticated UI has been inspected.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -19,13 +20,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .campaigns import _review_problems
+import requests
+
+from .campaigns import _review_problems, _salary_confidence
 from .config import AppConfig, search_groups
 from .parser import ScanSegment
 from .providers import ProviderRegistry, default_registry
 from .providers.base import SourceCapabilities
-from .scoring import evaluate_search_filter, score_vacancy
-from .storage import Store
+from .scoring import auto_apply_title_eligible, evaluate_search_filter, score_vacancy
+from .storage import AUTO_APPROVAL_REASON, Store, needs_manual_reapproval
 
 SOURCE_LABELS = {
     "hh.ru": "HH.ru",
@@ -126,15 +129,21 @@ def _fixture_defaults(source: str) -> tuple[str, str]:
 
 def _provider_filters(source: str, *, queries: list[str], pages: int,
                       request_budget: int, details_limit: int,
+                      primary_role_terms: Iterable[str] = (),
+                      start_page: int = 1,
+                      until_complete: bool = False,
                       fixture_dir: str | Path | None = None,
                       fixture_path: str | Path | None = None,
                       detail_fixture_path: str | Path | None = None,
                       remote: bool | None = None, date_from: str = "") -> dict[str, Any]:
     filters: dict[str, Any] = {
         "queries": queries,
+        "primary_role_terms": list(primary_role_terms),
         "pages": max(1, int(pages)),
         "request_budget": max(1, int(request_budget)),
         "details_limit": max(0, int(details_limit)),
+        "start_page": max(1, int(start_page)),
+        "until_complete": bool(until_complete),
         "remote": bool(remote) if remote is not None else False,
         "date_from": date_from,
         "pause_seconds": 1.0,
@@ -274,6 +283,9 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
         filter_result = evaluate_search_filter(item, group)
         filter_status = filter_result.status
         filter_reasons = list(filter_result.reasons)
+        item["auto_apply_eligible"] = auto_apply_title_eligible(item, group)
+        if not item["auto_apply_eligible"]:
+            item["auto_apply_reason"] = "title_requires_manual_role_review"
         salary_cfg = group.get("salary") or {}
         try:
             salary_threshold = int(salary_cfg.get("from", 0) or 0)
@@ -299,40 +311,21 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
             if filter_status == "pass":
                 filter_status = "unknown"
             filter_reasons.append("publication:time_not_verified")
-        if track == "ai_core":
-            title = str(item.get("name") or "").casefold()
-            description = str(item.get("description") or "").casefold()
-            # Foundation-model training is not applied agent engineering.
-            if re.search(
-                r"(?:обучени[а-яё]*.{0,45}модел|"
-                r"post.training.{0,25}llm|pre.train.{0,25}llm)",
-                title,
-            ):
-                item["score_decision"] = "reject"
+        title = str(item.get("name") or "")
+        description = str(item.get("description") or "")
+        configured_guards = (
+            ("exclude_title_patterns", title, "role:configured_title_exclusion", True),
+            ("exclude_description_patterns", description,
+             "description:configured_exclusion", False),
+            ("exclude_location_patterns", description, "geo:configured_exclusion", False),
+        )
+        for setting, text, reason, reject_score in configured_guards:
+            if any(re.search(pattern, text, re.IGNORECASE)
+                   for pattern in group.get(setting, []) or []):
                 filter_status = "reject"
-                filter_reasons.append("role:foundation_training_not_ai_core")
-            # Worldwide Remote does not imply eligible to work from Russia.
-            if re.search(
-                r"(?:already relocated from russia|already moved out of russia|"
-                r"only candidates outside russia|не рассматриваем.{0,30}из рф)",
-                description,
-            ):
-                filter_status = "reject"
-                filter_reasons.append("geo:requires_relocation_from_russia")
-            # Some job listings advertise 'Remote' in their header while the
-            # actual description explicitly excludes applicants in Russia.
-            # Job eligibility comes from that detailed condition, not the badge.
-            if re.search(
-                r"(?:location\s*:\s*any\s*,?\s*except\s+(?:russia|russian federation)|"
-                r"(?:location|candidates|applicants)\s*:\s*[^.\n]{0,90}"
-                r"(?:except|excluding)\s+(?:russia|russian federation)|"
-                r"(?:remote|work|location)\s+[^.\n]{0,90}"
-                r"(?:except|excluding)\s+(?:russia|russian federation)|"
-                r"удал[её]нн[^.\n]{0,80}(?:кроме|за исключением)\s+(?:рф|росси))",
-                description,
-            ):
-                filter_status = "reject"
-                filter_reasons.append("geo:remote_excludes_russia")
+                filter_reasons.append(reason)
+                if reject_score:
+                    item["score_decision"] = "reject"
         item["filter_status"] = filter_status
         item["filter_reasons"] = list(dict.fromkeys(filter_reasons))
         item["filter_fields"] = list(filter_result.fields)
@@ -341,10 +334,7 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
             else "within_window"
         )
         item["problems"] = _review_problems(item, group)
-        item["salary_confidence"] = next(
-            (value.split(":", 1)[1] for value in item["problems"] if value.startswith("salary:")),
-            "unknown",
-        )
+        item["salary_confidence"] = _salary_confidence(item, group)
         lane = review_lane(
             str(item.get("filter_status") or "unknown"),
             str(item.get("score_decision") or "unknown"),
@@ -361,7 +351,9 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
 
 def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
                 source: str, *, pages: int | None = None, request_budget: int | None = None,
-                details_limit: int | None = None, limit: int = 100,
+                details_limit: int | None = None, limit: int = 100, start_page: int = 1,
+                until_complete: bool = False,
+                hh_start_pages: dict[str, int | None] | None = None,
                 fixture_dir: str | Path | None = None,
                 fixture_path: str | Path | None = None,
                 detail_fixture_path: str | Path | None = None,
@@ -391,7 +383,9 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 days=max(1, min(365, int(search.get("days", 3) or 3))),
                 pages=pages, request_budget=request_budget,
                 details_limit=details_limit, limit=limit,
+                sort_mode=str(search.get("sort_mode") or "newest"),
                 track_resume=str(profile.get("resume") or ""),
+                start_pages=hh_start_pages,
             )
             summary = result.get("summary") or {}
             return {
@@ -400,9 +394,14 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 "track": track, "fixture": False,
                 "items": int(summary.get("items", 0) or 0),
                 "segments": int(result.get("segment_count", 0) or 0),
+                "query_count": int(result.get("query_count", 0) or 0),
+                "covered_query_count": int(result.get("covered_query_count", 0) or 0),
+                "uncovered_queries": list(result.get("uncovered_queries") or []),
+                "segments_detail": list(result.get("segments") or []),
                 "errors": list(result.get("segment_errors") or []),
                 "snapshot": result.get("snapshot", ""), "summary": summary,
                 "top": result.get("top", []), "score_counts": result.get("score_counts", {}),
+                "candidate_ids": result.get("candidate_ids", []),
                 "legacy_hh": True,
             }
         except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
@@ -441,6 +440,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
         "track": track, "source": source, "queries": queries,
         "pages": effective_pages, "request_budget": effective_budget,
         "details_limit": effective_details, "limit": int(limit),
+        "start_page": max(1, int(start_page)),
         "fixture": bool(fixture_dir or fixture_path),
     }
     store.start_campaign(campaign_id, account, track, safe_config, source=source)
@@ -448,17 +448,48 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
         filters = _provider_filters(
             source, queries=queries, pages=effective_pages,
             request_budget=effective_budget, details_limit=effective_details,
+            primary_role_terms=group.get("primary_role_terms", []),
+            start_page=start_page,
+            until_complete=until_complete,
             fixture_dir=fixture_dir, fixture_path=fixture_path,
             detail_fixture_path=detail_fixture_path,
             remote=group.get("only_remote"), date_from=cutoff.date().isoformat(),
         )
+        if source in {"career.habr.com", "getmatch.ru", "geekjob.ru"} and not fixture_mode:
+            cached: dict[str, dict[str, Any]] = {}
+            cache_cutoff = datetime.now(UTC) - timedelta(days=30)
+            for old in store.list_campaign_vacancies(account, track, "all", 5000, source=source):
+                description = str(old.get("description") or "").strip()
+                if old.get("description_status") != "ok" or not description:
+                    continue
+                try:
+                    checked = datetime.fromisoformat(str(old.get("last_checked_at") or ""))
+                    if checked.tzinfo is None:
+                        checked = checked.replace(tzinfo=UTC)
+                    if checked.astimezone(UTC) < cache_cutoff:
+                        continue
+                except ValueError:
+                    continue
+                cached[str(old.get("id") or "")] = old
+            filters["known_descriptions"] = cached
         if source == "getmatch.ru" and not fixture_mode:
             # Namespace incremental sitemap cursor per source and account.
             # Telegram-specific scans use explicit URLs, not the sitemap.
+            scope = json.dumps({
+                "queries": sorted(queries),
+                "primary_role_terms": sorted(str(value) for value in group.get("primary_role_terms", [])),
+            }, ensure_ascii=False, sort_keys=True)
+            scope_id = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
             filters["state_path"] = str(
                 config.data_dir / "providers" / source_slug(source)
-                / source_slug(account) / "sitemap_seen.json"
+                / source_slug(account) / f"sitemap_seen-{scope_id}.json"
             )
+            if telegram_hints:
+                filters["telegram_state_path"] = str(
+                    config.data_dir / "providers" / source_slug(source)
+                    / source_slug(account) / f"telegram_seen-{scope_id}.json"
+                )
+                filters["include_sitemap"] = True
         # The user already owns these messages. Extract public job IDs only:
         # no bot commands are interpreted, no callbacks are executed.
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:
@@ -483,14 +514,26 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 filters["detail_urls"] = [
                     url for _, url in sorted(candidates, key=lambda item: item[0])
                 ]
-                # Keep Telegram-linked vacancy coverage separate from sitemap
-                # coverage; successive bounded runs must advance, not reread
-                # the same top N URLs indefinitely.
-                filters["state_path"] = str(
-                    config.data_dir / "providers" / source_slug(source)
-                    / source_slug(account) / "telegram_seen.json"
-                )
-        discovered = provider.discover(filters)
+                # GetMatchProvider routes these links through telegram_state_path.
+                # Keep state_path on the independent sitemap cursor so the
+                # two discovery channels cannot advance or suppress each other.
+        scan_session = None
+        if not fixture_mode and source in {"career.habr.com", "getmatch.ru", "geekjob.ru"}:
+            # A provider pass can make hundreds of list/detail GETs. Reuse its
+            # connection pool instead of paying a new TCP/TLS setup per URL.
+            scan_session = requests.Session()
+            filters["session"] = scan_session
+        try:
+            discovered = provider.discover(filters)
+        except KeyboardInterrupt:
+            # Ctrl-C must not leave a permanent `running` campaign row. The
+            # provider cursor is the resume point; the partially fetched page
+            # is deliberately retried on the next invocation.
+            store.fail_campaign(campaign_id, "scan interrupted by user; resume is safe")
+            raise
+        finally:
+            if scan_session is not None:
+                scan_session.close()
         if hasattr(discovered, "items"):
             raw_items = list(discovered.items)
             segments = list(discovered.segments)
@@ -550,6 +593,8 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             "items": len(items), "segments": len(segments), "errors": errors,
             "snapshot": str(snapshot), "summary": summary, "top": top,
             "telegram_links": telegram_linked,
+            "candidate_ids": [str(item.get("id") or "") for item in items if item.get("id")],
+            "start_page": max(1, int(start_page)),
         }
     except Exception as exc:  # noqa: BLE001 - source failures are isolated by contract
         message = f"{type(exc).__name__}: {exc}"
@@ -560,13 +605,296 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
 
 
 def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
-                 sources: Iterable[str] | None = None, **kwargs: Any) -> dict[str, Any]:
-    """Scans selected sources independently and returns one aggregate receipt."""
+                 sources: Iterable[str] | None = None, *, until_complete: bool = False,
+                 resume: bool = False, max_passes: int = 30, **kwargs: Any) -> dict[str, Any]:
+    """Scan all configured query groups and continue bounded provider passes."""
     registry = kwargs.pop("registry", None) or default_registry()
     selected = list(dict.fromkeys(str(source) for source in (sources or DEFAULT_SOURCES)))
+    if not 1 <= int(max_passes) <= 100:
+        raise ValueError("max_passes must be between 1 and 100")
+    drain = bool(until_complete or resume)
+    base_kwargs = dict(kwargs)
+    groups = search_groups(search) or [dict(search)]
     results = []
     for source in selected:
-        results.append(scan_source(config, track, profile, search, source, registry=registry, **kwargs))
+        source_groups: list[dict[str, Any]] = []
+        source_account = resolve_source_account(config, profile, source)
+        for group in groups:
+            group_search = dict(group)
+            group_name = str(group_search.get("group_name") or "default")
+            scope = json.dumps({
+                "source": source, "track": track, "group": group_name,
+                "queries": sorted(str(v) for v in group_search.get("queries", [])),
+                "primary_role_terms": sorted(str(v) for v in group_search.get("primary_role_terms", [])),
+            }, ensure_ascii=False, sort_keys=True)
+            scope_id = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+            cursor_path = (
+                config.data_dir / "providers" / source_slug(source) / source_slug(source_account)
+                / f"scan-{source_slug(track)}-{scope_id}.json"
+            )
+            group_kwargs = dict(base_kwargs)
+            if drain and group_kwargs.get("pages") is None:
+                # A pass uses the configured page window (normally one page).
+                # Continuation advances the cursor between bounded passes;
+                # replacing this with 50/100 pages multiplies the work by all
+                # search terms and can turn a scan into an hours-long crawl.
+                group_kwargs["pages"] = max(1, int(
+                    group_search.get("max_pages", search.get("max_pages", 1)) or 1
+                ))
+            if drain:
+                # Use the profile's per-pass budgets. The former generic
+                # 10,000 requests / 1,000 detail pages ignored settings and
+                # caused slow providers to dominate the whole scan.
+                if group_kwargs.get("request_budget") is None:
+                    group_kwargs["request_budget"] = int(
+                        group_search.get("request_budget", search.get("request_budget", 100))
+                        or 100
+                    )
+                if group_kwargs.get("details_limit") is None:
+                    group_kwargs["details_limit"] = int(
+                        group_search.get("details_limit", search.get("details_limit", 100))
+                        or 100
+                    )
+            start_page = 1
+            hh_page_cursor: dict[str, int | None] = {}
+            if resume and source == "hh.ru":
+                try:
+                    saved = json.loads(cursor_path.read_text(encoding="utf-8"))
+                    raw_cursor = saved.get("next_pages", {})
+                    if isinstance(raw_cursor, dict):
+                        hh_page_cursor = {
+                            str(key): (None if value is None else max(0, int(value)))
+                            for key, value in raw_cursor.items()
+                        }
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pass
+            if source == "hh.ru" and drain:
+                # Materialize every segment before the first pass. If the
+                # request budget runs out halfway through the query matrix,
+                # segments that have not been requested yet must remain at
+                # page zero instead of disappearing from the cursor map.
+                from .sources import HhSearchAdapter
+
+                sort_mode = str(group_search.get("sort_mode", search.get("sort_mode", "newest")))
+                orders = ("publication_time", "relevance") if sort_mode == "balanced" else (
+                    "publication_time",) if sort_mode == "newest" else ("relevance",)
+                group_queries = [
+                    str(value).strip() for value in group_search.get("queries", []) if str(value).strip()
+                ]
+                group_areas = [
+                    int(value) for value in group_search.get("areas", search.get("areas", [113]))
+                ]
+                for query in group_queries:
+                    for area in group_areas:
+                        for order in orders:
+                            hh_page_cursor.setdefault(
+                                HhSearchAdapter.page_key(query, area, order), 0,
+                            )
+            if resume and source in {"career.habr.com", "geekjob.ru"}:
+                try:
+                    saved = json.loads(cursor_path.read_text(encoding="utf-8"))
+                    start_page = max(1, int(saved.get("next_page", 1)))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pass
+            passes: list[dict[str, Any]] = []
+            hh_cursor_complete = False
+            pass_limit = max_passes if drain and source in {
+                "hh.ru", "getmatch.ru", "career.habr.com", "geekjob.ru",
+            } else 1
+            for _pass in range(pass_limit):
+                pass_search = dict(group_search)
+                previous_hh_cursor = dict(hh_page_cursor)
+                result = scan_source(
+                    config, track, profile, pass_search, source,
+                    registry=registry, **{
+                        **group_kwargs, "start_page": start_page,
+                        "until_complete": drain,
+                        "hh_start_pages": hh_page_cursor if source == "hh.ru" and drain else None,
+                    },
+                )
+                passes.append(result)
+                status = str(result.get("status") or "failed")
+                errors = [str(value) for value in result.get("errors", [])]
+
+                if source == "hh.ru" and drain:
+                    from .sources import HhSearchAdapter
+
+                    for segment in result.get("segments_detail", []):
+                        key = HhSearchAdapter.page_key(
+                            str(segment.get("query") or ""), int(segment.get("area") or 0),
+                            str(segment.get("order_by") or "relevance"),
+                        )
+                        current = hh_page_cursor.get(key, 0)
+                        if current is None:
+                            continue
+                        segment_pages = max(0, int(segment.get("pages") or 0))
+                        segment_status = str(segment.get("status") or "failed")
+                        segment_error = str(segment.get("error") or "")
+                        if not segment_pages:
+                            continue
+                        if segment_status == "truncated" and not segment_error:
+                            hh_page_cursor[key] = int(current) + segment_pages
+                        elif segment_status in {"ok", "empty"}:
+                            hh_page_cursor[key] = None
+
+                    pending_hh_pages = any(value is not None for value in hh_page_cursor.values())
+                    if pending_hh_pages:
+                        try:
+                            cursor_path.parent.mkdir(parents=True, exist_ok=True)
+                            temporary = cursor_path.with_name(f".{cursor_path.name}.tmp")
+                            temporary.write_text(json.dumps({
+                                "track": track, "source": source, "scope": scope_id,
+                                "next_pages": hh_page_cursor,
+                                "updated_at": datetime.now(UTC).isoformat(),
+                            }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                            os.chmod(temporary, 0o600)
+                            temporary.replace(cursor_path)
+                        except OSError as exc:
+                            result["errors"] = [*errors, f"resume cursor save failed: {exc}"]
+                            break
+                    else:
+                        cursor_path.unlink(missing_ok=True)
+                        hh_cursor_complete = True
+
+                if not drain or status not in {"partial", "truncated", "blocked"}:
+                    if source in {"career.habr.com", "geekjob.ru"} and status in {"ok", "empty_verified"}:
+                        cursor_path.unlink(missing_ok=True)
+                    break
+                if status == "blocked" or result.get("blocked"):
+                    break
+                if source == "hh.ru":
+                    pending_hh_pages = any(value is not None for value in hh_page_cursor.values())
+                    if not pending_hh_pages or hh_page_cursor == previous_hh_cursor:
+                        break
+                    continue
+                if source == "getmatch.ru":
+                    if not int(result.get("items") or 0):
+                        break
+                    continue
+                page_window = any("maximum page window reached" in value for value in errors)
+                detail_window = any("detail limit reached" in value for value in errors)
+                if source in {"career.habr.com", "geekjob.ru"} and (page_window or detail_window):
+                    if page_window and not detail_window:
+                        page_window = group_kwargs.get("pages")
+                        if page_window is None:
+                            page_window = 100 if source == "hh.ru" else 50
+                        start_page += max(1, int(page_window))
+                    try:
+                        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = cursor_path.with_name(f".{cursor_path.name}.tmp")
+                        temporary.write_text(json.dumps({
+                            "track": track, "source": source, "scope": scope_id,
+                            "next_page": start_page, "updated_at": datetime.now(UTC).isoformat(),
+                        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                        os.chmod(temporary, 0o600)
+                        temporary.replace(cursor_path)
+                    except OSError as exc:
+                        result["errors"] = [*errors, f"resume cursor save failed: {exc}"]
+                        break
+                    continue
+                break
+            candidate_ids = list(dict.fromkeys(
+                str(value) for row in passes for value in row.get("candidate_ids", []) if str(value)
+            ))
+            totals: dict[str, int] = {}
+            for row in passes:
+                for key, value in (row.get("summary") or {}).items():
+                    if isinstance(value, int):
+                        totals[key] = totals.get(key, 0) + value
+            final = passes[-1] if passes else {"status": "failed", "errors": ["no scan pass ran"]}
+            pass_errors = [
+                f"pass {index + 1}: {error}"
+                for index, row in enumerate(passes) for error in row.get("errors", [])
+            ]
+            group_result = dict(final)
+            group_result.update({
+                "group": group_name, "status": final.get("status", "failed"),
+                "items": len(candidate_ids), "candidate_ids": candidate_ids,
+                "passes": len(passes),
+                "pass_campaign_ids": [row.get("campaign_id", "") for row in passes],
+                "summary": totals, "errors": pass_errors,
+            })
+            if source == "hh.ru":
+                query_count = len({
+                    str(value).strip() for value in group_search.get("queries", [])
+                    if str(value).strip()
+                })
+                group_result["query_count"] = query_count
+                if drain:
+                    all_segments = [
+                        segment for pass_result in passes
+                        for segment in pass_result.get("segments_detail", [])
+                    ]
+                    group_result["segments_detail"] = all_segments
+                if hh_cursor_complete:
+                    # The legacy HH runner reports coverage within one bounded
+                    # pass. The final pass may contain only the last unfinished
+                    # query, so its local `uncovered_queries` is not a campaign
+                    # coverage result. The cursor is removed only after every
+                    # query/area/sort segment reached a terminal page.
+                    residual_errors = [
+                        error for error in pass_errors
+                        if not any(marker in error.casefold() for marker in (
+                            "request budget reached", "maximum page window reached",
+                        ))
+                    ]
+                    failed_pass = any(
+                        str(pass_result.get("status") or "").casefold()
+                        in {"failed", "blocked", "partial"}
+                        for pass_result in passes
+                    )
+                    complete_status = "partial" if failed_pass or residual_errors else (
+                        "ok" if candidate_ids else "empty_verified"
+                    )
+                    group_result.update({
+                        "status": complete_status,
+                        "coverage_complete": True,
+                        "covered_query_count": query_count,
+                        "uncovered_queries": [],
+                        "errors": residual_errors,
+                    })
+                else:
+                    group_result["uncovered_queries"] = list(final.get("uncovered_queries") or [])
+            source_groups.append(group_result)
+
+        candidate_ids = list(dict.fromkeys(
+            str(value) for row in source_groups for value in row.get("candidate_ids", []) if str(value)
+        ))
+        statuses = {str(row.get("status") or "failed") for row in source_groups}
+        status = next((value for value in ("blocked", "failed", "partial", "truncated")
+                       if value in statuses),
+                      "empty_verified" if statuses == {"empty_verified"} else "ok")
+        summary: dict[str, int] = {}
+        for row in source_groups:
+            for key, value in (row.get("summary") or {}).items():
+                if isinstance(value, int):
+                    summary[key] = summary.get(key, 0) + value
+        if summary:
+            summary["items"] = len(candidate_ids)
+        results.append({
+            "source": source, "status": status, "account": source_account,
+            "track": track, "items": len(candidate_ids), "candidate_ids": candidate_ids,
+            "groups": len(source_groups),
+            "passes": sum(int(row.get("passes", 1)) for row in source_groups),
+            "query_count": sum(int(row.get("query_count", 0) or 0) for row in source_groups),
+            "covered_query_count": sum(
+                int(row.get("covered_query_count", 0) or 0) for row in source_groups
+            ),
+            "coverage_complete": bool(source == "hh.ru" and drain and source_groups)
+            and all(row.get("coverage_complete") is True for row in source_groups),
+            "segments_detail": [
+                segment for row in source_groups for segment in row.get("segments_detail", [])
+            ] if source == "hh.ru" and drain else [],
+            "uncovered_queries": list(dict.fromkeys(
+                str(value) for row in source_groups for value in row.get("uncovered_queries", [])
+            )),
+            "campaign_ids": [value for row in source_groups
+                             for value in row.get("pass_campaign_ids", [row.get("campaign_id", "")])],
+            "summary": summary,
+            "errors": [f"{row.get('group', 'default')}: {error}"
+                       for row in source_groups for error in row.get("errors", [])],
+            "partial": status in {"partial", "truncated", "blocked", "failed"},
+        })
     counts: dict[str, int] = {}
     for result in results:
         status = str(result.get("status") or "failed")
@@ -578,7 +906,87 @@ def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search:
         "sources": results,
         "counts": counts,
         "ok": sum(int(result.get("items") or 0) for result in results),
+        "until_complete": drain,
         "failed_sources": [r["source"] for r in results if r.get("status") in {"failed", "blocked"}],
+        "partial_sources": [r["source"] for r in results
+                             if r.get("status") in {"partial", "truncated", "blocked", "failed"}],
+    }
+
+
+def approve_scanned_fits(
+    store: Store, account: str, track: str, source: str, vacancy_ids: Iterable[str],
+    *, search: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Approve fully described FIT rows and explicitly allowed soft unknowns.
+
+    Missing salary is allowed only when the search profile says ``missing=include``.
+    An unknown publication date is not treated as stale when the active listing was
+    found in the current scan. Remote, currency, experience and personal checks stay hard.
+    """
+    wanted = {str(value).strip() for value in vacancy_ids if str(value).strip()}
+    rows = store.list_campaign_vacancies(account, track, "all", 5000, source=source)
+    groups = {
+        str(group.get("group_name") or "default"): group
+        for group in search_groups(search or {})
+    }
+    eligible: list[str] = []
+    rejected: dict[str, str] = {}
+    for row in rows:
+        vacancy_id = str(row.get("id") or "")
+        if vacancy_id not in wanted:
+            continue
+        group = groups.get(str(row.get("search_group") or "default"), search or {})
+        reasons = {str(value) for value in row.get("filter_reasons", [])}
+        soft_unknowns: set[str] = set()
+        if "publication:time_not_verified" in reasons and int(group.get("days", 0) or 0) > 0:
+            soft_unknowns.add("publication:time_not_verified")
+        salary_cfg = group.get("salary") or {}
+        if ("salary:unpublished_not_verified" in reasons
+                and str(salary_cfg.get("missing", "include")) == "include"):
+            soft_unknowns.add("salary:unpublished_not_verified")
+        allowed_unknown_reasons = soft_unknowns | {
+            "remote:verified", "work_format:matching", "experience:matching",
+            "salary:matching", "salary:missing_allowed", "salary:gross_net_unknown",
+        }
+        soft_unknown_ok = bool(soft_unknowns) and reasons <= allowed_unknown_reasons
+        problems = {str(value) for value in row.get("problems", [])}
+        if soft_unknown_ok and "salary:unpublished_not_verified" in soft_unknowns:
+            problems.discard("salary:unpublished")
+        reason = ""
+        if (row.get("score_decision") != "pass"
+                or (row.get("filter_status") != "pass" and not soft_unknown_ok)):
+            reason = "role or search conditions are not fully verified"
+        elif row.get("review_lane") != "FIT" and not (
+            soft_unknown_ok and row.get("review_lane") == "GOOD_UNKNOWN"
+        ):
+            reason = "not in the FIT review lane"
+        elif row.get("auto_apply_eligible") is False:
+            reason = "title requires manual role review"
+        elif row.get("description_status") != "ok" or not str(row.get("description") or "").strip():
+            reason = "full vacancy description is missing"
+        elif problems:
+            reason = "; ".join(sorted(problems))[:240]
+        elif row.get("channel_type") == "external_ats" or row.get("application_channel_type") == "external_ats":
+            reason = "external ATS requires separate review"
+        elif row.get("applied_before") or row.get("channel_duplicate"):
+            reason = "application channel is already used or reserved"
+        elif row.get("application_state") not in {"NOT_STARTED", "FAILED_BEFORE_SUBMIT", "READY_TO_APPLY"}:
+            reason = f"application state is {row.get('application_state')}"
+        if reason:
+            rejected[vacancy_id] = reason
+        else:
+            eligible.append(vacancy_id)
+    updated = 0
+    for offset in range(0, len(eligible), 100):
+        chunk = eligible[offset:offset + 100]
+        updated += store.set_review_state_batch(
+            account, source, chunk, "APPROVED",
+            reason=AUTO_APPROVAL_REASON,
+            track=track,
+        )
+    return {
+        "source": source, "requested": len(wanted), "eligible": len(eligible),
+        "approved": updated, "blocked": rejected,
     }
 
 
@@ -596,7 +1004,8 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         row for row in store.list_campaign_vacancies(
             account, track, "approved", 5000, source=source,
         )
-        if not row.get("applied_before")
+        if not needs_manual_reapproval(row)
+        and not row.get("applied_before")
         and row.get("filter_status") in {"pass", "unknown"}
         and row.get("score_decision") == "pass"
     ]
@@ -624,6 +1033,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
             "review_state": row.get("review_state", ""),
             "score_decision": row.get("score_decision", ""),
             "filter_status": row.get("filter_status", ""),
+            "resume": row.get("resume", ""),
         }
         # Re-read the live ledger at planning time.  The duplicate flag stored
         # during the scan can be stale after an HH sync or a manual decision.
@@ -653,7 +1063,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
             reason = f"not_ready:{row.get('application_state')}"
         elif source != "hh.ru" and not capabilities.apply and not verified_driver:
             reason = f"needs_live_validation:{capabilities.apply_status}"
-        elif row.get("application_channel_type") == "external_ats":
+        elif row.get("channel_type") == "external_ats":
             reason = "external_ats_manual_review"
         elif not capabilities.apply and source != "hh.ru" and not verified_driver:
             reason = "apply_not_available"

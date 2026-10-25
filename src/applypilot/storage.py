@@ -195,6 +195,17 @@ CREATE INDEX IF NOT EXISTS idx_telegram_messages_account
   ON telegram_messages(account, sent_at DESC);
 """
 
+AUTO_APPROVAL_REASON = "FIT by private search criteria; full description and conditions verified"
+
+
+def needs_manual_reapproval(item: dict[str, Any]) -> bool:
+    """Invalidate stale automatic approvals when current title policy is stricter."""
+    return (
+        item.get("review_state") == "APPROVED"
+        and item.get("review_reason") == AUTO_APPROVAL_REASON
+        and item.get("auto_apply_eligible") is not True
+    )
+
 def _vacancy_group_key(company: str, title: str) -> str:
     normalized = f"{company or ''}|{title or ''}".casefold()
     normalized = re.sub(r"[^0-9a-zа-яё]+", " ", normalized).strip()
@@ -675,7 +686,7 @@ class Store:
                             (task_id, account, "hh.ru", vacancy_id, track, task_type,
                              "NEEDS_MANUAL", payload, timestamp, timestamp),
                         )
-            if status == "success" and str(item.get("cover_letter") or "").strip():
+            if status == "success" and item.get("cover_letter_submitted") is True:
                 track = str(item.get("track") or "").strip()
                 conn.execute(
                     "UPDATE workflow_tasks SET status='SENT_CONFIRMED',updated_at=? "
@@ -1111,18 +1122,40 @@ class Store:
     def reserve_source_application(self, account: str, source: str, vacancy_id: str,
                                    track: str, channel_key: str, run_id: str,
                                    *, mirror_source: str = "",
-                                   mirror_native_id: str = "") -> tuple[bool, str]:
+                                   mirror_native_id: str = "",
+                                   per_run: int = 100,
+                                   per_day: int = 300) -> tuple[bool, str]:
         """Atomically reserves one canonical channel writer lock.
 
         The lock is ``(account, canonical channel)`` and is independent of the
         source/track that discovered the vacancy.  Two boards linking to the
         same ATS destination therefore cannot both reserve it, while HH and
-        Habr native forms remain separate channels.
+        Habr native forms remain separate channels.  Source budgets are
+        checked in the same write transaction as the reservation. Submitting,
+        unknown, successful and already-applied attempts consume budget;
+        known pre-submit failures do not.
         """
         channel = canonical_channel_key(channel_key)
         if not channel:
             return False, "missing channel key"
+        try:
+            per_run = int(per_run)
+            per_day = int(per_day)
+        except (TypeError, ValueError):
+            return False, "invalid source application budget"
+        if per_run < 1 or per_day < 1:
+            return False, "invalid source application budget"
         timestamp = now()
+        try:
+            current_time = datetime.fromisoformat(timestamp)
+        except ValueError:
+            current_time = datetime.now(UTC)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=UTC)
+        day_start = current_time.astimezone(UTC).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).isoformat()
+        consuming_statuses = ("submitting", "unknown", "success", "already_applied")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             link = conn.execute(
@@ -1171,6 +1204,36 @@ class Store:
                     )
                     return True, "already reserved for this run"
                 return False, "reserved by another run"
+
+            # Count the union of durable attempts and active reservations so
+            # the short interval between reserve() and recording submitting
+            # still consumes capacity. UNION deduplicates that in-flight item.
+            run_count = int(conn.execute(
+                """SELECT COUNT(*) FROM (
+                     SELECT vacancy_id,track,channel_key FROM source_application_attempts
+                     WHERE account=? AND source=? AND run_id=? AND status IN (?,?,?,?)
+                     UNION
+                     SELECT vacancy_id,track,channel_key FROM source_reservations
+                     WHERE account=? AND source=? AND run_id=?
+                   )""",
+                (account, source, run_id, *consuming_statuses,
+                 account, source, run_id),
+            ).fetchone()[0])
+            if run_count >= per_run:
+                return False, f"source per-run limit reached ({run_count}/{per_run})"
+            day_count = int(conn.execute(
+                """SELECT COUNT(*) FROM (
+                     SELECT vacancy_id,track,channel_key FROM source_application_attempts
+                     WHERE account=? AND source=? AND updated_at>=? AND status IN (?,?,?,?)
+                     UNION
+                     SELECT vacancy_id,track,channel_key FROM source_reservations
+                     WHERE account=? AND source=? AND created_at>=?
+                   )""",
+                (account, source, day_start, *consuming_statuses,
+                 account, source, day_start),
+            ).fetchone()[0])
+            if day_count >= per_day:
+                return False, f"source per-day limit reached ({day_count}/{per_day})"
             try:
                 conn.execute(
                     "INSERT INTO channel_reservations"
@@ -1939,6 +2002,8 @@ class Store:
         result = []
         with self.connect() as conn:
             for row in rows:
+                if needs_manual_reapproval(row):
+                    continue
                 # APPROVED is a track-scoped human override for reviewable unknown
                 # filters (for example, unpublished salary), never for rejected
                 # filters or an uncertain mechanical fit score.

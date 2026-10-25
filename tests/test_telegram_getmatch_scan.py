@@ -17,8 +17,10 @@ FIXTURES = ROOT / "tests/fixtures/public"
 class SpyGetmatch(GetMatchProvider):
     def __init__(self) -> None:
         self.detail_urls: list[str] = []
+        self.scan_filters: dict | None = None
 
     def discover(self, filters):
+        self.scan_filters = dict(filters)
         self.detail_urls = list(filters.get("detail_urls") or [])
         # Simulate a successful authenticated transport-independent detail scan
         # using a public synthetic HTML fixture, with no network or bot clicks.
@@ -56,6 +58,13 @@ def test_telegram_hints_use_saved_public_ids_and_restore_bot_links(tmp_path: Pat
     assert rows[0]["telegram_message_id"] == 101
     assert rows[0]["telegram_buttons"][0]["kind"] == "callback"
     assert store.source_attempts("default", "getmatch.ru") == []
+    assert provider.scan_filters is not None
+    sitemap_state = Path(provider.scan_filters["state_path"])
+    telegram_state = Path(provider.scan_filters["telegram_state_path"])
+    assert sitemap_state.name.startswith("sitemap_seen-")
+    assert telegram_state.name.startswith("telegram_seen-")
+    assert sitemap_state.parent == telegram_state.parent
+    assert sitemap_state != telegram_state
 
 
 def test_telegram_hints_require_explicit_opt_in(tmp_path: Path) -> None:

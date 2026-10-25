@@ -350,6 +350,8 @@ def execute_getmatch_pilot(
     track: str = "ai_core",
     allow_live: bool = False,
     run_id: str | None = None,
+    per_run: int = 100,
+    per_day: int = 300,
     transport: Callable[..., dict[str, Any]] = click_and_confirm,
 ) -> dict[str, Any]:
     """Reserve, submit one approved Getmatch callback, verify, then quarantine."""
@@ -367,6 +369,7 @@ def execute_getmatch_pilot(
     run_id = run_id or "getmatch-pilot-" + uuid.uuid4().hex[:12]
     reserved, note = store.reserve_source_application(
         account, "getmatch.ru", str(vacancy_id), track, channel, run_id,
+        per_run=per_run, per_day=per_day,
     )
     if not reserved:
         return {**plan, "status": "channel_conflict", "reason": note}

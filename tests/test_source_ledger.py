@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from applypilot.storage import Store
@@ -127,3 +128,57 @@ def test_planning_conflict_is_recomputed_not_taken_from_stale_link(tmp_path):
     assert conflict is not None
     assert conflict["kind"] == "applied_or_quarantined"
     assert conflict["source"] == "hh.ru"
+
+
+def test_source_limits_count_unknown_and_are_scoped_to_account_and_source(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve_source_application(
+        "acc", "career.habr.com", "100", "ai_core", "career.habr.com:100", "run-1",
+        per_run=10, per_day=1,
+    )[0]
+    assert store.record_source_application(
+        "acc", "career.habr.com", "100", "ai_core", "career.habr.com:100",
+        "submitting", run_id="run-1",
+    )
+    assert store.record_source_application(
+        "acc", "career.habr.com", "100", "ai_core", "career.habr.com:100",
+        "unknown", run_id="run-1",
+    )
+
+    blocked, reason = store.reserve_source_application(
+        "acc", "career.habr.com", "101", "ai_core", "career.habr.com:101", "run-2",
+        per_run=10, per_day=1,
+    )
+    assert not blocked
+    assert reason.startswith("source per-day limit reached")
+
+    # The same profile limit is independent for another source and account.
+    assert store.reserve_source_application(
+        "acc", "getmatch.ru", "100", "ai_core", "getmatch.ru:100", "run-1",
+        per_run=10, per_day=1,
+    )[0]
+    assert store.reserve_source_application(
+        "other-account", "career.habr.com", "100", "ai_core", "career.habr.com:100", "run-1",
+        per_run=10, per_day=1,
+    )[0]
+
+
+def test_source_run_cap_counts_active_reservations_and_is_atomic(tmp_path):
+    store = _store(tmp_path)
+
+    def reserve(index: int) -> bool:
+        ok, _reason = store.reserve_source_application(
+            "acc", "getmatch.ru", str(index), "ai_core", f"getmatch.ru:{index}", "run-1",
+            per_run=5, per_day=100,
+        )
+        return ok
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(reserve, range(20)))
+
+    assert sum(results) == 5
+    with store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_reservations WHERE account=? AND source=?",
+            ("acc", "getmatch.ru"),
+        ).fetchone()[0] == 5

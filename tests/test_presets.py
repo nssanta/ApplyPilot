@@ -25,6 +25,38 @@ def test_explicit_cli_preset_uses_only_declared_additional_queries():
     assert extended["queries"][-1] == "Private role"
 
 
+def test_role_preset_replaces_role_specific_guards_and_selects_role_resume():
+    result = resolve_search({
+        "exclude_title_patterns": ["AI-only"],
+        "exclude_location_patterns": ["AI-only"],
+        "salary": {"from": 120000},
+    }, "go-backend")
+
+    assert result["resume_key"] == "go"
+    assert "exclude_title_patterns" not in result
+    assert "exclude_location_patterns" not in result
+    assert result["salary"] == {"from": 120000}
+
+
+def test_role_preset_selects_resume_configured_in_private_profile(tmp_path):
+    from applypilot.cli import _profile
+    from applypilot.config import AppConfig, effective_search
+
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text(
+        '[resumes]\ndefault = "Default Resume"\ngo = "Go Resume"\n',
+        encoding="utf-8",
+    )
+    config = AppConfig(
+        tmp_path, tmp_path / "private" / "data", profile_path,
+        tmp_path / "search.toml",
+    )
+
+    profile = _profile(config, effective_search({}, "go-backend"))
+
+    assert profile["resume"] == "Go Resume"
+
+
 def test_ai_agents_llmops_preset_is_narrower_than_the_general_ai_preset():
     result = resolve_search({}, "ai-agents-llmops")
 

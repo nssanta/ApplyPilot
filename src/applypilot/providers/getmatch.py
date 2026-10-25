@@ -15,6 +15,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,26 @@ def _slug_score(slug: str) -> int:
     return score
 
 
+def _slug_role_score(slug: str, terms: Any) -> int:
+    """Scores explicit role terms from the active search profile against a URL slug."""
+    slug_tokens = [
+        token for token in re.split(r"[^a-z0-9а-яё]+", clean_text(slug).casefold()) if token
+    ]
+    tokens = set(slug_tokens)
+    compact_slug = "".join(slug_tokens)
+    score = 0
+    for raw_term in terms or ():
+        words = [
+            token for token in re.split(r"[^a-z0-9а-яё]+", clean_text(str(raw_term)).casefold())
+            if token
+        ]
+        if not words:
+            continue
+        if set(words).issubset(tokens) or "".join(words) in compact_slug:
+            score += 1
+    return score
+
+
 def _sitemap_rows(xml_text: str) -> list[dict[str, Any]]:
     """Parses public sitemap ``<loc>`` values and deduplicates by vacancy ID."""
     rows: list[dict[str, Any]] = []
@@ -149,6 +170,7 @@ def _sitemap_rows(xml_text: str) -> list[dict[str, Any]]:
             "slug": slug,
             "url": canonical_url(_BASE, value),
             "score": _slug_score(slug),
+            "sitemap_position": len(rows),
         })
     return rows
 
@@ -157,14 +179,41 @@ def _load_seen(filters: Mapping[str, Any]) -> tuple[set[str], Path | None]:
     seen: set[str] = set()
     state_path = filters.get("state_path")
     path = Path(str(state_path)) if state_path else None
+    now = time.time()
+    active_ttl = max(86400, int(filters.get("active_refresh_days", 7)) * 86400)
+    archived_ttl = max(active_ttl, int(filters.get("archived_refresh_days", 30)) * 86400)
     if path is not None and path.is_file():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             payload = {}
-        raw = payload
         if isinstance(payload, dict):
-            raw = payload.get("seen_ids") or payload.get("ids") or payload.get("seen_urls") or []
+            active = payload.get("active_seen")
+            archived = payload.get("archived_seen")
+            if isinstance(active, Mapping) or isinstance(archived, Mapping):
+                raw = []
+                for values, ttl in ((active, active_ttl), (archived, archived_ttl)):
+                    if not isinstance(values, Mapping):
+                        continue
+                    for value, stamp in values.items():
+                        try:
+                            fresh = 0 <= now - float(stamp) < ttl
+                        except (TypeError, ValueError):
+                            fresh = False
+                        if fresh:
+                            seen.add(str(value))
+            else:
+                raw = payload.get("seen_ids") or payload.get("ids") or payload.get("seen_urls") or []
+                try:
+                    legacy_age = now - path.stat().st_mtime
+                except OSError:
+                    legacy_age = 0
+                # Legacy state had no per-ID timestamps. Recheck it once if the
+                # old cursor is stale so active listings can be refreshed.
+                if legacy_age >= max(active_ttl, archived_ttl):
+                    raw = []
+        else:
+            raw = payload
         if isinstance(raw, (str, bytes)):
             raw = [raw]
         if isinstance(raw, Mapping):
@@ -208,11 +257,57 @@ def _persist_seen(
     seen: set[str],
     urls: set[str],
     filters: Mapping[str, Any],
+    *,
+    refreshed_ids: set[str] | None = None,
+    archived_ids: set[str] | None = None,
 ) -> None:
     if path is not None:
+        previous: dict[str, Any] = {}
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            if isinstance(loaded, dict):
+                previous = loaded
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        timestamp = time.time()
+        active_seen = dict(previous.get("active_seen") or {})
+        archived_seen = dict(previous.get("archived_seen") or {})
+        if not active_seen and not archived_seen:
+            try:
+                legacy_stamp = path.stat().st_mtime
+            except OSError:
+                legacy_stamp = timestamp
+            legacy = previous.get("seen_ids") or previous.get("ids") or []
+            if isinstance(legacy, (str, bytes)):
+                legacy = [legacy]
+            if isinstance(legacy, Mapping):
+                legacy = list(legacy.keys())
+            for value in legacy:
+                match = _VACANCY_ANY_RE.search(str(value))
+                if match:
+                    active_seen.setdefault(match.group(1), legacy_stamp)
+        current = {str(value) for value in seen}
+        refreshed = {str(value) for value in (refreshed_ids or set())}
+        archived = {str(value) for value in (archived_ids or set())}
+        active_seen = {
+            key: value for key, value in active_seen.items()
+            if key in current and key not in archived
+        }
+        archived_seen = {
+            key: value for key, value in archived_seen.items()
+            if key in current or key in archived
+        }
+        for value in current - archived:
+            if value not in active_seen or value in refreshed:
+                active_seen[value] = timestamp
+        for value in archived:
+            active_seen.pop(value, None)
+            archived_seen[value] = timestamp
         _atomic_write_json(path, {
-            "version": 1,
-            "seen_ids": sorted(seen),
+            "version": 2,
+            "seen_ids": sorted(current),  # compatibility with older readers
+            "active_seen": active_seen,
+            "archived_seen": archived_seen,
             "seen_urls": sorted(urls),
         })
     provided = filters.get("seen_ids")
@@ -390,7 +485,7 @@ class GetMatchProvider:
         login=True,
         check=True,
         apply=False,
-        apply_status="needs_live_validation",
+        apply_status="verified_telegram_callback",
     )
 
     def normalize(self, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -560,7 +655,41 @@ class GetMatchProvider:
             return self._discover_fixture_details(filters)
         urls = [str(value) for value in filters.get("detail_urls", []) if str(value).startswith("http")]
         if urls:
-            return self._discover_urls(urls, filters)
+            if not filters.get("include_sitemap"):
+                return self._discover_urls(urls, filters)
+            # Bot links are a priority source, not a replacement for the
+            # public catalogue. Share one request budget and then continue
+            # through the sitemap, suppressing IDs already fetched above.
+            telegram_filters = dict(filters)
+            if filters.get("telegram_state_path"):
+                telegram_filters["state_path"] = filters["telegram_state_path"]
+            budget = _Budget(_request_budget(filters))
+            linked_items, linked_segments = self._discover_urls(
+                urls, telegram_filters, budget=budget,
+            )
+            if any(str(value.status) == "blocked" for value in linked_segments):
+                return linked_items, linked_segments
+            sitemap_filters = dict(filters)
+            sitemap_filters["detail_urls"] = []
+            configured_details = _bounded_int(
+                filters, ("details_limit", "max_details"), 20, 500, 0,
+            )
+            linked_requests = sum(int(value.requests or 0) for value in linked_segments)
+            sitemap_filters["details_limit"] = max(0, configured_details - linked_requests)
+            sitemap_filters["seen_ids"] = {
+                str(item.get("native_id") or item.get("id") or "")
+                for item in linked_items
+                if str(item.get("native_id") or item.get("id") or "").isdigit()
+            }
+            sitemap_items, sitemap_segments = self._discover_live_sitemap(
+                sitemap_filters, budget=budget,
+            )
+            merged: dict[str, dict[str, Any]] = {}
+            for item in [*linked_items, *sitemap_items]:
+                key = str(item.get("native_id") or item.get("id") or "")
+                if key:
+                    merged.setdefault(key, item)
+            return list(merged.values()), [*linked_segments, *sitemap_segments]
         return self._discover_live_sitemap(filters)
 
     def _discover_fixture_details(
@@ -617,32 +746,74 @@ class GetMatchProvider:
             ]
         seen, state_path = _load_seen(filters)
         matched = [row for row in rows if row["score"] > 0]
+        role_terms = filters.get("primary_role_terms") or ()
+        if isinstance(role_terms, (str, bytes)):
+            role_terms = [role_terms]
+        for row in matched:
+            row["role_score"] = _slug_role_score(row["slug"], role_terms)
         unseen = [row for row in matched if row["native_id"] not in seen]
-        unseen.sort(key=lambda row: (-int(row["score"]), -int(row["native_id"])))
+        if role_terms:
+            # The live sitemap contains no <lastmod> fields. Preserve its order
+            # only as a stable traversal order after role-specific priority;
+            # neither sitemap position nor vacancy ID is a freshness claim.
+            unseen.sort(key=lambda row: (
+                -int(row["role_score"]), -int(row["score"]), int(row["sitemap_position"]),
+            ))
+        else:
+            unseen.sort(key=lambda row: (
+                -int(row["score"]), int(row["sitemap_position"]),
+            ))
         fixtures = _detail_fixture_map(filters)
+        known_descriptions = filters.get("known_descriptions") or {}
         limit = _bounded_int(filters, ("details_limit", "max_details"), 20, 500, 0)
         if offline:
-            candidates = [(row, fixtures[row["native_id"]]) for row in unseen
-                          if row["native_id"] in fixtures]
+            candidates = [
+                (row, fixtures[row["native_id"]], None) for row in unseen
+                if row["native_id"] in fixtures
+            ]
         else:
-            candidates = [(row, None) for row in unseen]
-        candidates = candidates[:limit]
+            candidates = [
+                (row, None, known_descriptions.get(row["native_id"])) for row in unseen
+            ]
         items: list[dict[str, Any]] = []
         archived = 0
         invalid = 0
+        cached = 0
+        processed = 0
         errors: list[str] = []
         blocked = False
         truncated = False
+        truncation_reason = ""
         new_seen: set[str] = set()
+        archived_seen: set[str] = set()
         seen_urls: set[str] = set()
         requests_used = 0
         budget = budget if budget is not None else _Budget(_request_budget(filters))
-        for row, path in candidates:
+        for row, path, cached_item in candidates:
+            if processed >= limit:
+                truncated = True
+                truncation_reason = "details limit reached"
+                break
             if path is not None:
                 html = path.read_text(encoding="utf-8")
+            elif (isinstance(cached_item, Mapping)
+                  and str(cached_item.get("description") or "").strip()):
+                item = dict(cached_item)
+                item.update({
+                    "id": row["native_id"], "native_id": row["native_id"],
+                    "source": self.source, "url": row["url"],
+                    "application_url": row["url"], "slug": row["slug"],
+                })
+                items.append(self.normalize(item))
+                processed += 1
+                cached += 1
+                new_seen.add(row["native_id"])
+                seen_urls.add(row["url"])
+                continue
             else:
                 if not budget.take():
                     truncated = True
+                    truncation_reason = "request budget reached"
                     break
                 html, fetch_status, error, used = _fetch(filters, row["url"], _timeout(filters))
                 requests_used += used
@@ -653,25 +824,33 @@ class GetMatchProvider:
             soup = BeautifulSoup(html, "html.parser")
             if _is_archived(soup):
                 archived += 1
+                processed += 1
                 new_seen.add(row["native_id"])
+                archived_seen.add(row["native_id"])
                 seen_urls.add(row["url"])
                 continue
             item = self._parse_detail(html, row["url"], row["native_id"])
             if item is None:
                 invalid += 1
+                processed += 1
                 continue
             if item["native_id"] in {existing["native_id"] for existing in items}:
+                processed += 1
                 continue
             items.append(item)
+            processed += 1
             new_seen.add(row["native_id"])
             seen_urls.add(row["url"])
         # Incremental sitemap scan: never erase IDs covered in earlier runs.
         # Otherwise a small details_limit loops over the same pages forever.
-        _persist_seen(state_path, seen | new_seen, seen_urls, filters)
+        _persist_seen(
+            state_path, seen | new_seen, seen_urls, filters,
+            refreshed_ids=new_seen - archived_seen, archived_ids=archived_seen,
+        )
 
         coverage = (
             f"sitemap_urls={len(rows)} matched={len(matched)} unseen={len(unseen)} "
-            f"fixtures={len(fixtures)} archived={archived} invalid={invalid}"
+            f"fixtures={len(fixtures)} cached={cached} archived={archived} invalid={invalid}"
         )
         if errors:
             coverage = f"{coverage} errors={len(errors)}"
@@ -699,6 +878,8 @@ class GetMatchProvider:
         detail_error = coverage
         if errors:
             detail_error = f"{detail_error}; " + "; ".join(errors[:3])
+        if truncated:
+            detail_error = f"{detail_error}; {truncation_reason or 'scan truncated'}"
         if limit == 0:
             detail_error = f"{detail_error}; details limit is zero"
         elif offline and not items and unseen:
@@ -711,9 +892,9 @@ class GetMatchProvider:
         ]
 
     def _discover_live_sitemap(
-        self, filters: Mapping[str, Any]
+        self, filters: Mapping[str, Any], *, budget: _Budget | None = None
     ) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
-        budget = _Budget(_request_budget(filters))
+        budget = budget if budget is not None else _Budget(_request_budget(filters))
         if not budget.take():
             return [], [segment("sitemap", status="truncated", items=0, requests=0,
                                 error="request budget reached")]
@@ -726,11 +907,11 @@ class GetMatchProvider:
         )
 
     def _discover_urls(
-        self, urls: list[str], filters: Mapping[str, Any]
+        self, urls: list[str], filters: Mapping[str, Any], *, budget: _Budget | None = None
     ) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
         """Incrementally fetch linked jobs, preserving successful bounded coverage."""
         limit = _bounded_int(filters, ("details_limit", "max_details"), 20, 500, 0)
-        budget = _Budget(_request_budget(filters))
+        budget = budget if budget is not None else _Budget(_request_budget(filters))
         seen, state_path = _load_seen(filters)
         selected: list[str] = []
         skipped_seen = 0
@@ -746,6 +927,7 @@ class GetMatchProvider:
             selected.append(url)
         items: list[dict[str, Any]] = []
         new_seen: set[str] = set()
+        archived_seen: set[str] = set()
         seen_urls: set[str] = set()
         errors: list[str] = []
         blocked = False
@@ -766,6 +948,7 @@ class GetMatchProvider:
             if _is_archived(BeautifulSoup(html, "html.parser")):
                 archived += 1
                 new_seen.add(native_id)
+                archived_seen.add(native_id)
                 seen_urls.add(url)
                 continue
             item = self._parse_detail(html, url)
@@ -775,7 +958,10 @@ class GetMatchProvider:
                 new_seen.add(native_id)
                 seen_urls.add(url)
         if state_path is not None:
-            _persist_seen(state_path, seen | new_seen, seen_urls, filters)
+            _persist_seen(
+                state_path, seen | new_seen, seen_urls, filters,
+                refreshed_ids=new_seen - archived_seen, archived_ids=archived_seen,
+            )
         if items:
             status = "partial" if errors or truncated else "ok"
         elif blocked:

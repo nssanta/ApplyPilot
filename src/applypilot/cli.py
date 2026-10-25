@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import io
 import json
 import logging
 import os
@@ -9,18 +10,18 @@ import random
 import sys
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import __version__, letters
-from .analytics import report
 from .config import (
     AppConfig,
     ConfigError,
     aitunnel_api_key,
+    application_limits,
     effective_search,
     ensure_data_dirs,
     search_groups,
@@ -60,6 +61,36 @@ from .templates import create_template, list_templates
 
 PRESET_CHOICES = tuple(ROLE_PRESETS)
 LOGGER = logging.getLogger(__name__)
+
+
+def _campaign_apply_summary(result: dict[str, Any]) -> dict[str, int | str]:
+    """Normalize the legacy HH runner and source dispatcher for campaign output."""
+    dispatch = result.get("dispatch")
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    raw = dispatch.get("summary")
+    if not isinstance(raw, dict):
+        raw = result.get("summary")
+    raw = raw if isinstance(raw, dict) else {}
+    counts = raw.get("counts")
+    counts = counts if isinstance(counts, dict) else raw
+    confirmed = int(counts.get("success", 0) or 0)
+    unknown = int(counts.get("unknown", 0) or 0)
+    sent_value = dispatch.get("send_attempts", dispatch.get("executed"))
+    sent = int(sent_value) if sent_value is not None else confirmed + unknown
+    failure_count = sum(
+        int(counts.get(key, 0) or 0) for key in ("failed", "failed_before_submit")
+    )
+    status = result.get("status") or dispatch.get("status")
+    if not status and result.get("exit_code") is not None:
+        status = "completed" if int(result["exit_code"]) == 0 else f"exit {result['exit_code']}"
+    return {
+        "sent": sent,
+        "confirmed": confirmed,
+        "needs_manual": int(counts.get("needs_manual", 0) or 0),
+        "unknown": unknown,
+        "failures": failure_count,
+        "status": str(status or "unknown"),
+    }
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -107,11 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_cmd = sub.add_parser("run", help="запустить ручную операцию")
     run_sub = run_cmd.add_subparsers(dest="run_action", required=True)
-    campaign = run_sub.add_parser("campaign", help="выполнить HH scan и сохранить очередь вакансий")
+    campaign = run_sub.add_parser("campaign", help="найти и подготовить вакансии; live apply включается явно")
     campaign.add_argument("--track", required=True, help="ключ трека из private/config/tracks.toml")
+    campaign.add_argument("--source", action="append", help="источник; повторить для нескольких; без флага — прежний HH-only режим")
     campaign.add_argument("--query", action="append", help="поисковая фраза; можно указать несколько раз")
     campaign.add_argument("--area", type=int, action="append", help="регион HH; можно указать несколько раз")
-    campaign.add_argument("--days", type=int, default=3)
+    campaign.add_argument("--days", type=int, default=30)
     campaign.add_argument("--pages", type=int)
     campaign.add_argument("--request-budget", type=int)
     campaign.add_argument("--details-limit", type=int)
@@ -119,8 +151,23 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
     campaign.add_argument("--salary-from", type=int)
     campaign.add_argument("--salary-currency")
-    campaign.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"), default="newest")
+    campaign.add_argument("--sort-mode", choices=("newest", "relevance", "balanced"))
     campaign.add_argument("--preset", choices=PRESET_CHOICES)
+    campaign.add_argument("--until-complete", action="store_true",
+                          help="продолжать bounded passes до завершения или внешней остановки")
+    campaign.add_argument("--resume", action="store_true",
+                          help="продолжить сохранённые страницы и sitemap cursors")
+    campaign.add_argument("--max-passes", type=int, default=30)
+    campaign.add_argument("--apply", action="store_true", help="после сканирования выполнить live отправки")
+    campaign.add_argument("--allow-live", action="store_true", help="обязательное явное подтверждение live режима")
+    campaign_visibility = campaign.add_mutually_exclusive_group()
+    campaign_visibility.add_argument("--visible", action="store_true",
+                                     help="показывать окна авторизованных площадок")
+    campaign_visibility.add_argument("--headless", action="store_true",
+                                     help="запускать браузерные отклики без видимого окна")
+    campaign.add_argument("--habr-min-interval", type=float, default=2.0)
+    campaign.add_argument("--getmatch-min-interval", type=float, default=2.0)
+    campaign.add_argument("--geekjob-min-interval", type=float, default=2.0)
 
     bundle = run_sub.add_parser("bundle", help="собрать до 100 кандидатов из нескольких треков")
     bundle.add_argument("--track", action="append", choices=("ai", "backend", "ml"),
@@ -145,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_list.add_argument("--track")
     queue_list.add_argument("--source", help="фильтр по источнику; без флага — все источники")
     queue_list.add_argument("--view", choices=(
-        "all", "new", "top", "deferred", "approved", "ready", "needs_letter", "needs_form",
+        "all", "new", "top", "review", "deferred", "approved", "ready", "needs_letter", "needs_form",
         "external_ats", "unknown", "applied", "skip",
     ), default="all")
     queue_list.add_argument("--limit", type=int, default=100)
@@ -230,6 +277,10 @@ def build_parser() -> argparse.ArgumentParser:
     sources_scan.add_argument("--pages", type=int)
     sources_scan.add_argument("--request-budget", type=int)
     sources_scan.add_argument("--details-limit", type=int)
+    sources_scan.add_argument("--days", type=int, default=30)
+    sources_scan.add_argument("--until-complete", action="store_true")
+    sources_scan.add_argument("--resume", action="store_true")
+    sources_scan.add_argument("--max-passes", type=int, default=30)
     sources_scan.add_argument("--limit", type=int, default=100)
     sources_scan.add_argument("--fixture-dir", help="офлайн-каталог публичных HTML-образцов")
     sources_scan.add_argument(
@@ -286,6 +337,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--getmatch-min-interval", type=float, default=2.0,
         help="Getmatch: минимальные секунды между Telegram callback в одной сессии (0..30)",
     )
+    sources_dispatch_apply.add_argument(
+        "--enable-geekjob", action="store_true",
+        help="включить native-form GeekJob driver; готовность анкеты и письма проверяется preflight",
+    )
+    sources_dispatch_apply.add_argument(
+        "--geekjob-min-interval", type=float, default=2.0,
+        help="GeekJob: минимальные секунды между отправками в одной сессии (0..30)",
+    )
     sources_dispatch_apply.add_argument("--json", action="store_true")
 
     sources_approve_batch = sources_sub.add_parser(
@@ -307,6 +366,11 @@ def build_parser() -> argparse.ArgumentParser:
     sources_accounts = sources_sub.add_parser("accounts", help="показать source account mapping")
     sources_accounts.add_argument("--track", required=True)
     sources_accounts.add_argument("--json", action="store_true")
+    sources_readiness = sources_sub.add_parser(
+        "readiness", help="локальная карта готовности без сети и изменения SQLite",
+    )
+    sources_readiness.add_argument("--track", required=True)
+    sources_readiness.add_argument("--json", action="store_true")
     sources_recover = sources_sub.add_parser("recover", help="карантинить прерванные submitting-попытки")
     sources_recover.add_argument("--account")
     sources_recover.add_argument("--max-age-seconds", type=int, default=900)
@@ -607,6 +671,11 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
                     "only_remote", "work_formats"):
             if key in search:
                 profile[key] = search[key]
+        resume_key = str(search.get("resume_key") or "").strip()
+        if resume_key:
+            resumes = profile.get("resumes", {}) or {}
+            selected_resume = str(resumes.get(resume_key) or "").strip()
+            profile["resume"] = selected_resume
     return profile
 
 
@@ -946,9 +1015,18 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
             )
             from .multisource import resolve_source_account
 
-            ledger_account = resolve_source_account(
-                config, config.load_profile(), "getmatch.ru",
+            selected_config, _track_info = _track_config(
+                config, track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
             )
+            selected_search = effective_search(selected_config.load_search())
+            profile = _profile(selected_config, selected_search)
+            ledger_account = resolve_source_account(
+                selected_config, profile, "getmatch.ru",
+            )
+            limits = application_limits(profile, "getmatch.ru")
+            per_run = limits["per_run"]
+            per_day = limits["per_day"]
             if args.allow_live and args.probe_live:
                 print("telegram-pilot: choose --probe-live OR --allow-live", file=sys.stderr)
                 return 2
@@ -979,7 +1057,7 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
                 result = execute_getmatch_pilot(
                     store, root, str(args.id), account=ledger_account,
                     telegram_account=telegram_account, track=track,
-                    allow_live=bool(args.allow_live),
+                    allow_live=bool(args.allow_live), per_run=per_run, per_day=per_day,
                 )
             if args.json:
                 emit(result)
@@ -1197,6 +1275,9 @@ def main(argv: list[str] | None = None) -> int:
             profile = _profile(
                 selected_config, effective_search(selected_config.load_search()),
             )
+            limits = application_limits(profile, "geekjob.ru")
+            per_run = limits["per_run"]
+            per_day = limits["per_day"]
             account = resolve_source_account(selected_config, profile, source)
             store = Store(selected_config.db_path)
             rows = [x for x in store.list_campaign_vacancies(
@@ -1247,6 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
             channel = str(row.get("channel_key") or f"{source}:{args.id}")
             reserved, reason = store.reserve_source_application(
                 account, source, str(args.id), args.track, channel, run_id,
+                per_run=per_run, per_day=per_day,
             )
             if not reserved:
                 output({"status": "channel_conflict", "id": args.id, "note": reason})
@@ -1379,25 +1461,30 @@ def main(argv: list[str] | None = None) -> int:
                 search_override=bool(args.search),
             )
             search = effective_search(selected_config.load_search())
+            search["days"] = args.days
             profile = _profile(selected_config, search)
             sources = args.source or None
             result = scan_sources(
                 selected_config, args.track, profile, search, sources=sources,
                 pages=args.pages, request_budget=args.request_budget,
                 details_limit=args.details_limit, limit=args.limit,
+                until_complete=args.until_complete, resume=args.resume,
+                max_passes=args.max_passes,
                 fixture_dir=args.fixture_dir, telegram_hints=args.telegram_hints,
                 registry=registry,
             )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
-                print(f"multi-source scan: track={args.track}; sources={len(result['sources'])}")
+                print(f"multi-source scan: track={args.track}; sources={len(result['sources'])}; "
+                      f"complete={not bool(result['partial_sources'])}; passes="
+                      f"{sum(int(row.get('passes', 1)) for row in result['sources'])}")
                 for row in result["sources"]:
-                    print(f"  {row['source']}: {row['status']} · items={row.get('items', 0)} · "
-                          f"campaign={row.get('campaign_id','-')}")
+                    print(f"  {row['source']}: {row['status']} · unique={row.get('items', 0)} · "
+                          f"groups={row.get('groups', 1)} · passes={row.get('passes', 1)}")
                     for error in row.get("errors", [])[:4]:
                         print(f"    note: {error[:220]}")
-            return 0 if not result["failed_sources"] else 2
+            return 0 if not result["partial_sources"] else 2
         if args.sources_action == "approve":
             selected_config, _track_info = _track_config(
                 config, args.track, profile_override=bool(args.profile),
@@ -1449,6 +1536,10 @@ def main(argv: list[str] | None = None) -> int:
                 source: resolve_source_account(selected_config, profile, source)
                 for source in selected
             }
+            source_limits = {
+                source: application_limits(profile, source)
+                for source in selected
+            }
             store = Store(selected_config.db_path)
             if args.sources_action == "dispatch-plan":
                 result = dispatch_plan(
@@ -1456,8 +1547,12 @@ def main(argv: list[str] | None = None) -> int:
                     accounts=accounts, registry=registry,
                 )
             else:
-                if (args.enable_habr or args.enable_getmatch) and not args.allow_live:
-                    print("dispatch: --enable-habr/--enable-getmatch requires --allow-live",
+                if args.allow_live and profile.get("reviewed") is not True:
+                    print("dispatch: live sends require reviewed = true in the selected private profile",
+                          file=sys.stderr)
+                    return 2
+                if (args.enable_habr or args.enable_getmatch or args.enable_geekjob) and not args.allow_live:
+                    print("dispatch: source drivers require --allow-live",
                           file=sys.stderr)
                     return 2
                 if not 0 <= args.habr_min_interval <= 30:
@@ -1466,65 +1561,111 @@ def main(argv: list[str] | None = None) -> int:
                 if not 0 <= args.getmatch_min_interval <= 30:
                     print("dispatch: --getmatch-min-interval must be 0..30", file=sys.stderr)
                     return 2
-                if (args.enable_getmatch and "getmatch.ru" in selected
-                        and os.environ.get("APPLYPILOT_TELEGRAM_LIVE") != "1"):
-                    print(
-                        "dispatch: Getmatch live requires APPLYPILOT_TELEGRAM_LIVE=1",
-                        file=sys.stderr,
-                    )
+                if not 0 <= args.geekjob_min_interval <= 30:
+                    print("dispatch: --geekjob-min-interval must be 0..30", file=sys.stderr)
                     return 2
                 drivers: dict[str, Any] = {}
                 with ExitStack() as cleanup:
                     if args.allow_live and args.enable_habr and "career.habr.com" in selected:
-                        from .habr_apply import HabrPageDriver
-                        from .provider_sessions import (
-                            ProviderSessionManager,
-                            _exclusive_profile_lock,
-                        )
-
-                        manager = ProviderSessionManager(selected_config.data_dir / "providers")
-                        habr_account = accounts["career.habr.com"]
-                        auth = manager.check("career.habr.com", habr_account)
-                        if auth.get("status") == "confirmed":
-                            from playwright.sync_api import sync_playwright
-
-                            profile_dir = manager.profile_dir("career.habr.com", habr_account)
-                            cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
-                            playwright = cleanup.enter_context(sync_playwright())
-                            context = manager._context_factory(playwright, profile_dir, not args.visible)
-                            cleanup.callback(context.close)
-                            drivers["career.habr.com"] = HabrPageDriver(
-                                context.new_page, min_interval_seconds=args.habr_min_interval,
+                        try:
+                            from .habr_apply import HabrPageDriver
+                            from .provider_sessions import (
+                                ProviderSessionManager,
+                                _exclusive_profile_lock,
                             )
-                        else:
+
+                            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+                            habr_account = accounts["career.habr.com"]
+                            auth = manager.check("career.habr.com", habr_account)
+                            if auth.get("status") == "confirmed":
+                                from playwright.sync_api import sync_playwright
+
+                                profile_dir = manager.profile_dir("career.habr.com", habr_account)
+                                cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
+                                playwright = cleanup.enter_context(sync_playwright())
+                                context = manager._context_factory(playwright, profile_dir, not args.visible)
+                                cleanup.callback(context.close)
+                                drivers["career.habr.com"] = HabrPageDriver(
+                                    context.new_page, min_interval_seconds=args.habr_min_interval,
+                                )
+                            else:
+                                print(
+                                    f"Habr driver unavailable: login={auth.get('status', 'unknown')}; "
+                                    "run sources login/check first",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # noqa: BLE001 - isolate one source setup failure
                             print(
-                                f"Habr driver unavailable: login={auth.get('status', 'unknown')}; "
-                                "run sources login/check first",
+                                f"Habr driver initialization failed: {type(exc).__name__}: {str(exc)[:160]}",
                                 file=sys.stderr,
                             )
                     if args.allow_live and args.enable_getmatch and "getmatch.ru" in selected:
-                        from .getmatch_apply import GetmatchCallbackDriver
-                        from .telegram_client import TelegramAccount
+                        try:
+                            from .getmatch_apply import GetmatchCallbackDriver
+                            from .telegram_client import TelegramAccount
 
-                        source_account = accounts["getmatch.ru"]
-                        telegram_account = "getmatch-primary"
-                        auth = TelegramAccount(config.root, telegram_account).status()
-                        if auth.get("status") == "confirmed":
-                            drivers["getmatch.ru"] = GetmatchCallbackDriver(
-                                config.root, store, account=source_account,
-                                telegram_account=telegram_account, track=args.track,
-                                min_interval_seconds=args.getmatch_min_interval,
-                            )
-                        else:
+                            source_account = accounts["getmatch.ru"]
+                            telegram_account = "getmatch-primary"
+                            auth = TelegramAccount(config.root, telegram_account).status()
+                            if auth.get("status") == "confirmed":
+                                drivers["getmatch.ru"] = GetmatchCallbackDriver(
+                                    config.root, store, account=source_account,
+                                    telegram_account=telegram_account, track=args.track,
+                                    min_interval_seconds=args.getmatch_min_interval,
+                                )
+                            else:
+                                print(
+                                    f"Getmatch driver unavailable: Telegram={auth.get('status', 'unknown')}; "
+                                    "run accounts telegram-status --online first",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # noqa: BLE001 - isolate one source setup failure
                             print(
-                                f"Getmatch driver unavailable: Telegram={auth.get('status', 'unknown')}; "
-                                "run accounts telegram-status --online first",
+                                f"Getmatch driver initialization failed: {type(exc).__name__}: {str(exc)[:160]}",
+                                file=sys.stderr,
+                            )
+                    if args.allow_live and args.enable_geekjob and "geekjob.ru" in selected:
+                        try:
+                            from .geekjob_apply import GeekJobPageDriver
+                            from .provider_sessions import (
+                                ProviderSessionManager,
+                                _exclusive_profile_lock,
+                            )
+
+                            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+                            geekjob_account = accounts["geekjob.ru"]
+                            auth = manager.check("geekjob.ru", geekjob_account)
+                            if auth.get("status") == "confirmed":
+                                from playwright.sync_api import sync_playwright
+
+                                profile_dir = manager.profile_dir("geekjob.ru", geekjob_account)
+                                cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
+                                playwright = cleanup.enter_context(sync_playwright())
+                                context = manager._context_factory(
+                                    playwright, profile_dir, not args.visible,
+                                )
+                                cleanup.callback(context.close)
+                                drivers["geekjob.ru"] = GeekJobPageDriver(
+                                    context.new_page,
+                                    selected_config.data_dir / "providers" / "geekjob"
+                                    / geekjob_account / "letters",
+                                    min_interval_seconds=args.geekjob_min_interval,
+                                )
+                            else:
+                                print(
+                                    f"GeekJob driver unavailable: login={auth.get('status', 'unknown')}; "
+                                    "run sources login/check first",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # noqa: BLE001 - isolate one source setup failure
+                            print(
+                                f"GeekJob driver initialization failed: {type(exc).__name__}: {str(exc)[:160]}",
                                 file=sys.stderr,
                             )
                     result = dispatch_apply(
                         store, "default", args.track, selected, args.limit,
                         allow_live=bool(args.allow_live), drivers=drivers,
-                        accounts=accounts, registry=registry,
+                        accounts=accounts, source_limits=source_limits, registry=registry,
                     )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1572,6 +1713,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"updated={result['updated']} state={result['state']}"
                 )
             return 0
+        if args.sources_action == "readiness":
+            from .multisource import resolve_source_account
+            from .readiness import CHANNELS, readiness_snapshot
+
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            profile = selected_config.load_profile()
+            accounts = {source: resolve_source_account(selected_config, profile, source)
+                        for source in CHANNELS}
+            result = readiness_snapshot(
+                selected_config.db_path, args.track, accounts,
+                max_sync_age_hours=max(1, int((profile.get("apply") or {}).get("sync_max_age_hours", 24))),
+            )
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"readiness: {result['status']} (local only; session/preflight still required)")
+                for row in result["sources"]:
+                    print(f"{row['source']}: {row['channel']} · {row['queue']} · {', '.join(row['gates'])}")
+            return 2 if result["status"] == "database_missing" else 0
         if args.sources_action == "accounts":
             selected_config, _track_info = _track_config(
                 config, args.track, profile_override=bool(args.profile),
@@ -1707,6 +1870,255 @@ def main(argv: list[str] | None = None) -> int:
         print("No applications submitted. Use batch-set and queue apply after selecting good fits.")
         return 2 if failures else 0
     if args.command == "run" and args.run_action == "campaign":
+        if (args.source is not None or args.until_complete or args.resume or args.apply):
+            if args.apply and not args.allow_live:
+                print("campaign: --apply requires explicit --allow-live", file=sys.stderr)
+                return 2
+            if args.allow_live and not args.apply:
+                print("campaign: --allow-live is meaningful only with --apply", file=sys.stderr)
+                return 2
+            try:
+                selected_config, track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search(), args.preset)
+                search["days"] = args.days
+                if args.query:
+                    if isinstance(search.get("groups"), list):
+                        for group in search["groups"]:
+                            if isinstance(group, dict):
+                                group["queries"] = list(args.query)
+                    else:
+                        search["queries"] = list(args.query)
+                if args.area:
+                    search["areas"] = list(args.area)
+                    for group in search.get("groups", []):
+                        if isinstance(group, dict):
+                            group["areas"] = list(args.area)
+                if args.remote is not None:
+                    search["only_remote"] = args.remote
+                    for group in search.get("groups", []):
+                        if isinstance(group, dict):
+                            group["only_remote"] = args.remote
+                if args.sort_mode is not None:
+                    search["sort_mode"] = args.sort_mode
+                profile = _profile(selected_config, search)
+                if not search.get("resume_key"):
+                    profile["resume"] = str(track_info.get("resume") or profile.get("resume") or "")
+                from .multisource import approve_scanned_fits, resolve_source_account, scan_sources
+                from .providers import default_registry
+
+                registry = default_registry()
+                selected = list(dict.fromkeys(args.source or ["hh.ru"]))
+                unknown_sources = [source for source in selected if source not in registry.sources()]
+                if unknown_sources:
+                    raise ValueError(f"unknown source(s): {', '.join(unknown_sources)}")
+                if not 1 <= args.limit <= 100 or not 1 <= args.max_passes <= 100:
+                    raise ValueError("limit must be 1..100 and max-passes must be 1..100")
+                order = ["hh.ru", "career.habr.com", "getmatch.ru", "geekjob.ru",
+                         "dreamjob.ru", "yandex.ru/jobs"]
+                selected.sort(key=lambda value: order.index(value) if value in order else len(order))
+                store = Store(selected_config.db_path)
+                stops: dict[str, str] = {}
+                hh_sync_ok = False
+                telegram_sync: dict[str, Any] = {"status": "not_selected"}
+                if "getmatch.ru" in selected:
+                    from .getmatch_receipts import reconcile_getmatch_receipts
+                    from .telegram_client import TelegramAccount
+
+                    telegram_account = "getmatch-primary"
+                    telegram = TelegramAccount(selected_config.root, telegram_account)
+                    telegram_sync = {"session": telegram.status()}
+                    try:
+                        if telegram_sync["session"].get("status") == "confirmed":
+                            telegram_sync["history"] = telegram.sync(store, 1000)
+                            ledger_account = resolve_source_account(
+                                selected_config, profile, "getmatch.ru",
+                            )
+                            telegram_sync["receipts_before_scan"] = reconcile_getmatch_receipts(
+                                store, telegram_account,
+                                ledger_account=ledger_account, track=args.track, limit=1000,
+                            )
+                        else:
+                            telegram_sync["history"] = {
+                                "status": "not_synced",
+                                "reason": "Telegram session is not confirmed; sitemap scan remains available",
+                            }
+                    except Exception as exc:  # noqa: BLE001 - isolate Telegram from other sources
+                        telegram_sync["history"] = {
+                            "status": "error",
+                            "reason": f"{type(exc).__name__}: {str(exc)[:180]}",
+                        }
+                if args.apply and "hh.ru" in selected:
+                    from .negotiations import SyncError, sync_statuses
+
+                    session_path = selected_config.data_dir / "hh_session.json"
+                    valid, detail = validate_state(session_path)
+                    if not valid:
+                        stops["hh.ru"] = f"sync blocked: {detail}"
+                    else:
+                        try:
+                            with store.run_lock():
+                                store.recover_interrupted_runs(_account(profile))
+                                sync_statuses(session_path, store, account=_account(profile))
+                                store.reconcile_unknowns_from_negotiations(_account(profile))
+                            hh_sync_ok = bool((store.latest_sync(_account(profile)) or {}).get("status") == "ok")
+                            if not hh_sync_ok:
+                                stops["hh.ru"] = "fresh HH negotiation sync did not complete"
+                        except (SyncError, OSError, ValueError) as exc:
+                            stops["hh.ru"] = f"sync blocked: {type(exc).__name__}: {str(exc)[:180]}"
+                scan_search = dict(search)
+                scan_search["days"] = args.days
+                scanned = scan_sources(
+                    selected_config, args.track, profile, scan_search, sources=selected,
+                    until_complete=args.until_complete, resume=args.resume,
+                    max_passes=args.max_passes, pages=args.pages,
+                    request_budget=args.request_budget, details_limit=args.details_limit,
+                    limit=args.limit,
+                    telegram_hints=("getmatch.ru" in selected), registry=registry,
+                )
+                if "getmatch.ru" in selected and telegram_sync.get("history", {}).get("status") == "ok":
+                    try:
+                        ledger_account = resolve_source_account(
+                            selected_config, profile, "getmatch.ru",
+                        )
+                        telegram_sync["receipts_after_scan"] = reconcile_getmatch_receipts(
+                            store, "getmatch-primary", ledger_account=ledger_account,
+                            track=args.track, limit=1000,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - scanner result remains usable
+                        telegram_sync["receipt_reconcile_error"] = (
+                            f"{type(exc).__name__}: {str(exc)[:180]}"
+                        )
+                approvals: dict[str, dict[str, Any]] = {}
+                for row in scanned["sources"]:
+                    source = row["source"]
+                    account = resolve_source_account(selected_config, profile, source)
+                    approvals[source] = approve_scanned_fits(
+                        store, account, args.track, source, row.get("candidate_ids", []),
+                        search=search,
+                    )
+                live: dict[str, Any] = {}
+                if args.apply:
+                    if profile.get("reviewed") is not True:
+                        stops["campaign"] = "live sends blocked: selected private profile is not reviewed"
+                    for source in selected:
+                        if profile.get("reviewed") is not True:
+                            live[source] = {"status": "blocked: private profile is not reviewed"}
+                            continue
+                        if source == "hh.ru":
+                            if not hh_sync_ok:
+                                continue
+                            from .campaigns import write_approved_input
+
+                            account = _account(profile)
+                            input_path, prepared = write_approved_input(
+                                selected_config, args.track, account, args.limit,
+                            )
+                            if not prepared or input_path is None:
+                                live[source] = {"status": "no READY approved HH vacancies", "sent": 0}
+                                continue
+                            expected_resume = str(profile.get("resume") or track_info.get("resume") or "").strip()
+                            if not expected_resume or any(
+                                str(item.get("resume") or "").strip() != expected_resume
+                                for item in prepared
+                            ):
+                                stops[source] = "live send blocked: exact track resume missing or mismatched"
+                                continue
+                            run_id = uuid.uuid4().hex
+                            code = _run_apply(
+                                selected_config, store, prepared, run_id, account,
+                                input_path, args.limit,
+                                headless_override=(True if args.headless else
+                                                   (False if args.visible else None)),
+                            )
+                            live[source] = {
+                                "exit_code": code, "run_id": run_id,
+                                "summary": store.run_summary(run_id),
+                            }
+                            continue
+                        if source == "dreamjob.ru":
+                            live[source] = {"status": "mirror of HH; no independent submission"}
+                            continue
+                        account = resolve_source_account(selected_config, profile, source)
+                        cmd = [
+                            "--data-dir", str(selected_config.data_dir),
+                            "--profile", str(selected_config.profile_path),
+                            "--search", str(selected_config.search_path),
+                            "sources", "dispatch-apply", "--track", args.track,
+                            "--source", source, "--limit", str(args.limit),
+                            "--allow-live", "--json",
+                        ]
+                        if args.visible:
+                            cmd.append("--visible")
+                        if source == "career.habr.com":
+                            cmd.extend(("--enable-habr", "--habr-min-interval", str(args.habr_min_interval)))
+                        elif source == "getmatch.ru":
+                            cmd.extend(("--enable-getmatch", "--getmatch-min-interval",
+                                        str(args.getmatch_min_interval)))
+                        elif source == "geekjob.ru":
+                            cmd.extend(("--enable-geekjob", "--geekjob-min-interval",
+                                        str(args.geekjob_min_interval)))
+                        capture = io.StringIO()
+                        previous_telegram_live = os.environ.get("APPLYPILOT_TELEGRAM_LIVE")
+                        if source == "getmatch.ru":
+                            # The unified command's explicit --apply --allow-live
+                            # is the operator opt-in for the existing callback
+                            # gate as well; restore the caller's environment
+                            # immediately after this isolated source dispatch.
+                            os.environ["APPLYPILOT_TELEGRAM_LIVE"] = "1"
+                        try:
+                            with redirect_stdout(capture):
+                                code = main(cmd)
+                        finally:
+                            if source == "getmatch.ru":
+                                if previous_telegram_live is None:
+                                    os.environ.pop("APPLYPILOT_TELEGRAM_LIVE", None)
+                                else:
+                                    os.environ["APPLYPILOT_TELEGRAM_LIVE"] = previous_telegram_live
+                        try:
+                            dispatch_result = json.loads(capture.getvalue())
+                        except json.JSONDecodeError:
+                            dispatch_result = {"status": "dispatch did not return JSON",
+                                               "output": capture.getvalue()[-2000:]}
+                        live[source] = {"exit_code": code, "account": account,
+                                        "dispatch": dispatch_result}
+                report = {
+                    "track": args.track, "sources": selected,
+                    "search_days": args.days, "until_complete": bool(args.until_complete or args.resume),
+                    "scan": scanned, "approvals": approvals, "live": live, "stops": stops,
+                    "telegram_sync": telegram_sync,
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+                report_path = _default_artifact(selected_config, "reports", "json")
+                _write_private_json(report_path, report)
+                os.chmod(report_path, 0o600)
+                print(f"campaign: track={args.track}; sources={len(selected)}; "
+                      f"scan={'complete' if not scanned['partial_sources'] else 'partial'}; "
+                      f"live={'enabled' if args.apply else 'off'}")
+                for row in scanned["sources"]:
+                    print(f"  SCAN {row['source']}: {row['status']} · unique={row.get('items', 0)} "
+                          f"· groups={row.get('groups', 1)} · passes={row.get('passes', 1)} "
+                          f"· FIT approved={approvals.get(row['source'], {}).get('approved', 0)}")
+                for source, result in live.items():
+                    counts = _campaign_apply_summary(result)
+                    print(
+                        f"  APPLY {source}: sent={counts['sent']} confirmed={counts['confirmed']} "
+                        f"needs_manual={counts['needs_manual']} unknown={counts['unknown']} "
+                        f"failures={counts['failures']} status={counts['status']}"
+                    )
+                for source, reason in stops.items():
+                    print(f"  STOP {source}: {reason}")
+                print(f"private_report: {report_path}")
+                return 2 if scanned["partial_sources"] or stops else 0
+            except (ConfigError, ValueError, OSError) as exc:
+                print(f"campaign: error ({str(exc)[:240]})", file=sys.stderr)
+                return 2
+            except Exception as exc:
+                LOGGER.exception("Multi-source campaign failed")
+                print(f"campaign: error ({type(exc).__name__}: {str(exc)[:200]})", file=sys.stderr)
+                return 3
         try:
             selected_config, track_info = _track_config(
                 config, args.track, profile_override=bool(args.profile),
@@ -1714,6 +2126,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             search = effective_search(selected_config.load_search(), args.preset)
             profile = _profile(selected_config, search)
+            if not search.get("resume_key"):
+                profile["resume"] = str(track_info.get("resume") or profile.get("resume") or "")
             from .campaigns import run_campaign
 
             result = run_campaign(
@@ -1721,7 +2135,8 @@ def main(argv: list[str] | None = None) -> int:
                 days=args.days, pages=args.pages, request_budget=args.request_budget,
                 details_limit=args.details_limit, limit=args.limit, only_remote=args.remote,
                 salary_from=args.salary_from, salary_currency=args.salary_currency,
-                sort_mode=args.sort_mode, track_resume=str(track_info.get("resume") or ""),
+                sort_mode=args.sort_mode or str(search.get("sort_mode") or "newest"),
+                track_resume=str(profile.get("resume") or track_info.get("resume") or ""),
                 preset=args.preset,
             )
         except (ConfigError, ValueError, OSError) as exc:
@@ -1763,15 +2178,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "queue":
         try:
             if args.queue_action == "list":
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+
                 store, account, track = _campaign_view(
                     config, args.track, profile_override=bool(args.profile),
                     search_override=bool(args.search),
                 )
-                rows = store.list_campaign_vacancies(
-                    account, track, args.view, args.limit, source=args.source,
-                )
+                selected_config, _ = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                ) if args.track else (config, {})
+                profile = selected_config.load_profile()
+                sources = [args.source] if args.source else default_registry().sources()
+                accounts = {src: resolve_source_account(selected_config, profile, src)
+                            for src in sources}
+                rows = []
+                for src, source_account in accounts.items():
+                    rows.extend(store.list_campaign_vacancies(
+                        source_account, track, args.view, args.limit, source=src,
+                    ))
+                lane_rank = {"FIT": 0, "GOOD_UNKNOWN": 1, "NEEDS_ENRICHMENT": 2,
+                             "MANUAL_REVIEW": 3, "SKIP": 4, "APPLIED": 5}
+                rows.sort(key=lambda row: (lane_rank.get(str(row.get("review_lane")), 4),
+                                           -int(row.get("score") or 0)))
+                rows = rows[:args.limit]
+                if args.source:
+                    account = accounts[args.source]
                 if args.json:
                     print(json.dumps({"account": account, "track": track, "view": args.view,
+                                      "accounts": accounts,
                                       "count": len(rows), "items": rows}, ensure_ascii=False, indent=2))
                     return 0
                 print(f"queue: {args.view}; track={track or 'all'}; items={len(rows)}")
@@ -1809,7 +2245,10 @@ def main(argv: list[str] | None = None) -> int:
                     search_override=bool(args.search),
                 )
                 search = effective_search(selected_config.load_search())
-                account = _account(_profile(selected_config, search))
+                from .multisource import resolve_source_account
+                account = resolve_source_account(
+                    selected_config, _profile(selected_config, search), args.source,
+                )
                 Store(selected_config.db_path).set_review_state(
                     account, args.source, args.id, args.state, reason=args.reason, notes=args.notes,
                     track=args.track,
@@ -1822,7 +2261,10 @@ def main(argv: list[str] | None = None) -> int:
                     search_override=bool(args.search),
                 )
                 search = effective_search(selected_config.load_search())
-                account = _account(_profile(selected_config, search))
+                from .multisource import resolve_source_account
+                account = resolve_source_account(
+                    selected_config, _profile(selected_config, search), args.source,
+                )
                 changed = Store(selected_config.db_path).set_review_state_batch(
                     account, args.source, args.id, args.state, reason=args.reason, track=args.track,
                 )
@@ -1844,7 +2286,8 @@ def main(argv: list[str] | None = None) -> int:
                 account = _account(profile)
                 store = Store(selected_config.db_path)
                 if args.source != "hh.ru":
-                    from .multisource import queue_plan
+                    from .multisource import queue_plan, resolve_source_account
+                    account = resolve_source_account(selected_config, profile, args.source)
                     plan = queue_plan(store, account, args.track, args.source, args.limit)
                     print(f"source dry-run: {args.source}; planned={plan['planned_count']} "
                           f"blocked={plan['blocked_count']} · apply={plan['apply_status']}")
@@ -2628,6 +3071,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     stop_reason = ""
     exit_code = 0
     confirmed_successes = 0
+    manual_questions: list[dict[str, str]] = []
     with store.run_lock():
         store.recover_interrupted_runs(account)
         store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
@@ -2711,7 +3155,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     visibility_verified=visibility_verified,
                     manual_captcha_timeout=manual_captcha_timeout,
                     interactive=interactive_captcha,
+                    screening_answers=profile.get("answers", {}),
                 )
+                if (result.status == "needs_manual"
+                        and result.note.startswith("unanswered screening questions:")):
+                    manual_questions.append({
+                        "id": vacancy_id, "url": str(item.get("url") or ""),
+                        "questions": result.note.removeprefix(
+                            "unanswered screening questions: "
+                        ),
+                    })
                 if result.status == "unknown":
                     store.record(item, result.status, result.note, run_id, account)
                     if run_headless and "CAPTCHA" in result.note:
@@ -2819,6 +3272,10 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                 exit_code = 4
             store.finish_run(run_id, run_status, stop_reason)
             store.recover_interrupted_runs(account)
+    if manual_questions:
+        print("manual screening questions (saved with each attempt):")
+        for task in manual_questions:
+            print(f"  {task['id']} · {task['url']} · {task['questions']}")
     _print_run_summary(store, run_id)
     return exit_code
 
