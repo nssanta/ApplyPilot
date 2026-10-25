@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reproducible offline Multi-Source smoke on public synthetic fixtures.
 
 No network, no browser, no real application.  It scans saved public fixtures,
