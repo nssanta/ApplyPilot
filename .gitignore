@@ -1,4 +1,8 @@
 # Private data and credentials
+# Automated CI/CD is intentionally disabled; validation runs locally.
+.github/workflows/
+.gitlab-ci.yml
+.circleci/
 private/
 AGENTS.md
 docs/IMPLEMENTATION_PLAN.md
