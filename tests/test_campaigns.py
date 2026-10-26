@@ -172,6 +172,9 @@ def test_stale_automatic_title_approval_is_filtered_from_hh_apply_input(tmp_path
     _path, prepared = write_approved_input(config, "ai_core", "default")
 
     assert [item["id"] for item in prepared] == ["manual-override", "current-auto"]
+    _selected_path, selected = write_approved_input(
+        config, "ai_core", "default", vacancy_ids={"manual-override"})
+    assert [item["id"] for item in selected] == ["manual-override"]
 
 
 def test_unpublished_salary_is_maybe_until_owner_approves_it(tmp_path, monkeypatch):

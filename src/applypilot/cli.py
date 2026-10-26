@@ -221,6 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     queue_apply.add_argument("--track", required=True)
     queue_apply.add_argument("--source", default="hh.ru", help="источник очереди")
     queue_apply.add_argument("--limit", type=int, default=100)
+    queue_apply.add_argument("--id", action="append", default=[],
+                             help="точные ID ранее APPROVED вакансий HH для выборочного запуска")
     apply_mode = queue_apply.add_mutually_exclusive_group(required=True)
     apply_mode.add_argument("--dry-run", action="store_true")
     apply_mode.add_argument("--run", action="store_true")
@@ -2274,6 +2276,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.limit < 1 or args.limit > 100:
                     print("--limit must be between 1 and 100", file=sys.stderr)
                     return 2
+                if args.id and args.source != "hh.ru":
+                    print("--id is currently supported only for the HH queue", file=sys.stderr)
+                    return 2
                 if args.target_success is not None and (args.target_success < 1 or args.target_success > args.limit):
                     print("--target-success must be positive and no greater than --limit", file=sys.stderr)
                     return 2
@@ -2302,7 +2307,23 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 from .campaigns import write_approved_input
 
-                input_path, selected = write_approved_input(selected_config, args.track, account, args.limit)
+                requested_ids = {str(value).strip() for value in args.id if str(value).strip()}
+                if args.id and (not requested_ids or any(not value.isdecimal() for value in requested_ids)):
+                    print("--id must be a nonempty HH numeric vacancy ID", file=sys.stderr)
+                    return 2
+                if len(requested_ids) > args.limit:
+                    print("--limit must cover every requested --id", file=sys.stderr)
+                    return 2
+                input_path, selected = write_approved_input(
+                    selected_config, args.track, account,
+                    100 if requested_ids else args.limit,
+                    vacancy_ids=requested_ids if requested_ids else None,
+                )
+                missing = requested_ids - {str(item.get("id") or "") for item in selected}
+                if missing:
+                    print(f"requested IDs are not approved and ready: {', '.join(sorted(missing))}",
+                          file=sys.stderr)
+                    return 2
                 if input_path is None or not selected:
                     print("approved queue is empty or every approved vacancy is blocked", file=sys.stderr)
                     return 2

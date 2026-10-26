@@ -16,6 +16,15 @@ def test_queue_apply_accepts_explicit_bulk_limit() -> None:
     assert args.visible is True
 
 
+def test_queue_apply_accepts_exact_ids_for_a_single_hh_pilot() -> None:
+    args = build_parser().parse_args([
+        "queue", "apply", "--track", "ai", "--source", "hh.ru",
+        "--id", "123", "--id", "456", "--limit", "2", "--dry-run",
+    ])
+    assert args.id == ["123", "456"]
+    assert args.limit == 2
+
+
 def test_campaign_preserves_track_sort_mode_unless_overridden() -> None:
     parser = build_parser()
     configured = parser.parse_args([
