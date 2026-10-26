@@ -953,7 +953,12 @@ def approve_scanned_fits(
         if soft_unknown_ok and "salary:unpublished_not_verified" in soft_unknowns:
             problems.discard("salary:unpublished")
         reason = ""
-        if (row.get("score_decision") != "pass"
+        # Never overwrite a human review or repeat an existing approval.
+        # The owner must explicitly reset a decision to UNREVIEWED first.
+        review_state = str(row.get("review_state") or "UNREVIEWED").upper()
+        if review_state != "UNREVIEWED":
+            reason = f"existing review state is {review_state}"
+        elif (row.get("score_decision") != "pass"
                 or (row.get("filter_status") != "pass" and not soft_unknown_ok)):
             reason = "role or search conditions are not fully verified"
         elif row.get("review_lane") != "FIT" and not (

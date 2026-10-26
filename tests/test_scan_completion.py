@@ -359,6 +359,55 @@ def test_autoapproval_requires_complete_fit_and_no_open_checks(tmp_path):
     assert [row["id"] for row in approved] == ["123"]
 
 
+def test_autoapproval_preserves_manual_review_decisions(tmp_path):
+    store = Store(tmp_path / "applypilot.sqlite3")
+    account, track, source = "hh-primary", "ai_core", "hh.ru"
+    store.start_campaign("review-veto", account, track, {"queries": ["AI agents"]}, source=source)
+    base = {
+        "source": source, "name": "AI Agent Engineer", "company": "Example",
+        "url": "https://hh.ru/vacancy/123", "score": 90,
+        "score_decision": "pass", "filter_status": "pass",
+        "description_status": "ok", "description": "Production LLM agents and RAG",
+        "review_lane": "FIT", "problems": [], "filter_reasons": [],
+        "auto_apply_eligible": True,
+    }
+    ids = ["fresh", "skip", "deferred", "maybe", "manual-approved"]
+    store.save_campaign_items(
+        "review-veto", account, track,
+        [{**base, "id": vacancy_id} for vacancy_id in ids],
+        status="ok", snapshot_path="", source=source,
+    )
+    for vacancy_id, state in [
+        ("skip", "SKIP"), ("deferred", "DEFERRED"),
+        ("maybe", "MAYBE"), ("manual-approved", "APPROVED"),
+    ]:
+        store.set_review_state_batch(
+            account, source, [vacancy_id], state,
+            reason=f"owner decided {state}", track=track,
+        )
+
+    result = multisource.approve_scanned_fits(store, account, track, source, ids)
+    assert result["approved"] == 1
+    assert result["blocked"] == {
+        vacancy_id: f"existing review state is {state}"
+        for vacancy_id, state in [
+            ("skip", "SKIP"), ("deferred", "DEFERRED"),
+            ("maybe", "MAYBE"), ("manual-approved", "APPROVED"),
+        ]
+    }
+    rows = {
+        row["id"]: row
+        for row in store.list_campaign_vacancies(account, track, "all", 10, source=source)
+    }
+    assert rows["fresh"]["review_state"] == "APPROVED"
+    for vacancy_id in ids[1:]:
+        assert rows[vacancy_id]["review_reason"].startswith("owner decided ")
+
+    again = multisource.approve_scanned_fits(store, account, track, source, ids)
+    assert again["approved"] == 0
+    assert again["blocked"]["fresh"] == "existing review state is APPROVED"
+
+
 def test_autoapproval_allows_only_configured_soft_unknowns(tmp_path):
     store = Store(tmp_path / "applypilot.sqlite3")
     account, track, source = "getmatch-primary", "ai_core", "getmatch.ru"
