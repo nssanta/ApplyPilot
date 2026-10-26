@@ -6,7 +6,7 @@ from pathlib import Path
 from applypilot.config import AppConfig, effective_search
 from applypilot.multisource import resolve_source_account, scan_sources
 from applypilot.storage import Store
-from applypilot.telegram_import import import_telegram_vacancies
+from applypilot.telegram_import import _title_from_text, import_telegram_vacancies
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/public"
@@ -99,3 +99,14 @@ def test_import_ignores_other_sources(tmp_path: Path) -> None:
 
     assert result["linked_count"] == 0
     assert result["missing_count"] == 0
+
+
+def test_telegram_markdown_title_is_not_replaced_by_salary_line() -> None:
+    text = (
+        "[**ML инженер в платформу оценки агентных систем (Крупный Банк) [Remote]**]"
+        "(https://getmatch.ru/vacancies/36991-ml-inzhener)** @ Компания скрыта**\n\n"
+        "от 300 000 ₽/мес на руки\n\n📍Москва, Россия"
+    )
+    assert _title_from_text(text) == (
+        "ML инженер в платформу оценки агентных систем (Крупный Банк) [Remote]"
+    )

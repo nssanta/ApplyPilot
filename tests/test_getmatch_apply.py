@@ -251,7 +251,7 @@ def test_getmatch_verified_driver_dispatches_once_and_blocks_duplicates(
     assert len(store.source_attempts("getmatch-primary", "getmatch.ru")) == 1
 
 
-def test_getmatch_dispatch_pauses_after_unknown_without_resending(
+def test_getmatch_dispatch_quarantines_unknown_and_continues_other_vacancies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from applypilot.dispatch import dispatch_apply
@@ -301,14 +301,14 @@ def test_getmatch_dispatch_pauses_after_unknown_without_resending(
         allow_live=True, drivers={"getmatch.ru": driver},
         accounts={"getmatch.ru": "getmatch-primary"}, run_id="getmatch-unknown",
     )
-    assert result["summary"]["unknown"] == 1
-    assert result["summary"]["needs_manual"] == 2
-    assert len(calls) == 1
+    assert result["summary"]["unknown"] == 3
+    assert len(calls) == 3
+    assert len(set(calls)) == 3
     blocked_id = calls[0]
     assert store.vacancy_track_row(
         "getmatch-primary", "getmatch.ru", blocked_id, "ai_core",
     )["application_state"] == "UNKNOWN"
-    assert len(store.source_attempts("getmatch-primary", "getmatch.ru")) == 1
+    assert len(store.source_attempts("getmatch-primary", "getmatch.ru")) == 3
 
 
 def test_getmatch_verified_driver_blocks_live_without_second_optin(

@@ -15,7 +15,7 @@ def test_legacy_daily_cap_is_hh_only_and_other_sources_have_separate_limits():
     profile = {"limits": {"per_run": 100, "per_day": 300}}
 
     assert application_limits(profile, "hh.ru") == {"per_run": 100, "per_day": 300}
-    assert application_limits(profile, "career.habr.com") == {"per_run": 100, "per_day": 100}
+    assert application_limits(profile, "career.habr.com") == {"per_run": 100, "per_day": 0}
     assert application_limits({**profile, "source_limits": {
         "career.habr.com": {"per_run": 25, "per_day": 40},
     }}, "career.habr.com") == {"per_run": 25, "per_day": 40}

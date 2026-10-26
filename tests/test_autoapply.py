@@ -402,7 +402,7 @@ def test_submission_preflight_stops_before_a_budget_reservation():
     assert _submission_preflight(_item(resume="Python"), False) == ""
 
 
-def test_unknown_result_stops_the_entire_run_before_the_next_vacancy(tmp_path, monkeypatch):
+def test_unknown_result_is_quarantined_and_the_next_vacancy_continues(tmp_path, monkeypatch):
     class _Context:
         def new_page(self):
             return object()
@@ -455,11 +455,11 @@ def test_unknown_result_stops_the_entire_run_before_the_next_vacancy(tmp_path, m
     result = _run_apply(config, store, selected, "run", "account", tmp_path / "input.json", 2)
 
     assert result == 3
-    assert calls == ["one"]
+    assert calls == ["one", "two"]
     summary = store.run_summary("run")
     assert summary is not None
-    assert summary["run"]["status"] == "stopped_unknown"
-    assert summary["counts"] == {"unknown": 1, "prepared": 1}
+    assert summary["run"]["status"] == "completed_with_unknown"
+    assert summary["counts"] == {"unknown": 2}
 
 
 def test_negotiation_confirmation_turns_unknown_into_success_and_continues(tmp_path, monkeypatch):
@@ -526,6 +526,62 @@ def test_negotiation_confirmation_turns_unknown_into_success_and_continues(tmp_p
     assert summary is not None
     assert summary["run"]["status"] == "completed"
     assert summary["counts"] == {"success": 2}
+
+
+def test_campaign_queue_uses_template_letter_without_owner_draft(tmp_path, monkeypatch):
+    class _Context:
+        def new_page(self):
+            return object()
+
+        def storage_state(self):
+            return {"cookies": []}
+
+        def close(self):
+            return None
+
+    class _Browser:
+        def new_context(self, **_kwargs):
+            return _Context()
+
+        def close(self):
+            return None
+
+    class _Playwright:
+        class chromium:
+            @staticmethod
+            def launch(**_kwargs):
+                return _Browser()
+
+        def stop(self):
+            return None
+
+    config = AppConfig(tmp_path, tmp_path / "data", tmp_path / "profile.toml")
+    store = Store(config.db_path)
+    item = {
+        "id": "one", "url": "https://hh.ru/vacancy/1", "resume": "Resume",
+        "track": "ai_core", "cover_letter_required": True,
+    }
+    calls = []
+    monkeypatch.setattr("applypilot.cli.effective_search", lambda *_args: {})
+    monkeypatch.setattr("applypilot.cli._profile", lambda *_args: {
+        "reviewed": True, "account": "account", "limits": {"per_run": 10, "per_day": 10},
+        "apply": {"delay_min_seconds": 0, "delay_max_seconds": 0},
+        "cover_letter": {"mode": "template"}, "llm": {"enabled": False},
+    })
+    monkeypatch.setattr("applypilot.cli.check_session", lambda _path, **_kwargs: SessionCheck("confirmed", "ok"))
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: type("_Starter", (), {
+        "start": staticmethod(lambda: _Playwright()),
+    })())
+    monkeypatch.setattr("applypilot.cli._prepare_cover_letter",
+                        lambda *_args, **_kwargs: ("Здравствуйте", "template"))
+    monkeypatch.setattr("applypilot.autoapply.apply_one", lambda _page, row, resume, letter, **_kwargs: (
+        calls.append((row["id"], resume, letter))
+        or type("_Result", (), {"status": "success", "note": "confirmed"})()
+    ))
+    monkeypatch.setattr("applypilot.cli.save_state", lambda *_args: None)
+
+    assert _run_apply(config, store, [item], "run", "account", tmp_path / "input.json", 1) == 0
+    assert calls == [("one", "Resume", "Здравствуйте")]
 
 
 def test_success_target_replaces_manual_and_leaves_unused_candidate(tmp_path, monkeypatch):

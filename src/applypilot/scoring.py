@@ -124,19 +124,81 @@ def normalize_vacancy(raw: dict[str, Any]) -> Candidate:
     )
 
 
-def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any]) -> bool:
-    """Apply an optional private title gate before automatically approving a FIT."""
+def _title_excluded(term: str, title: str) -> bool:
+    if str(term).casefold() == "qa":
+        return bool(re.search(r"(?<![\w])(?:a?qa|sdet|test(?:ing)? automation)(?![\w])", title))
+    normalized = re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(term).casefold())).strip()
+    if not normalized:
+        return False
+    if re.fullmatch(r"[a-z0-9а-яё]+", normalized) and len(normalized) <= 4:
+        return bool(re.search(rf"(?<![\w]){re.escape(normalized)}(?![\w])", title))
+    return normalized in title
+
+
+def _title_term_present(term: str, title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(term).casefold())).strip()
+    if not normalized:
+        return False
+    if re.fullmatch(r"[a-z0-9а-яё]+", normalized) and len(normalized) <= 4:
+        return bool(re.search(rf"(?<![\w]){re.escape(normalized)}(?![\w])", title))
+    return f" {normalized} " in f" {title} "
+
+
+def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
+                              skills: Iterable[str] | None = None) -> bool:
+    """Apply an optional private title gate before automatically approving a FIT.
+
+    The explicit ``auto_apply_title_terms`` phrases win.  When a private
+    campaign uses a narrow phrase list, a structurally valid role title can
+    still be auto-eligible if it contains both a primary role term and a
+    required engineering title term and does not contain an excluded title.
+    This keeps the gate generic across source vocabularies instead of forcing
+    every new source to extend one hand-maintained phrase list.
+    """
     terms = [
         re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(value).casefold())).strip()
         for value in search.get("auto_apply_title_terms", [])
         if str(value).strip()
     ]
+    raw_title = str(item.get("name") or "").casefold()
+    title = re.sub(
+        r"\s+", " ", re.sub(r"[^\w]+", " ", raw_title),
+    ).strip()
     if not terms:
         return True
-    title = re.sub(
-        r"\s+", " ", re.sub(r"[^\w]+", " ", str(item.get("name") or "").casefold()),
-    ).strip()
-    return any(f" {term} " in f" {title} " for term in terms)
+
+    primary = [str(value) for value in search.get("primary_role_terms", []) if str(value).strip()]
+    required = [str(value) for value in search.get("required_role_terms", []) if str(value).strip()]
+    excluded = [str(value) for value in search.get("exclude_titles", []) if str(value).strip()]
+    excluded_match = any(_title_excluded(term, title) for term in excluded if str(term).strip())
+    if excluded_match:
+        return False
+    if any(_title_term_present(term, title) for term in terms):
+        return True
+    if not primary or not required:
+        return False
+    if not any(_title_term_present(term, title) for term in required):
+        return False
+
+    # If the AI/role term is only a parenthetical suffix, the leading role is
+    # the real domain.  Accept it only when that leading role is a known
+    # private skill (e.g. "Python (AI-native) developer"), not a mobile,
+    # platform or support role that merely mentions AI.
+    open_index = raw_title.find("(")
+    close_index = raw_title.find(")", open_index + 1)
+    if open_index > 0 and close_index > open_index:
+        outside = re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", raw_title[:open_index])).strip()
+        inside = re.sub(
+            r"\s+", " ", re.sub(r"[^\w]+", " ", raw_title[open_index + 1:close_index]),
+        ).strip()
+        inside_primary = any(_title_term_present(term, inside) for term in primary)
+        if inside_primary:
+            known_skills = [str(value) for value in (skills or []) if str(value).strip()]
+            return any(_title_term_present(skill, outside) for skill in known_skills)
+    return any(_title_term_present(term, title) for term in primary) or (
+        bool(search.get("allow_description_role_match"))
+        and any(_title_term_present(term, str(item.get("description") or "").casefold()) for term in primary)
+    )
 
 
 def choose_resume(title: str, profile: dict[str, Any]) -> str:
@@ -180,9 +242,11 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
     incompatible_title_terms = tuple(str(term).lower() for term in profile.get(
         "incompatible_title_terms", search_rules.get("incompatible_title_terms", [])))
     title = candidate.name.lower()
-    reasons = list(candidate.reasons)
-    hard_killers = list(candidate.hard_killers)
-    soft_killers = list(candidate.soft_killers)
+    # Scores and rejection reasons in cached payloads belong to the previous
+    # criteria. Carrying them into a rescore makes old exclusions permanent.
+    reasons = [] if profile.get("rescore") else list(candidate.reasons)
+    hard_killers = [] if profile.get("rescore") else list(candidate.hard_killers)
+    soft_killers = [] if profile.get("rescore") else list(candidate.soft_killers)
     def matches(term: str, value: str) -> bool:
         escaped = re.escape(term.lower().strip())
         if not escaped:
@@ -198,7 +262,7 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
         if matches(str(term), title):
             hard_killers.append(f"noise:{term}")
     for term in title_excludes:
-        if term and matches(term, title):
+        if term and _title_excluded(term, title):
             # A job that actually builds agents and writes code can have DevOps
             # duties; pure DevOps vacancies are still outside the AI track.
             if term == "devops" and "разработ" in title and any(
@@ -211,7 +275,12 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
         hard_killers.append("stack:title_incompatible")
     if required_role_terms and not any(matches(term, title) for term in required_role_terms):
         hard_killers.append("role:title_not_technical")
-    if title_role_terms and not any(matches(term, title) for term in title_role_terms):
+    description_role = (
+        bool(search_rules.get("allow_description_role_match"))
+        and any(matches(term, candidate.description.lower()) for term in primary_role_terms)
+        and any(matches(term, title) for term in required_role_terms)
+    )
+    if title_role_terms and not any(matches(term, title) for term in title_role_terms) and not description_role:
         hard_killers.append("role:title_not_target")
     if role_terms and not any(matches(term, text) for term in role_terms):
         hard_killers.append("role:no_match")
@@ -262,6 +331,10 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
             score = min(score, 29)
             decision = "unknown"
             reasons.append("unknown:insufficient_description_evidence")
+        duty_terms = search_rules.get("description_role_terms", [])
+        if duty_terms and not any(matches(str(term), description_text) for term in duty_terms):
+            score = min(score, 29)
+            reasons.append("unknown:role_duties_not_verified")
         if any(matches(term, text) for term in ("cursor", "windsurf", "claude code", "vibe coding", "ai-native", "agentic")):
             reasons.append("signal:ai-assisted-workflow")
         if matches("ai", title):
@@ -318,10 +391,16 @@ def prioritize_for_enrichment(raw_items: Iterable[dict[str, Any]], profile: dict
     seen: set[str] = set()
     for raw in raw_items:
         candidate = score_vacancy(raw, profile)
-        if not candidate.id or candidate.id in seen or candidate.hard_killers:
+        search = profile.get("search", profile)
+        provisional_role = (
+            bool(search.get("allow_description_role_match"))
+            and (not raw.get("description") or raw.get("description_status") in {"missing", "provisional"})
+            and set(candidate.hard_killers) <= {"role:title_not_target", "role:no_match"}
+        )
+        if not candidate.id or candidate.id in seen or (candidate.hard_killers and not provisional_role):
             continue
         seen.add(candidate.id)
-        decision = evaluate_search_filter(raw, profile.get("search", profile))
+        decision = evaluate_search_filter(raw, search)
         if decision.status == "reject":
             continue
         result.append(candidate)

@@ -283,7 +283,9 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
         filter_result = evaluate_search_filter(item, group)
         filter_status = filter_result.status
         filter_reasons = list(filter_result.reasons)
-        item["auto_apply_eligible"] = auto_apply_title_eligible(item, group)
+        professional = profile.get("professional")
+        skills = professional.get("skills", []) if isinstance(professional, dict) else []
+        item["auto_apply_eligible"] = auto_apply_title_eligible(item, group, skills)
         if not item["auto_apply_eligible"]:
             item["auto_apply_reason"] = "title_requires_manual_role_review"
         salary_cfg = group.get("salary") or {}
@@ -624,6 +626,9 @@ def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search:
             group_name = str(group_search.get("group_name") or "default")
             scope = json.dumps({
                 "source": source, "track": track, "group": group_name,
+                "days": group_search.get("days"), "remote": group_search.get("only_remote"),
+                "areas": group_search.get("areas"), "salary": group_search.get("salary"),
+                "scan_scope": search.get("scan_scope", ""),
                 "queries": sorted(str(v) for v in group_search.get("queries", [])),
                 "primary_role_terms": sorted(str(v) for v in group_search.get("primary_role_terms", [])),
             }, ensure_ascii=False, sort_keys=True)
@@ -1011,13 +1016,25 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         )
         if not needs_manual_reapproval(row)
         and not row.get("applied_before")
-        and row.get("filter_status") in {"pass", "unknown"}
+        and str(row.get("decision") or "").upper() != "BLOCKED"
         and row.get("score_decision") == "pass"
+        and (row.get("filter_status") in {"pass", "unknown"}
+             or str(row.get("decision") or "").upper() == "APPLY")
     ]
     # Keep scoring order *within* each group, but inspect ready work before
-    # unfinished forms/letters when the batch limit is reached.
+    # unfinished forms/letters when the batch limit is reached.  Also collapse
+    # repeated employer+title postings so one role cannot consume two sends.
     eligible.sort(key=lambda row: row.get("application_state") != "READY_TO_APPLY")
-    rows = eligible[:min(100, max(1, int(limit)))]
+    deduped: list[dict[str, Any]] = []
+    seen_groups: set[str] = set()
+    for row in eligible:
+        group_key = str(row.get("job_group_key") or "")
+        if group_key and group_key in seen_groups:
+            continue
+        if group_key:
+            seen_groups.add(group_key)
+        deduped.append(row)
+    rows = deduped[:min(100, max(1, int(limit)))]
     planned: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     try:
@@ -1105,3 +1122,77 @@ def source_status(config: AppConfig, track: str, account: str | None = None,
         })
     return {"account": account or str(profile.get("account") or "default"),
             "track": track, "sources": rows}
+
+
+def refresh_queue(config: AppConfig, track: str, profile: dict[str, Any],
+                  search: dict[str, Any], source: str, *, details_limit: int = 0,
+                  persist: bool = True) -> dict[str, Any]:
+    """Rescore cached cards using current criteria; optionally drain missing descriptions.
+
+    save_campaign_items preserves review decisions and application ledgers. A refresh
+    is an observation, not a new discovery or permission to retry an application.
+    """
+    from .parser import enrich_items
+    from .scoring import prioritize_for_enrichment
+
+    store = Store(config.db_path)
+    account = resolve_source_account(config, profile, source)
+    rows = store.list_campaign_vacancies(account, track, "all", None, source=source)
+    terminal = {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
+    rows = [row for row in rows if row.get("global_application_state") not in terminal
+            and row.get("review_state") not in {"SKIP", "DEFERRED", "MAYBE"}]
+    pending = [row for row in rows if not row.get("description")
+               or row.get("description_status") in {"missing", "provisional", "network_error", "parse_error"}]
+    ranking_profile = {**profile, "search": search, "rescore": True}
+    prioritized = prioritize_for_enrichment(pending, ranking_profile, len(pending))
+    pending_ids = {row.id for row in prioritized}
+    timestamp = datetime.now(UTC).isoformat()
+    deferred_ids = {row["id"] for row in pending
+                    if str(row.get("description_retry_after") or "") > timestamp}
+    retryable = [row for row in prioritized if row.id not in deferred_ids]
+    selected_ids = {row.id for row in retryable[:max(0, details_limit)]}
+    selected = [dict(row) for row in pending if row["id"] in selected_ids]
+    errors = []
+    if persist and selected:
+        if source == "hh.ru":
+            enriched, errors = enrich_items(selected, len(selected), pause_seconds=1.0)
+            updates = {row["id"]: row for row in enriched}
+        else:
+            provider = default_registry().get(source)
+            updates = {}
+            for row in selected:
+                try:
+                    fresh = provider.inspect(row["id"], {"timeout": 20})
+                    if fresh and fresh.get("description"):
+                        updates[row["id"]] = {**row, **fresh, "description_status": "ok"}
+                    else:
+                        errors.append(f"{row['id']}: description unavailable")
+                except (requests.RequestException, ValueError, OSError) as exc:
+                    errors.append(f"{row['id']}: {type(exc).__name__}")
+        for row in selected:
+            fresh = updates.get(row["id"], row)
+            if fresh.get("description") and fresh.get("description_status") == "ok":
+                fresh["description_retry_after"] = ""
+                fresh["enrichment_error"] = ""
+            else:
+                fresh["description_retry_after"] = (datetime.now(UTC) + timedelta(minutes=15)).isoformat()
+                fresh["enrichment_error"] = "description unavailable; retry after cooldown"
+                deferred_ids.add(row["id"])
+            updates[row["id"]] = fresh
+        rows = [{**row, **updates.get(row["id"], {})} for row in rows]
+    cutoff = datetime.now(UTC) - timedelta(days=int(search.get("days", 30)))
+    items = _prepare_scored_items(rows, source=source, profile=profile, search=search,
+                                  cutoff=cutoff, track_resume=str(profile.get("resume") or ""), track=track)
+    # Definite title mismatches can be rejected from the title alone. A lack of
+    # description must not turn a potentially matching card into a final reject.
+    outstanding = sum(item["id"] in pending_ids and item["id"] not in deferred_ids and (
+        not item.get("description") or item.get("description_status") != "ok") for item in items)
+    if persist and items:
+        refresh_id = uuid.uuid4().hex
+        store.start_campaign(refresh_id, account, track, {"operation": "queue_refresh"}, source=source)
+        store.save_campaign_items(refresh_id, account, track, items, status="partial" if errors else "ok",
+                                  snapshot_path="", source=source, error="; ".join(errors),
+                                  error_count=len(errors))
+    return {"rescored": len(items), "needs_description": outstanding,
+            "description_deferred": len(pending_ids & deferred_ids),
+            "detail_attempts": len(selected), "errors": errors}

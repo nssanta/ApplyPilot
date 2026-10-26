@@ -8,10 +8,12 @@ ApplyPilot — локальный инструмент для поиска ва�
 
 - Поиск вакансий по нескольким платформам и раздельные поисковые треки.
 - Нормализация карточек, объяснимый скоринг и optional LLM-скрининг.
-- Отдельные очереди review/approval, черновики писем и ручные анкеты.
+- Track-scoped решения `APPLY/REVIEW/REJECT/APPLIED/BLOCKED`, повторный sweep старых неопределённостей и отдельные review/approval очереди.
+- Чтение сложных анкет (text, textarea, number, select, radio, checkbox) с ответами только из подтверждённых приватных фактов.
 - SQLite-журнал, канонические каналы отправки и защита от дублей.
-- Безопасные `scan`, `form-audit`, `dispatch-plan` и `dry-run`.
-- Браузерные и Telegram-драйверы откликов, требующие явного разрешения и проверки результата.
+- Безопасные `scan`, `form-audit`, `dispatch-plan`, `queue sweep` и `dry-run`.
+- Одна команда `go` для цикла `scan → decide → apply → verify` по всем источникам, с `--visible` и `--headless`.
+- Браузерные и Telegram-драйверы откликов, требующие явного разрешения и проверки результата; один `UNKNOWN` карантинится без остановки независимых вакансий.
 - Опциональная веб-панель и экспериментальная Debian-сборка.
 
 ## Установка
@@ -43,6 +45,20 @@ cp examples/sources.toml private/config/sources.toml
 .venv/bin/python -m applypilot sources scan \
   --track default --fixture-dir tests/fixtures/public --json
 
+# Только поиск и решения, без отправок
+.venv/bin/python -m applypilot go --track default --scan-only
+
+# Полный цикл; live-отправки разрешены operating-policy.toml
+.venv/bin/python -m applypilot go --track default --visible
+.venv/bin/python -m applypilot go --track default --headless
+
+# Ad-hoc поиск и целевое число подтверждённых откликов
+.venv/bin/python -m applypilot go --track default \
+  --query "AI агент" --salary-from 100000 --sources all --target 10 --target-scope total --headless
+
+# Одна логическая вакансия: HH, DreamJob-зеркало, отклик и ответ
+.venv/bin/python -m applypilot queue links --track default --source dreamjob.ru
+
 # Без отправки заявок
 .venv/bin/python -m applypilot sources dispatch-plan \
   --track default --limit 10 --json
@@ -54,11 +70,11 @@ cp examples/sources.toml private/config/sources.toml
 
 | Источник | Поиск | Действия отклика |
 |---|---|---|
-| HH.ru | Запросы, регионы, страницы и детали | Существующий браузерный runner; партии до 100 за запуск |
+| HH.ru | Запросы, регионы, страницы и детали | Существующий браузерный runner; батчи до 100, кампания продолжается до цели |
 | Habr Career | Каталог и form-audit | Проверенная простая нативная форма; сложные анкеты уходят в ручной разбор |
-| Getmatch | Sitemap, Telegram-ссылки, карточки | Подтверждённый callback только при наличии актуальной кнопки для вакансии |
-| GeekJob | Каталог и проверка формы | Живой submit и пакетный драйвер ждут подтверждённого пилота |
-| Яндекс Карьера | Вакансии и read-only анкеты | Форма читается; отправка не подтверждена |
+| Getmatch | Sitemap, Telegram-ссылки, карточки | Callback при актуальной кнопке + подтверждённая web-форма: POST `/api/offers/<id>/apply` и точная запись в `/applications` |
+| GeekJob | Каталог и проверка формы | Подтверждённый native submit: POST `/json/respond/vacancy` 200 + точная вакансия в `/responses` |
+| Яндекс Карьера | Вакансии и анкеты | Проверенный native survey: submit + success page + applied state |
 | DreamJob | Каталог компаний | Зеркало HH; второй отклик запрещён |
 
 Таблица описывает возможности кода. Поддержка одиночного действия не означает, что пакетный процесс принят для любой учётной записи или вакансии. Для массового запуска требуются полный охват, действующая сессия, готовая очередь и подтверждение результата каждой отправки. Детали в [Multi-Source](docs/MULTISOURCE.md).

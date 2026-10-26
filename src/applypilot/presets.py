@@ -16,6 +16,10 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "title_role_terms": ["ai", "llm", "agent", "rag", "genai", "prompt", "nlp"],
     },
     "ai-agents-llmops": {
+        "allow_description_role_match": True,
+        "description_role_terms": ["ai", "ии", "llm", "rag", "agent", "агент", "vllm",
+                                   "litellm", "mcp", "genai", "langgraph", "chatgpt",
+                                   "embedding", "vector", "qdrant", "model serving"],
         "resume_key": "ai_agent",
         "queries": [
             "AI Agent Engineer", "LLM Engineer", "AI-разработчик", "Вайбкодер",
@@ -32,7 +36,7 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
             "продаж", "ассистент", "тренер", "маркетолог", "рекрутер", "support", "qa",
             "тестиров", "quality assurance", "sdet", "security", "кибербез", "иб",
             "training", "обучению", "наставник", "ментор", "mentor",
-            "devops", "site reliability", "sre", "java", ".net", "php", "computer vision", "bioinformatics", "marketing engineer", "growth engineer",
+            "site reliability", "sre", "java", ".net", "php", "computer vision", "bioinformatics", "marketing engineer", "growth engineer",
         ],
         "role_terms": [
             "ai", "ии", "llm", "agent", "агент", "rag", "genai", "llmops",
@@ -104,7 +108,7 @@ def resolve_search(search: dict[str, Any], preset_name: str | None = None) -> di
     preset_fields = {
         "queries", "include_terms", "exclude_titles", "role_terms", "primary_role_terms",
         "required_role_terms", "title_role_terms", "incompatible_title_terms",
-        "resume_key",
+        "resume_key", "allow_description_role_match", "description_role_terms",
         "exclude_title_patterns", "exclude_description_patterns", "exclude_location_patterns",
     }
     for key, value in search.items():

@@ -118,8 +118,8 @@ def check_session(path: Path, *, data_dir: Path | None = None,
                 headless=True,
             )
             page = session.context.new_page()
-            page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=30000)
-            body = page.locator("body").inner_text(timeout=5000)
+            page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=45000)
+            body = page.locator("body").inner_text(timeout=15000)
             return classify_session_page(page.url, body)
     except Exception as exc:  # noqa: BLE001 — ошибки браузера и сети классифицируются вместе
         message = str(exc)

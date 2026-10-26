@@ -180,7 +180,10 @@ _SOURCE_CONFIGS: dict[str, ProviderSessionConfig] = {
         login_url="https://getmatch.ru/profile",
         check_url="https://getmatch.ru/profile",
         allowed_hosts=("getmatch.ru",),
-        confirmed_body_markers=("выйти", "мои отклики", "редактировать профиль", "logout"),
+        confirmed_body_markers=(
+            "выйти", "мои отклики", "редактировать профиль", "logout",
+            "мой профиль", "скрыть профиль", "отклики",
+        ),
         expired_body_markers=("для просмотра профиля нужно", "войти в getmatch"),
         login_hint="Sign in through the Telegram widget on the profile page.",
     ),

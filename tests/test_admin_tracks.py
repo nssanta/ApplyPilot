@@ -62,6 +62,22 @@ def test_delete_track_keeps_other_tracks_and_files(tmp_path):
     assert [t["key"] for t in fresh.tracks_overview()["tracks"]] == ["keep"]
 
 
+def test_disabled_track_is_rejected_by_campaign_config(tmp_path):
+    from applypilot.cli import _track_config
+
+    config_path = tmp_path / TRACKS_CONFIG
+    _write_tracks_config(config_path, [
+        {"key": "active", "enabled": True, "profile": "private/config/profile-active.toml",
+         "search": "private/config/search-active.toml"},
+        {"key": "frozen", "enabled": False, "profile": "private/config/profile-frozen.toml",
+         "search": "private/config/search-frozen.toml"},
+    ])
+    config = AppConfig.discover(root=tmp_path)
+    with pytest.raises(ConfigError, match="disabled"):
+        _track_config(config, "frozen")
+    assert _track_config(config, "active")[1]["key"] == "active"
+
+
 def test_delete_track_rejects_unknown_and_last_track(tmp_path):
     config_path = tmp_path / TRACKS_CONFIG
     _write_tracks_config(config_path, [{"key": "only"}])

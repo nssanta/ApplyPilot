@@ -245,6 +245,46 @@ def test_dispatch_apply_exception_becomes_unknown_and_never_retries(tmp_path: Pa
     assert len(store.source_attempts("default", "getmatch.ru")) == 1
 
 
+def test_one_ambiguous_submit_does_not_pause_source_for_independent_rows(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    store = Store(tmp_path / "jobs.sqlite3")
+    rows = [
+        {"id": "50001", "source": "getmatch.ru", "name": "AI Engineer",
+         "company": "Example", "channel_key": "getmatch.ru:50001"},
+        {"id": "50002", "source": "getmatch.ru", "name": "LLM Engineer",
+         "company": "Example", "channel_key": "getmatch.ru:50002"},
+    ]
+
+    def plan(_store, _account, _track, source, *_args, **_kwargs):
+        return {**_fake_plan(store, source), "candidate_count": len(rows),
+                "planned_count": len(rows), "planned": rows}
+
+    monkeypatch.setattr("applypilot.dispatch.queue_plan", plan)
+
+    class MixedDriver(FakeDriver):
+        def apply(self, row):
+            self.applies += 1
+            if row["id"] == "50001":
+                return ApplyOutcome("unknown", "ambiguous callback")
+            return ApplyOutcome("success", "confirmed", receipt={
+                "provider": "@g_jobbot", "vacancy_id": row["id"],
+                "confirmation_message_id": 50002,
+            })
+
+    driver = MixedDriver()
+    result = dispatch_apply(
+        store, "default", "ai_core", ["getmatch.ru"], 100,
+        allow_live=True, drivers={"getmatch.ru": driver}, run_id="run-mixed",
+    )
+
+    assert result["summary"] == {"unknown": 1, "success": 1}
+    assert driver.applies == 2
+    assert sorted(row["status"] for row in store.source_attempts(
+        "default", "getmatch.ru", 10,
+    )) == ["success", "unknown"]
+
+
 def test_dispatch_apply_skips_when_preflight_blocks(tmp_path: Path, monkeypatch) -> None:
     _config_obj, store = _seed(tmp_path)
     import applypilot.dispatch as dispatch_module

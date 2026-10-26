@@ -10,12 +10,30 @@ from types import SimpleNamespace
 
 import pytest
 
+from applypilot.dispatch import verified_success_receipt
 from applypilot.yandex_apply import (
     EXPECTED_SURVEY_FIELDS,
     canonical_job_id,
     inspect_yandex_page,
     is_survey_read_request,
 )
+
+
+def test_yandex_receipt_requires_success_page_and_applied_state() -> None:
+    base = {
+        "provider": "yandex.ru/jobs", "vacancy_id": "48171", "publication_id": "48171",
+        "success_url": "https://forms.yandex.ru/surveys/1/success/?publication_id=48171",
+        "success_path": "/surveys/1/success/", "success_marker": "success_path",
+        "success_verified": True, "applied_state_verified": True,
+    }
+    assert verified_success_receipt("yandex.ru/jobs", "48171", base) is True
+    assert verified_success_receipt(
+        "yandex.ru/jobs", "48171", {**base, "applied_state_verified": False},
+    ) is False
+    assert verified_success_receipt(
+        "yandex.ru/jobs", "48171", {**base, "publication_id": "99999"},
+    ) is False
+    assert verified_success_receipt("yandex.ru/jobs", "99999", base) is False
 
 
 @pytest.mark.parametrize("url,expected", [

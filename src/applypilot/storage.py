@@ -15,6 +15,23 @@ from typing import Any
 from urllib.parse import urlparse
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS execution_campaigns (
+  execution_id TEXT PRIMARY KEY, spec_json TEXT NOT NULL,
+  status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+  progress_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_vacancies (
+  execution_id TEXT NOT NULL, account TEXT NOT NULL, source TEXT NOT NULL,
+  vacancy_id TEXT NOT NULL, track TEXT NOT NULL, checked INTEGER NOT NULL,
+  decision TEXT NOT NULL, reason TEXT NOT NULL, application_state TEXT NOT NULL,
+  PRIMARY KEY(execution_id,account,source,vacancy_id,track),
+  FOREIGN KEY(execution_id) REFERENCES execution_campaigns(execution_id)
+);
+CREATE TABLE IF NOT EXISTS execution_runs (
+  run_id TEXT NOT NULL, execution_id TEXT NOT NULL, source TEXT NOT NULL, track TEXT NOT NULL,
+  PRIMARY KEY(run_id, source, track),
+  FOREIGN KEY(execution_id) REFERENCES execution_campaigns(execution_id)
+);
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY, account TEXT NOT NULL, mode TEXT NOT NULL,
   input_path TEXT NOT NULL DEFAULT '', requested_limit INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +111,8 @@ CREATE TABLE IF NOT EXISTS vacancy_track_scores (
   problems_json TEXT NOT NULL DEFAULT '[]', filter_reasons_json TEXT NOT NULL DEFAULT '[]',
   review_state TEXT NOT NULL DEFAULT 'UNREVIEWED', review_reason TEXT NOT NULL DEFAULT '',
   review_notes TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT '', decision_reason TEXT NOT NULL DEFAULT '',
+  decision_at TEXT NOT NULL DEFAULT '', next_action_at TEXT NOT NULL DEFAULT '',
   resume TEXT NOT NULL DEFAULT '', campaign_id TEXT NOT NULL DEFAULT '',
   latest_change TEXT NOT NULL DEFAULT 'first_seen', last_seen_at TEXT NOT NULL,
   PRIMARY KEY(account, source, vacancy_id, track),
@@ -204,6 +223,7 @@ def needs_manual_reapproval(item: dict[str, Any]) -> bool:
         item.get("review_state") == "APPROVED"
         and item.get("review_reason") == AUTO_APPROVAL_REASON
         and item.get("auto_apply_eligible") is not True
+        and str(item.get("decision") or "").upper() != "APPLY"
     )
 
 def _vacancy_group_key(company: str, title: str) -> str:
@@ -354,6 +374,41 @@ def review_lane_for(filter_status: str, score_decision: str, *,
     return "MANUAL_REVIEW"
 
 
+def effective_track_application_state(
+    global_state: str,
+    track_review_state: str,
+    score_decision: str,
+    filter_status: str,
+    decision: str = "",
+) -> str:
+    """Return the application state that is valid for one track.
+
+    ``vacancies.application_state`` is the channel-wide attempt state.  A
+    ``READY_TO_APPLY`` value, however, is only meaningful for the track that
+    owns an approval and a passing score.  Without this projection a broad
+    queue approval makes every other track look ready even when that track
+    rejected the vacancy.  Terminal attempt states stay global because the
+    vacancy/channel was already used regardless of the track.
+    """
+    state = str(global_state or "NOT_STARTED").upper()
+    if state in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}:
+        return state
+    approved = str(track_review_state or "UNREVIEWED").upper() == "APPROVED"
+    if state == "READY_TO_APPLY":
+        # An explicit decision=APPLY is a human/engine decision that survives a
+        # later scan-window change (for example, an old approved vacancy falling
+        # outside ``days``).  It never bypasses a rejected score.
+        if (approved and score_decision == "pass"
+                and (filter_status in {"pass", "unknown"}
+                     or str(decision or "").upper() == "APPLY")):
+            return state
+        return "NOT_STARTED"
+    # NEEDS_FORM/NEEDS_LETTER/FAILED_BEFORE_SUBMIT describe a real channel
+    # attempt; they stay visible even when the current track has not approved
+    # the vacancy.  Only the synthetic READY state is track-scoped.
+    return state
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -380,6 +435,87 @@ class Store:
         self._migrate(conn)
         return conn
 
+    def execution(self, execution_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM execution_campaigns WHERE execution_id=?",
+                               (execution_id,)).fetchone()
+        if not row:
+            return None
+        return {**dict(row), "spec": json.loads(row["spec_json"]),
+                "progress": json.loads(row["progress_json"])}
+
+    def create_execution(self, execution_id: str, spec: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("INSERT INTO execution_campaigns "
+                         "(execution_id,spec_json,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+                         (execution_id, json.dumps(spec, ensure_ascii=False), "running", now(), now()))
+
+    def update_execution(self, execution_id: str, status: str, reason: str,
+                         progress: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE execution_campaigns SET status=?,reason=?,progress_json=?,updated_at=? "
+                         "WHERE execution_id=?",
+                         (status, reason, json.dumps(progress, ensure_ascii=False), now(), execution_id))
+
+    def execution_run(self, execution_id: str, run_id: str, source: str, track: str) -> None:
+        if not execution_id:
+            return
+        with self.connect() as conn:
+            conn.execute("INSERT INTO execution_runs VALUES(?,?,?,?)",
+                         (run_id, execution_id, source, track))
+
+    def observe_execution(self, execution_id: str, account: str, source: str, track: str,
+                          rows: list[dict[str, Any]]) -> None:
+        if not execution_id:
+            return
+        with self.connect() as conn:
+            conn.executemany("INSERT OR REPLACE INTO execution_vacancies VALUES(?,?,?,?,?,?,?,?,?)", [
+                (execution_id, account, source, row["id"], track,
+                 int(bool(row.get("description")) and row.get("description_status") == "ok"),
+                 row.get("decision", ""), json.dumps(row.get("problems") or [row.get("decision_reason", "")]),
+                 row.get("global_application_state", row.get("application_state", "")))
+                for row in rows])
+
+    def execution_funnel(self, execution_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM execution_vacancies WHERE execution_id=?",
+                                (execution_id,)).fetchall()
+        groups: dict[tuple[str, str, str], list[Any]] = {}
+        reasons: dict[str, int] = {}
+        for row in rows:
+            groups.setdefault((row["account"], row["source"], row["vacancy_id"]), []).append(row)
+            if row["decision"] == "REJECT":
+                for reason in json.loads(row["reason"] or "[]"):
+                    reasons[reason] = reasons.get(reason, 0) + 1
+        return {
+            "unique_considered": len(groups),
+            "descriptions_checked": sum(any(row["checked"] for row in group) for group in groups.values()),
+            "eligible": sum(any(row["decision"] == "APPLY" for row in group) for group in groups.values()),
+            "review": sum(any(row["decision"] == "REVIEW" for row in group) for group in groups.values()),
+            "rejected_all_tracks": sum(all(row["decision"] == "REJECT" for row in group)
+                                       for group in groups.values()),
+            "track_rejection_reasons": reasons,
+        }
+
+    def execution_counts(self, execution_id: str) -> dict[str, dict[str, int]]:
+        # Read the actual receipt ledgers, including a run interrupted before its report.
+        # HH run_items are immutable per run; source attempts retain their exact run_id.
+        with self.connect() as conn:
+            rows = conn.execute("""
+                SELECT e.source,i.status,count(*) n FROM execution_runs e
+                JOIN run_items i ON i.run_id=e.run_id
+                WHERE e.execution_id=? AND e.source='hh.ru' GROUP BY e.source,i.status
+                UNION ALL
+                SELECT e.source,a.status,count(*) n FROM execution_runs e
+                JOIN source_application_attempts a ON a.run_id=e.run_id AND a.source=e.source AND a.track=e.track
+                WHERE e.execution_id=? AND e.source!='hh.ru' GROUP BY e.source,a.status
+                """, (execution_id, execution_id)).fetchall()
+        result: dict[str, dict[str, int]] = {}
+        for row in rows:
+            counts = result.setdefault(row["source"], {})
+            counts[row["status"]] = counts.get(row["status"], 0) + row["n"]
+        return result
+
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sync_snapshots)")}
@@ -397,6 +533,10 @@ class Store:
             ("review_state", "TEXT NOT NULL DEFAULT 'UNREVIEWED'"),
             ("review_reason", "TEXT NOT NULL DEFAULT ''"),
             ("review_notes", "TEXT NOT NULL DEFAULT ''"),
+            ("decision", "TEXT NOT NULL DEFAULT ''"),
+            ("decision_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("decision_at", "TEXT NOT NULL DEFAULT ''"),
+            ("next_action_at", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in score_columns:
                 conn.execute(f"ALTER TABLE vacancy_track_scores ADD COLUMN {column} {definition}")
@@ -729,7 +869,7 @@ class Store:
             ).fetchone()[0]
             if run_count >= per_run:
                 return False, f"run budget exhausted ({per_run})"
-            if day_count >= per_day:
+            if per_day > 0 and day_count >= per_day:
                 return False, f"daily budget exhausted ({per_day})"
             try:
                 conn.execute(
@@ -1124,7 +1264,7 @@ class Store:
                                    *, mirror_source: str = "",
                                    mirror_native_id: str = "",
                                    per_run: int = 100,
-                                   per_day: int = 300) -> tuple[bool, str]:
+                                   per_day: int = 0) -> tuple[bool, str]:
         """Atomically reserves one canonical channel writer lock.
 
         The lock is ``(account, canonical channel)`` and is independent of the
@@ -1143,7 +1283,7 @@ class Store:
             per_day = int(per_day)
         except (TypeError, ValueError):
             return False, "invalid source application budget"
-        if per_run < 1 or per_day < 1:
+        if per_run < 1 or per_day < 0:
             return False, "invalid source application budget"
         timestamp = now()
         try:
@@ -1232,7 +1372,7 @@ class Store:
                 (account, source, day_start, *consuming_statuses,
                  account, source, day_start),
             ).fetchone()[0])
-            if day_count >= per_day:
+            if per_day > 0 and day_count >= per_day:
                 return False, f"source per-day limit reached ({day_count}/{per_day})"
             try:
                 conn.execute(
@@ -1681,7 +1821,7 @@ class Store:
         return result
 
     def list_campaign_vacancies(self, account: str = "default", track: str | None = None,
-                                view: str = "all", limit: int = 100,
+                                view: str = "all", limit: int | None = 100,
                                 source: str | None = None) -> list[dict[str, Any]]:
         if view not in CAMPAIGN_VIEWS:
             raise ValueError(f"unknown campaign view: {view}")
@@ -1689,6 +1829,8 @@ class Store:
                           s.problems_json,s.filter_reasons_json,s.resume,s.campaign_id AS track_campaign_id,
                           s.review_state AS track_review_state,s.review_reason AS track_review_reason,
                           s.review_notes AS track_review_notes,
+                          s.decision AS track_decision,s.decision_reason AS track_decision_reason,
+                          s.decision_at AS track_decision_at,s.next_action_at AS track_next_action_at,
                           s.latest_change,s.last_seen_at AS track_last_seen_at,
                           l.group_key AS link_group_key,l.channel_key AS link_channel_key,
                           l.channel_type AS link_channel_type,l.application_url AS link_application_url,
@@ -1715,21 +1857,31 @@ class Store:
                 if view == "new" and row["latest_change"] not in {"first_seen", "new_since_previous"}:
                     continue
                 review_state = row["track_review_state"] or "UNREVIEWED"
+                application_state = effective_track_application_state(
+                    str(row["application_state"] or ""),
+                    review_state,
+                    str(row["score_decision"] or ""),
+                    str(row["filter_status"] or ""),
+                    str(row.get("track_decision") or ""),
+                )
                 if view == "deferred" and review_state != "DEFERRED":
                     continue
                 if view == "approved" and review_state != "APPROVED":
                     continue
-                if view == "ready" and row["application_state"] != "READY_TO_APPLY":
+                if view == "ready" and (
+                    application_state != "READY_TO_APPLY"
+                    or str(row["track_decision"] or "").upper() == "BLOCKED"
+                ):
                     continue
-                if view == "needs_letter" and row["application_state"] != "NEEDS_LETTER":
+                if view == "needs_letter" and application_state != "NEEDS_LETTER":
                     continue
-                if view == "needs_form" and row["application_state"] != "NEEDS_FORM":
+                if view == "needs_form" and application_state != "NEEDS_FORM":
                     continue
-                if view == "external_ats" and row["application_state"] != "EXTERNAL_ATS":
+                if view == "external_ats" and application_state != "EXTERNAL_ATS":
                     continue
-                if view == "unknown" and row["application_state"] != "UNKNOWN":
+                if view == "unknown" and application_state != "UNKNOWN":
                     continue
-                if view == "applied" and row["application_state"] not in {"APPLIED_CONFIRMED", "ALREADY_APPLIED"}:
+                if view == "applied" and application_state not in {"APPLIED_CONFIRMED", "ALREADY_APPLIED"}:
                     continue
                 if view == "skip" and review_state != "SKIP":
                     continue
@@ -1756,8 +1908,13 @@ class Store:
                     "resume": row["resume"], "review_state": review_state,
                     "review_reason": row["track_review_reason"],
                     "review_notes": row["track_review_notes"],
-                    "application_state": row["application_state"],
+                    "application_state": application_state,
+                    "global_application_state": row["application_state"] or "",
                     "application_note": row["application_note"],
+                    "decision": row["track_decision"] or "",
+                    "decision_reason": row["track_decision_reason"] or "",
+                    "decision_at": row["track_decision_at"] or "",
+                    "next_action_at": row["track_next_action_at"] or "",
                     "conversation_state": row["conversation_state"], "next_action": row["next_action"],
                     "owner": row["owner"], "first_seen_at": row["first_seen_at"],
                     "last_seen_at": row["last_seen_at"], "discovery_status": row["latest_change"],
@@ -1778,7 +1935,7 @@ class Store:
                 old_lane = str(item.get("review_lane") or "").strip()
                 lane = review_lane_for(
                     str(row["filter_status"] or ""), str(row["score_decision"] or ""),
-                    application_state=str(row["application_state"] or ""),
+                    application_state=application_state,
                     description_status=str(item.get("description_status") or ""),
                 )
                 item["review_lane"] = lane
@@ -1793,13 +1950,13 @@ class Store:
                 if view == "top" and (
                     lane not in {"FIT", "GOOD_UNKNOWN"}
                     or review_state == "SKIP"
-                    or row["application_state"] in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
+                    or application_state in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
                 ):
                     continue
                 if view == "review" and (
                     lane in {"SKIP", "APPLIED"}
                     or review_state == "SKIP"
-                    or row["application_state"] in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
+                    or application_state in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
                 ):
                     continue
                 if row["source"] == "hh.ru":
@@ -1825,6 +1982,25 @@ class Store:
                         item["channel_duplicate"]
                         or (source_attempt and source_attempt["status"] in BLOCKED_STATUSES)
                     )
+                if row["source"] == "dreamjob.ru":
+                    mirror_source = str(row["link_mirror_source"] or item.get("mirror_source") or "")
+                    mirror_id = str(row["link_mirror_native_id"] or item.get("mirror_native_id") or "")
+                    if mirror_source == "hh.ru" and mirror_id:
+                        mirror = conn.execute(
+                            "SELECT application_state,application_note FROM vacancies "
+                            "WHERE account=? AND source='hh.ru' AND vacancy_id=?",
+                            (account, mirror_id),
+                        ).fetchone()
+                        if mirror and str(mirror["application_state"] or "") in {
+                            "APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN",
+                        }:
+                            item["application_state"] = "MIRRORED_APPLIED_VIA_HH"
+                            item["global_application_state"] = str(mirror["application_state"])
+                            item["application_note"] = (
+                                f"via hh.ru: {mirror['application_state']} "
+                                f"{mirror['application_note'] or ''}"
+                            ).strip()
+                            item["applied_via"] = "hh.ru"
                 result.append(item)
         result.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("id") or "")))
         if view in {"top", "review"}:
@@ -1834,7 +2010,29 @@ class Store:
                 -int(item.get("score") or 0),
                 str(item.get("id") or ""),
             ))
-        return result[:max(1, min(5000, int(limit)))]
+        return result if limit is None else result[:max(1, min(5000, int(limit)))]
+
+    def set_track_decision(self, account: str, source: str, vacancy_id: str, track: str,
+                           decision: str, reason: str = "", next_action_at: str = "") -> None:
+        """Persist the generic decision for one vacancy/track pair.
+
+        ``decision`` is intentionally not a review state: it is the result of
+        the policy engine (APPLY, REVIEW, REJECT, APPLIED, BLOCKED).  Keeping
+        it separate lets the scanner re-evaluate old rows without overwriting
+        an owner's SKIP/DEFERRED/APPROVED veto.
+        """
+        normalized = str(decision or "").strip().upper()
+        if normalized not in {"APPLY", "REVIEW", "REJECT", "APPLIED", "BLOCKED"}:
+            raise ValueError("decision must be APPLY, REVIEW, REJECT, APPLIED or BLOCKED")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """UPDATE vacancy_track_scores SET decision=?,decision_reason=?,decision_at=?,
+                   next_action_at=? WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
+                (normalized, str(reason or "")[:500], now(), str(next_action_at or ""),
+                 account, source, str(vacancy_id), track),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"vacancy {vacancy_id} is not present in track {track}")
 
     def set_review_state(self, account: str, source: str, vacancy_id: str, state: str,
                          *, reason: str, notes: str | None = None, track: str | None = None) -> None:
@@ -1857,6 +2055,24 @@ class Store:
                 "APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN",
             }:
                 raise ValueError(f"cannot approve a vacancy in {row['application_state']} state")
+            if normalized == "APPROVED":
+                score_query = (
+                    "SELECT score_decision,filter_status FROM vacancy_track_scores "
+                    "WHERE account=? AND source=? AND vacancy_id=?"
+                )
+                score_params: list[Any] = [account, source, str(vacancy_id)]
+                if track is not None:
+                    score_query += " AND track=?"
+                    score_params.append(track)
+                scores = conn.execute(score_query, score_params).fetchall()
+                if not scores:
+                    raise ValueError(f"vacancy {vacancy_id} is not present in the requested track")
+                if any(
+                    str(score["score_decision"]) != "pass"
+                    or str(score["filter_status"]) not in {"pass", "unknown"}
+                    for score in scores
+                ):
+                    raise ValueError(f"vacancy {vacancy_id} did not pass screening rules")
             if track is not None:
                 score = conn.execute(
                     "SELECT 1 FROM vacancy_track_scores WHERE account=? AND source=? AND vacancy_id=? AND track=?",
@@ -1996,6 +2212,96 @@ class Store:
             )
         return cursor.rowcount > 0
 
+    def application_groups(self, account: str, track: str, *,
+                           source: str | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+        """Group one logical vacancy across its native source and mirrors.
+
+        A DreamJob row is a mirror of HH, not a second application channel.
+        This view makes the one real application, its receipt and the latest
+        response state visible on every source row.
+        """
+        # Load the whole account group so a mirror filter still shows the
+        # native HH row and its receipt.  Filter by source after grouping.
+        rows = self.list_campaign_vacancies(account, track, "all", 5000)
+        groups: dict[str, dict[str, Any]] = {}
+        with self.connect() as conn:
+            for row in rows:
+                # channel_key joins a mirror (DreamJob) to its native writer
+                # (HH); group_key is the fallback for same-employer duplicates.
+                key = str(row.get("channel_key") or row.get("job_group_key")
+                          or f"{row.get('source')}:{row.get('id')}")
+                group = groups.setdefault(key, {
+                    "group_key": key, "title": row.get("name", ""),
+                    "company": row.get("company", ""), "sources": [],
+                })
+                source_name = str(row.get("source") or "")
+                vacancy_id = str(row.get("id") or "")
+                receipt = ""
+                response_state = ""
+                if source_name == "hh.ru":
+                    attempt = conn.execute(
+                        "SELECT status,note,updated_at FROM attempts "
+                        "WHERE account=? AND vacancy_id=? ORDER BY updated_at DESC LIMIT 1",
+                        (account, vacancy_id),
+                    ).fetchone()
+                    negotiation = conn.execute(
+                        "SELECT status,updated_at FROM negotiation_statuses "
+                        "WHERE account=? AND vacancy_id=?",
+                        (account, vacancy_id),
+                    ).fetchone()
+                    if attempt:
+                        receipt = f"{attempt['status']}: {attempt['note'] or ''}".strip()
+                    if negotiation:
+                        response_state = str(negotiation["status"])
+                else:
+                    attempt = conn.execute(
+                        "SELECT status,note,updated_at FROM source_application_attempts "
+                        "WHERE account=? AND source=? AND vacancy_id=? AND track=? "
+                        "ORDER BY updated_at DESC LIMIT 1",
+                        (account, source_name, vacancy_id, track),
+                    ).fetchone()
+                    if attempt:
+                        receipt = f"{attempt['status']}: {attempt['note'] or ''}".strip()
+                    response_state = str(row.get("application_note") or "")
+                state = str(row.get("application_state") or "NOT_STARTED")
+                group["sources"].append({
+                    "source": source_name, "vacancy_id": vacancy_id,
+                    "url": row.get("url", ""), "application_state": state,
+                    "global_application_state": row.get("global_application_state", ""),
+                    "decision": row.get("decision", ""),
+                    "review_state": row.get("review_state", ""),
+                    "mirror_source": row.get("mirror_source", ""),
+                    "mirror_native_id": row.get("mirror_native_id", ""),
+                    "channel_key": row.get("channel_key", ""),
+                    "receipt": receipt, "response_state": response_state,
+                })
+        result: list[dict[str, Any]] = []
+        terminal = {"success", "already_applied", "unknown", "applied_confirmed"}
+        for group in groups.values():
+            applied_via = ""
+            for item in group["sources"]:
+                receipt = str(item.get("receipt") or "").casefold()
+                if ((str(item.get("application_state") or "").casefold() in terminal
+                     or any(receipt.startswith(prefix) for prefix in terminal))
+                        and applied_via in {"", "dreamjob.ru"}):
+                    applied_via = item["source"]
+            group["applied_via"] = applied_via or "none"
+            group["mirror_applied"] = any(
+                item["source"] == "dreamjob.ru" for item in group["sources"]
+            ) and applied_via == "hh.ru"
+            group["response_state"] = next(
+                (item["response_state"] for item in group["sources"]
+                 if item.get("response_state")), "",
+            )
+            if source and not any(item["source"] == source for item in group["sources"]):
+                continue
+            if len(group["sources"]) > 1 or any(
+                item["source"] in {"dreamjob.ru"} or item.get("mirror_source")
+                for item in group["sources"]
+            ):
+                result.append(group)
+        return result[:max(1, int(limit))]
+
     def approved_campaign_items(self, account: str, track: str, limit: int = 10,
                                 source: str = "hh.ru") -> list[dict[str, Any]]:
         rows = self.list_campaign_vacancies(account, track, "approved", limit=1000, source=source)
@@ -2004,11 +2310,16 @@ class Store:
             for row in rows:
                 if needs_manual_reapproval(row):
                     continue
+                if str(row.get("decision") or "").upper() == "BLOCKED":
+                    continue
                 # APPROVED is a track-scoped human override for reviewable unknown
-                # filters (for example, unpublished salary), never for rejected
-                # filters or an uncertain mechanical fit score.
-                if (row.get("applied_before") or row.get("filter_status") not in {"pass", "unknown"}
-                        or row.get("score_decision") != "pass"):
+                # filters (for example, unpublished salary), never for an
+                # uncertain mechanical fit score.  An explicit decision=APPLY
+                # survives a later scan-window reject (see decision.py).
+                decision = str(row.get("decision") or "").upper()
+                if (row.get("applied_before") or row.get("score_decision") != "pass"
+                        or (row.get("filter_status") not in {"pass", "unknown"}
+                            and decision != "APPLY")):
                     continue
                 if row.get("application_state") == "READY_TO_APPLY":
                     task_id = hashlib.sha256(

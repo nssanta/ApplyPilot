@@ -13,6 +13,7 @@ the provider/clicker layer and HH keeps its verified ``autoapply`` runner.
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -47,6 +48,16 @@ class ApplyOutcome:
     evidence: str = ""
     receipt: Mapping[str, Any] = field(default_factory=dict)
 
+    @property
+    def blocks_source(self) -> bool:
+        text = f"{self.note} {self.evidence}".casefold()
+        return self.status in {"captcha", "auth_lost", "platform_block"} or any(
+            marker in text for marker in (
+                "success rejected:", "persistence failed", "outcome persistence",
+                "captcha", "auth_lost", "platform block", "session lost",
+            )
+        )
+
 
 class ApplyDriver(Protocol):
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome: ...
@@ -68,11 +79,26 @@ def verified_success_receipt(source: str, vacancy_id: str, receipt: Mapping[str,
                 and receipt.get("post_path") == f"/api/frontend/vacancies/{vacancy_id}/responses"
                 and receipt.get("verified_history") is True)
     if source == "getmatch.ru":
+        if receipt.get("provider") == "getmatch.ru":
+            return (
+                str(receipt.get("vacancy_id") or "") == vacancy_id
+                and str(receipt.get("post_path") or "") == f"/api/offers/{vacancy_id}/apply"
+                and type(receipt.get("post_status")) is int
+                and 200 <= int(receipt["post_status"]) < 300
+                and receipt.get("applications_verified") is True
+            )
         message_id = receipt.get("confirmation_message_id")
         return (receipt.get("provider") == "@g_jobbot"
                 and isinstance(message_id, (int, str)) and not isinstance(message_id, bool)
                 and len(str(message_id)) <= 20 and str(message_id).isascii()
                 and str(message_id).isdigit() and int(message_id) > 0)
+    if source == "yandex.ru/jobs":
+        return (receipt.get("provider") == source
+                and str(receipt.get("publication_id") or "") == vacancy_id
+                and receipt.get("success_verified") is True
+                and receipt.get("applied_state_verified") is True
+                and (str(receipt.get("success_path") or "").rstrip("/").endswith("/success")
+                     or bool(receipt.get("success_marker"))))
     if source == "geekjob.ru":
         paths = receipt.get("post_paths")
         statuses = receipt.get("post_statuses")
@@ -178,6 +204,7 @@ def dispatch_apply(
     source_limits: Mapping[str, Mapping[str, int]] | None = None,
     registry: ProviderRegistry | None = None,
     run_id: str | None = None,
+    unknown_before_pause: int = 0,
 ) -> dict[str, Any]:
     """Executes a plan; dry-run unless ``allow_live`` and a driver are present.
 
@@ -234,6 +261,8 @@ def dispatch_apply(
     live_results: dict[int, dict[str, Any]] = {}
     paused_sources: set[str] = set()
     limited_sources: set[str] = set()
+    unknown_counts: Counter[str] = Counter()
+    pause_after = max(0, int(unknown_before_pause))
     for index, row, driver, preflight in ready_rows:
         source = str(row.get("source") or "")
         source_account = str(row.get("account") or account)
@@ -255,7 +284,7 @@ def dispatch_apply(
         source_budget = (source_limits or {}).get(source, {})
         try:
             per_run = int(source_budget.get("per_run", 100))
-            per_day = int(source_budget.get("per_day", 100))
+            per_day = int(source_budget.get("per_day", 0))
         except (TypeError, ValueError):
             per_run = per_day = 0
         reserved, reservation_note = store.reserve_source_application(
@@ -297,7 +326,12 @@ def dispatch_apply(
             outcome = ApplyOutcome("unknown", "success rejected: missing or mismatched source receipt")
         ledger_status = LIVE_STATUS_MAP.get(outcome.status, "unknown")
         if ledger_status == "unknown":
-            paused_sources.add(source)
+            unknown_counts[source] += 1
+            # A broken receipt contract or persistence failure is a source
+            # health problem.  A single ambiguous vacancy is quarantined and
+            # the remaining independent rows may continue.
+            if outcome.blocks_source or (pause_after > 0 and unknown_counts[source] >= pause_after):
+                paused_sources.add(source)
         note = outcome.note or outcome.evidence
         if outcome.receipt:
             note = f"{note} | receipt={dict(outcome.receipt)}".strip(" |")

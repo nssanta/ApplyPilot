@@ -7,12 +7,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .storage import effective_track_application_state
+
 CHANNELS = {
     "hh.ru": "legacy_runner",
     "career.habr.com": "native_opt_in",
     "getmatch.ru": "native_opt_in",
-    "geekjob.ru": "needs_live_validation",
-    "yandex.ru/jobs": "needs_live_validation",
+    "geekjob.ru": "native_opt_in",
+    "yandex.ru/jobs": "native_opt_in",
     "dreamjob.ru": "mirror_only",
 }
 
@@ -33,22 +35,34 @@ def readiness_snapshot(db_path: Path, track: str, accounts: dict[str, str], *,
         return {**result, "status": "database_missing"}
     with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         conn.row_factory = sqlite3.Row
+        score_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(vacancy_track_scores)")
+        }
+        decision_expr = "s.decision" if "decision" in score_columns else "''"
         for source, channel in CHANNELS.items():
             account = accounts.get(source, "default")
             rows = conn.execute(
-                """SELECT s.review_state,s.score_decision,s.filter_status,v.application_state
+                f"""SELECT s.review_state,s.score_decision,s.filter_status,
+                           {decision_expr} AS decision,v.application_state
                 FROM vacancy_track_scores s JOIN vacancies v USING(account,source,vacancy_id)
                 WHERE s.account=? AND s.source=? AND s.track=?""", (account, source, track),
             ).fetchall()
             counts = {"total": len(rows), "approved": 0, "approved_eligible_ready": 0,
                       "needs_workflow": 0, "unknown": 0, "confirmed": 0, "rejected": 0}
             for row in rows:
-                state = row["application_state"]
+                state = effective_track_application_state(
+                    str(row["application_state"] or ""),
+                    str(row["review_state"] or ""),
+                    str(row["score_decision"] or ""),
+                    str(row["filter_status"] or ""),
+                    str(row["decision"] or ""),
+                )
                 approved = row["review_state"] == "APPROVED"
                 counts["approved"] += approved
                 counts["approved_eligible_ready"] += (
                     approved and state == "READY_TO_APPLY" and row["score_decision"] == "pass"
                     and row["filter_status"] in {"pass", "unknown"}
+                    and str(row["decision"] or "").upper() != "BLOCKED"
                 )
                 counts["needs_workflow"] += state in {"NEEDS_FORM", "NEEDS_LETTER", "NEEDS_MANUAL"}
                 counts["unknown"] += state == "UNKNOWN"

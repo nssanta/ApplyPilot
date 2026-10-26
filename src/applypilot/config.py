@@ -156,6 +156,29 @@ class AppConfig:
             return tomllib.load(fh)
 
     @property
+    def policy_path(self) -> Path:
+        return self.root / "private/config/operating-policy.toml"
+
+    def load_policy(self) -> dict[str, Any]:
+        """Load the optional machine-readable operating policy.
+
+        The policy is intentionally separate from STATUS/history documents.
+        It contains only permissions, hard stops and decision thresholds; the
+        code never depends on prose being interpreted by a model.
+        """
+        if not self.policy_path.exists():
+            return {}
+        try:
+            with self.policy_path.open("rb") as fh:
+                data = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigError(f"invalid operating policy: {exc}") from exc
+        policy = data.get("policy", data)
+        if not isinstance(policy, dict):
+            raise ConfigError("operating policy must be a TOML table")
+        return policy
+
+    @property
     def db_path(self) -> Path:
         return self.data_dir / "applypilot.sqlite3"
 
@@ -252,7 +275,7 @@ def effective_search(raw: dict[str, Any], preset_name: str | None = None,
 
 
 def application_limits(profile: dict[str, Any], source: str) -> dict[str, int]:
-    """Resolve independent source budgets; the 300/day legacy cap belongs to HH."""
+    """Explicit daily budgets only; zero means no local daily ceiling."""
     limits = profile.get("limits", {}) or {}
     configured = profile.get("source_limits", {}) or {}
     override = configured.get(source, {}) if isinstance(configured, dict) else {}
@@ -260,12 +283,12 @@ def application_limits(profile: dict[str, Any], source: str) -> dict[str, int]:
         raise ConfigError(f"source_limits.{source} must be a table")
     try:
         per_run = int(override.get("per_run", limits.get("per_run", 100)))
-        default_daily = limits.get("per_day", 300) if source == "hh.ru" else per_run
+        default_daily = limits.get("per_day", 0) if source == "hh.ru" else 0
         per_day = int(override.get("per_day", default_daily))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid application limit for {source}") from exc
-    if per_run < 1 or per_day < 1:
-        raise ConfigError(f"application limits for {source} must be positive")
+    if per_run < 1 or per_day < 0:
+        raise ConfigError(f"application limits for {source} must have per_run > 0 and per_day >= 0")
     return {"per_run": per_run, "per_day": per_day}
 
 

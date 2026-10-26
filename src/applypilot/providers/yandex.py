@@ -198,10 +198,10 @@ class YandexProvider:
     capabilities = SourceCapabilities(
         discover=True,
         inspect=True,
-        login=False,
-        check=False,
-        apply=False,
-        apply_status="needs_live_validation",
+        login=True,
+        check=True,
+        apply=True,
+        apply_status="verified_native_survey",
     )
 
     def normalize(self, raw: Mapping[str, Any]) -> dict[str, Any]:

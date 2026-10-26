@@ -3,6 +3,48 @@
 from applypilot.cli import build_parser
 
 
+def test_go_defaults_to_all_sources_and_full_cycle() -> None:
+    args = build_parser().parse_args(["go", "--track", "ai_core"])
+    assert args.sources == "all"
+    assert args.scan_only is False
+    assert args.once is False
+    assert args.visible is False
+    assert args.days == 30
+    assert args.max_cycles == 100
+    assert args.max_passes == 1
+
+
+def test_go_accepts_ad_hoc_query_and_target() -> None:
+    args = build_parser().parse_args([
+        "go", "--query", "AI агент", "--query", "LLM engineer",
+        "--salary-from", "120000", "--remote", "--target", "50",
+        "--sources", "hh.ru,career.habr.com",
+    ])
+    assert args.query == ["AI агент", "LLM engineer"]
+    assert args.salary_from == 120000
+    assert args.remote is True
+    assert args.target == 50
+    assert args.sources == "hh.ru,career.habr.com"
+
+
+def test_queue_links_parser() -> None:
+    args = build_parser().parse_args([
+        "queue", "links", "--track", "ai_core", "--source", "dreamjob.ru", "--limit", "5",
+    ])
+    assert args.queue_action == "links"
+    assert args.source == "dreamjob.ru"
+    assert args.limit == 5
+
+
+def test_go_can_be_scan_only_or_visible() -> None:
+    scan = build_parser().parse_args(["go", "--scan-only", "--sources", "hh.ru"])
+    assert scan.scan_only is True
+    assert scan.sources == "hh.ru"
+    visible = build_parser().parse_args(["go", "--visible", "--once"])
+    assert visible.visible is True
+    assert visible.once is True
+
+
 def test_queue_apply_defaults_to_bulk_limit() -> None:
     args = build_parser().parse_args(["queue", "apply", "--track", "ai_core", "--dry-run"])
     assert args.limit == 100
@@ -35,6 +77,62 @@ def test_campaign_preserves_track_sort_mode_unless_overridden() -> None:
     ])
     assert configured.sort_mode is None
     assert explicit.sort_mode == "newest"
+
+
+def test_campaign_cycle_controls_are_explicit() -> None:
+    args = build_parser().parse_args([
+        "run", "campaign", "--track", "ai_core", "--apply", "--allow-live",
+        "--until-exhausted", "--max-cycles", "7",
+    ])
+    assert args.until_exhausted is True
+    assert args.max_cycles == 7
+
+    from applypilot.cli import _campaign_cycle_argv, _campaign_report_attempts
+
+    child = _campaign_cycle_argv([
+        "run", "campaign", "--track", "ai_core", "--until-exhausted",
+        "--cycles", "4", "--max-cycles", "9", "--apply", "--allow-live",
+    ])
+    assert child == [
+        "run", "campaign", "--track", "ai_core", "--apply", "--allow-live",
+    ]
+    assert _campaign_report_attempts({"live": {
+        "hh.ru": {"summary": {"counts": {"success": 2, "needs_manual": 1}}},
+    }}) == {"attempted": 3, "confirmed": 2, "needs_manual": 1, "unknown": 0}
+
+
+def test_campaign_cycle_runner_stops_only_when_search_and_queue_are_exhausted(tmp_path, monkeypatch) -> None:
+    from applypilot import cli
+
+    args = cli.build_parser().parse_args([
+        "run", "campaign", "--track", "ai_core", "--apply", "--allow-live",
+        "--until-exhausted", "--max-cycles", "5",
+    ])
+    calls: list[list[str]] = []
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        report = tmp_path / f"report-{len(calls)}.json"
+        counts = {"success": 1} if len(calls) == 1 else {}
+        report.write_text(cli.json.dumps({
+            "sources": ["hh.ru"],
+            "scan": {"sources": [{"source": "hh.ru", "status": "ok"}]},
+            "queue": {"hh.ru": {"ready": 1 if len(calls) == 1 else 0}},
+            "live": {"hh.ru": {"summary": {"counts": counts}}},
+        }))
+        print(f"private_report: {report}")
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    code = cli._run_campaign_cycles(None, args, [
+        "run", "campaign", "--track", "ai_core", "--apply", "--allow-live",
+        "--until-exhausted", "--max-cycles", "5",
+    ])
+
+    assert code == 0
+    assert len(calls) == 2
+    assert "--cycles" not in calls[0]
+    assert "--until-exhausted" not in calls[0]
 
 
 def test_campaign_can_explicitly_run_headless() -> None:

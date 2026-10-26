@@ -18,12 +18,29 @@ GETMATCH_URL = re.compile(r"https?://(?:www\.)?getmatch\.ru/vacancies/(\d+)", re
 
 
 def _title_from_text(text: str) -> str:
-    """Uses the first non-URL line only; never guesses a vacancy ID."""
+    """Extract the visible vacancy title from a Telegram Markdown message.
+
+    Getmatch starts many cards with ``[**Title**](url)** @ Company**``.
+    Treating the whole line as a URL used to fall through to the salary line,
+    which made title scoring useless.  Never guesses a vacancy ID.
+    """
     for line in str(text or "").splitlines():
-        candidate = line.strip(" \t•-—–")
-        if not candidate or "http://" in candidate.lower() or "https://" in candidate.lower():
+        raw = line.strip()
+        if not raw:
             continue
-        return candidate[:117] + "..." if len(candidate) > 120 else candidate
+        markdown = re.search(r"\[(.+?)\]\(https?://", raw)
+        if markdown:
+            candidate = markdown.group(1)
+        elif raw.startswith("**") and raw.count("**") >= 2:
+            candidate = raw.split("**")[1]
+        elif "http://" in raw.lower() or "https://" in raw.lower():
+            continue
+        else:
+            candidate = raw
+        candidate = candidate.replace("**", "").strip(" \t•-—–")
+        candidate = candidate.split(" @ ", 1)[0].strip()
+        if candidate:
+            return candidate[:117] + "..." if len(candidate) > 120 else candidate
     return ""
 
 
@@ -86,6 +103,15 @@ def import_telegram_vacancies(
             link = _public_link(message)
             payload = store.vacancy_payload(ledger, source, vacancy_id)
             if payload:
+                if str(payload.get("description_status") or "") == "telegram":
+                    refreshed = _title_from_text(link["text"])
+                    if refreshed and refreshed != str(payload.get("name") or ""):
+                        store.save_imported_vacancy(
+                            ledger, source, vacancy_id,
+                            {**payload, "name": refreshed, "description": link["text"],
+                             "description_status": "telegram"},
+                            track,
+                        )
                 if store.link_telegram_message(ledger, source, vacancy_id, link):
                     linked.append({
                         "id": vacancy_id,

@@ -139,6 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd = sub.add_parser("run", help="запустить ручную операцию")
     run_sub = run_cmd.add_subparsers(dest="run_action", required=True)
     campaign = run_sub.add_parser("campaign", help="найти и подготовить вакансии; live apply включается явно")
+    campaign.add_argument("--queue-only", action="store_true", help="обработать сохранённую очередь без повторного discovery")
+    campaign.add_argument("--execution-id", default="", help=argparse.SUPPRESS)
     campaign.add_argument("--track", required=True, help="ключ трека из private/config/tracks.toml")
     campaign.add_argument("--source", action="append", help="источник; повторить для нескольких; без флага — прежний HH-only режим")
     campaign.add_argument("--query", action="append", help="поисковая фраза; можно указать несколько раз")
@@ -155,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--preset", choices=PRESET_CHOICES)
     campaign.add_argument("--until-complete", action="store_true",
                           help="продолжать bounded passes до завершения или внешней остановки")
+    campaign.add_argument("--until-exhausted", action="store_true",
+                          help="повторять scan→decide→apply, пока цикл не перестанет отправлять")
+    campaign.add_argument("--cycles", type=int, default=1,
+                          help="число последовательных scan→decide→apply циклов")
+    campaign.add_argument("--max-cycles", type=int, default=100,
+                          help="страховочный предел для --until-exhausted")
     campaign.add_argument("--resume", action="store_true",
                           help="продолжить сохранённые страницы и sitemap cursors")
     campaign.add_argument("--max-passes", type=int, default=30)
@@ -168,6 +176,41 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--habr-min-interval", type=float, default=2.0)
     campaign.add_argument("--getmatch-min-interval", type=float, default=2.0)
     campaign.add_argument("--geekjob-min-interval", type=float, default=2.0)
+
+    go = sub.add_parser(
+        "go", help="одна команда: scan → decide → apply → verify по всем источникам",
+    )
+    go.add_argument("--track", default="", help="ключ трека или all; по умолчанию active_tracks")
+    go.add_argument("--sources", default="all",
+                    help="all или список источников через запятую")
+    go.add_argument("--source", action="append", help="источник; можно повторить")
+    go.add_argument("--days", type=int, default=30)
+    go.add_argument("--limit", type=int, default=100)
+    go.add_argument("--target", type=int, default=0,
+                    help="желаемое число подтверждённых откликов; shortfall печатается")
+    go.add_argument("--target-scope", choices=("total", "per-source"),
+                    help="область цели: всего по кампании или на каждой площадке")
+    go.add_argument("--campaign-id", default="", help="продолжить сохранённую кампанию")
+    go.add_argument("--request-budget", type=int)
+    go.add_argument("--query", action="append", help="поисковая фраза; можно повторить")
+    go.add_argument("--area", type=int, action="append", help="регион HH")
+    go.add_argument("--salary-from", type=int)
+    go.add_argument("--remote", action=argparse.BooleanOptionalAction, default=None)
+    go.add_argument("--preset", choices=PRESET_CHOICES)
+    go.add_argument("--pages", type=int)
+    go.add_argument("--details-limit", type=int)
+    go.add_argument("--max-passes", type=int, default=1,
+                    help="порций поиска перед отправкой; продолжение — в следующих циклах")
+    go.add_argument("--max-cycles", type=int, default=100)
+    go.add_argument("--scan-only", action="store_true",
+                    help="только scan/decide, без live-отправок")
+    go.add_argument("--once", action="store_true",
+                    help="один цикл вместо until-exhausted")
+    go_visibility = go.add_mutually_exclusive_group()
+    go_visibility.add_argument("--visible", action="store_true",
+                               help="показывать окна браузера")
+    go_visibility.add_argument("--headless", action="store_true",
+                               help="без видимого окна (по умолчанию)")
 
     bundle = run_sub.add_parser("bundle", help="собрать до 100 кандидатов из нескольких треков")
     bundle.add_argument("--track", action="append", choices=("ai", "backend", "ml"),
@@ -213,6 +256,26 @@ def build_parser() -> argparse.ArgumentParser:
     queue_batch.add_argument("--state", required=True,
                              choices=("FIT", "MAYBE", "SKIP", "APPROVED", "DEFERRED", "UNREVIEWED"))
     queue_batch.add_argument("--reason", default="")
+    queue_stats = queue_sub.add_parser("stats", help="показать funnel решений по треку")
+    queue_stats.add_argument("--track", required=True)
+    queue_stats.add_argument("--source", help="источник; без флага — все источники трека")
+    queue_stats.add_argument("--json", action="store_true")
+    queue_links = queue_sub.add_parser(
+        "links", help="одна вакансия → все источники/зеркала, отклик и ответ",
+    )
+    queue_links.add_argument("--track", required=True)
+    queue_links.add_argument("--source", help="фильтр по источнику")
+    queue_links.add_argument("--limit", type=int, default=100)
+    queue_links.add_argument("--json", action="store_true")
+    queue_sweep = queue_sub.add_parser(
+        "sweep", help="пересчитать решение по всем незавершённым вакансиям трека",
+    )
+    queue_sweep.add_argument("--rescore", action="store_true", help="пересчитать сохранённые карточки по текущим фильтрам")
+    queue_sweep.add_argument("--track", required=True)
+    queue_sweep.add_argument("--source", help="источник; без флага — все источники трека")
+    queue_sweep.add_argument("--dry-run", action="store_true",
+                             help="только показать решения, не менять review/application state")
+    queue_sweep.add_argument("--json", action="store_true")
     queue_history = queue_sub.add_parser("history", help="история запусков поиска")
     queue_history.add_argument("--track")
     queue_history.add_argument("--limit", type=int, default=20)
@@ -317,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     sources_dispatch_apply.add_argument("--track", required=True)
     sources_dispatch_apply.add_argument("--source", action="append")
     sources_dispatch_apply.add_argument("--limit", type=int, default=100)
+    sources_dispatch_apply.add_argument("--execution-id", default="", help=argparse.SUPPRESS)
     sources_dispatch_apply.add_argument("--allow-live", action="store_true",
                                         help="разрешить live-драйверы; без драйвера источник пропускается")
     sources_dispatch_apply.add_argument(
@@ -346,6 +410,14 @@ def build_parser() -> argparse.ArgumentParser:
     sources_dispatch_apply.add_argument(
         "--geekjob-min-interval", type=float, default=2.0,
         help="GeekJob: минимальные секунды между отправками в одной сессии (0..30)",
+    )
+    sources_dispatch_apply.add_argument(
+        "--enable-yandex", action="store_true",
+        help="включить native-survey Yandex driver; требует --allow-live и APPROVED",
+    )
+    sources_dispatch_apply.add_argument(
+        "--yandex-min-interval", type=float, default=2.0,
+        help="Yandex: минимальные секунды между отправками в одной сессии (0..30)",
     )
     sources_dispatch_apply.add_argument("--json", action="store_true")
 
@@ -690,6 +762,8 @@ def _track_config(config: AppConfig, track: str, *, profile_override: bool = Fal
     if track not in tracks:
         raise ConfigError(f"unknown track: {track}")
     item = tracks[track]
+    if item.get("enabled") is False:
+        raise ConfigError(f"track is disabled by tracks.toml: {track}")
     profile_path = config.profile_path if profile_override else config.root / item["profile"]
     search_path = config.search_path if search_override else config.root / item["search"]
     return replace(config, profile_path=profile_path.resolve(), search_path=search_path.resolve()), item
@@ -1167,9 +1241,127 @@ def _accounts_command(config: AppConfig, args: argparse.Namespace) -> int:
     return 2
 
 
+def _campaign_cycle_argv(raw_argv: list[str]) -> list[str]:
+    """Strip cycle controls so a child campaign runs exactly one cycle."""
+    result: list[str] = []
+    skip_next = False
+    for token in raw_argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"--until-exhausted", "--cycles", "--max-cycles"}:
+            skip_next = token in {"--cycles", "--max-cycles"}
+            continue
+        if token.startswith(("--cycles=", "--max-cycles=")):
+            continue
+        result.append(token)
+    return result
+
+
+def _campaign_report_attempts(report: dict[str, Any]) -> dict[str, int]:
+    attempted = confirmed = manual = unknown = 0
+    live = report.get("live")
+    if isinstance(live, dict):
+        for result in live.values():
+            if not isinstance(result, dict):
+                continue
+            counts = _campaign_apply_summary(result)
+            confirmed_count = int(counts.get("confirmed", 0) or 0)
+            manual_count = int(counts.get("needs_manual", 0) or 0)
+            unknown_count = int(counts.get("unknown", 0) or 0)
+            failure_count = int(counts.get("failures", 0) or 0)
+            attempted += max(
+                int(counts.get("sent", 0) or 0),
+                confirmed_count + manual_count + unknown_count + failure_count,
+            )
+            confirmed += confirmed_count
+            manual += manual_count
+            unknown += unknown_count
+    return {
+        "attempted": attempted, "confirmed": confirmed,
+        "needs_manual": manual, "unknown": unknown,
+    }
+
+
+def _run_campaign_cycles(_config, args, raw_argv: list[str]) -> int:
+    """Continue unfinished search/enrichment/queue work, isolating source stops.
+
+    Every cycle owns its normal browser/session lifecycle. A zero-confirmation
+    round is not terminal while the report still proves useful work remains.
+    """
+    if not args.apply:
+        print("campaign: --until-exhausted/--cycles requires --apply", file=sys.stderr)
+        return 2
+    max_cycles = args.max_cycles if args.until_exhausted else args.cycles
+    if not 1 <= int(max_cycles) <= 1000:
+        print("campaign: cycles must be between 1 and 1000", file=sys.stderr)
+        return 2
+    child_argv = _campaign_cycle_argv(raw_argv)
+    last_code = 0
+    for cycle in range(1, int(max_cycles) + 1):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = main(child_argv)
+        output = buffer.getvalue()
+        last_code = code
+        report_path = ""
+        for line in output.splitlines():
+            if line.startswith("private_report: "):
+                report_path = line.split("private_report: ", 1)[1].strip()
+        report: dict[str, Any] = {}
+        if report_path:
+            try:
+                report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                report = {}
+        stats = _campaign_report_attempts(report)
+        print(
+            f"campaign cycle {cycle}/{max_cycles}: attempted={stats['attempted']} "
+            f"confirmed={stats['confirmed']} needs_manual={stats['needs_manual']} "
+            f"unknown={stats['unknown']} exit={code}"
+        )
+        if not report:
+            print(output[-1600:], file=sys.stderr)
+            print("campaign: cycle report is unavailable; stopping", file=sys.stderr)
+            return code or 2
+        from .execution import cycle_state
+
+        states = {source: cycle_state(report, source) for source in report.get("sources", [])}
+        if not any(state.startswith("pending_") for state in states.values()):
+            print(f"campaign stop: {states}")
+            return 0 if states and all(state == "exhausted" for state in states.values()) else 2
+        # The next cycle visits only unfinished sources; a CAPTCHA or auth
+        # failure must not be retried because another source still has work.
+        filtered = []
+        skip = False
+        for token in child_argv:
+            if skip:
+                skip = False
+            elif token == "--source":
+                skip = True
+            elif not token.startswith("--source="):
+                filtered.append(token)
+        for source, state in states.items():
+            if state.startswith("pending_"):
+                filtered.extend(("--source", source))
+        child_argv = filtered
+    print(f"campaign: reached safety limit of {max_cycles} cycles; run again to continue")
+    return 2 if args.until_exhausted else last_code
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = build_parser().parse_args(raw_argv)
     config = _config(args)
+
+    if args.command == "go":
+        try:
+            from .execution import run_go
+
+            return run_go(config, args, main)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"go: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
 
     if args.command == "doctor":
         print(f"root: {config.root}")
@@ -1553,7 +1745,8 @@ def main(argv: list[str] | None = None) -> int:
                     print("dispatch: live sends require reviewed = true in the selected private profile",
                           file=sys.stderr)
                     return 2
-                if (args.enable_habr or args.enable_getmatch or args.enable_geekjob) and not args.allow_live:
+                if (args.enable_habr or args.enable_getmatch or args.enable_geekjob
+                        or args.enable_yandex) and not args.allow_live:
                     print("dispatch: source drivers require --allow-live",
                           file=sys.stderr)
                     return 2
@@ -1565,6 +1758,9 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
                 if not 0 <= args.geekjob_min_interval <= 30:
                     print("dispatch: --geekjob-min-interval must be 0..30", file=sys.stderr)
+                    return 2
+                if not 0 <= args.yandex_min_interval <= 30:
+                    print("dispatch: --yandex-min-interval must be 0..30", file=sys.stderr)
                     return 2
                 drivers: dict[str, Any] = {}
                 with ExitStack() as cleanup:
@@ -1603,23 +1799,51 @@ def main(argv: list[str] | None = None) -> int:
                             )
                     if args.allow_live and args.enable_getmatch and "getmatch.ru" in selected:
                         try:
-                            from .getmatch_apply import GetmatchCallbackDriver
+                            from .getmatch_web import GetmatchHybridDriver
+                            from .provider_sessions import (
+                                ProviderSessionManager,
+                                _exclusive_profile_lock,
+                            )
                             from .telegram_client import TelegramAccount
 
                             source_account = accounts["getmatch.ru"]
                             telegram_account = "getmatch-primary"
                             auth = TelegramAccount(config.root, telegram_account).status()
-                            if auth.get("status") == "confirmed":
-                                drivers["getmatch.ru"] = GetmatchCallbackDriver(
-                                    config.root, store, account=source_account,
-                                    telegram_account=telegram_account, track=args.track,
-                                    min_interval_seconds=args.getmatch_min_interval,
+                            page_factory = None
+                            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+                            web_auth = manager.check("getmatch.ru", source_account)
+                            if web_auth.get("status") == "confirmed":
+                                from playwright.sync_api import sync_playwright
+
+                                profile_dir = manager.profile_dir("getmatch.ru", source_account)
+                                cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
+                                playwright = cleanup.enter_context(sync_playwright())
+                                context = manager._context_factory(
+                                    playwright, profile_dir, not args.visible,
+                                )
+                                cleanup.callback(context.close)
+                                page_factory = context.new_page
+                            if auth.get("status") != "confirmed" and page_factory is None:
+                                print(
+                                    f"Getmatch driver unavailable: Telegram={auth.get('status', 'unknown')}, "
+                                    f"web={web_auth.get('status', 'unknown')}",
+                                    file=sys.stderr,
                                 )
                             else:
-                                print(
-                                    f"Getmatch driver unavailable: Telegram={auth.get('status', 'unknown')}; "
-                                    "run accounts telegram-status --online first",
-                                    file=sys.stderr,
+                                def _getmatch_letter(row: dict[str, Any]) -> str:
+                                    approved = str(row.get("approved_cover_letter") or "").strip()
+                                    if approved:
+                                        return approved
+                                    try:
+                                        return render_template(dict(row), profile)
+                                    except (ConfigError, ValueError, KeyError):
+                                        return ""
+
+                                drivers["getmatch.ru"] = GetmatchHybridDriver(
+                                    config.root, store, account=source_account,
+                                    telegram_account=telegram_account, track=args.track,
+                                    page_factory=page_factory, letter_factory=_getmatch_letter,
+                                    min_interval_seconds=args.getmatch_min_interval,
                                 )
                         except Exception as exc:  # noqa: BLE001 - isolate one source setup failure
                             print(
@@ -1664,8 +1888,58 @@ def main(argv: list[str] | None = None) -> int:
                                 f"GeekJob driver initialization failed: {type(exc).__name__}: {str(exc)[:160]}",
                                 file=sys.stderr,
                             )
+                    if args.allow_live and args.enable_yandex and "yandex.ru/jobs" in selected:
+                        try:
+                            from .provider_sessions import (
+                                ProviderSessionManager,
+                                _exclusive_profile_lock,
+                            )
+                            from .yandex_apply import YandexPageDriver
+
+                            manager = ProviderSessionManager(selected_config.data_dir / "providers")
+                            yandex_account = accounts["yandex.ru/jobs"]
+                            auth = manager.check("yandex.ru/jobs", yandex_account)
+                            if auth.get("status") == "confirmed":
+                                from playwright.sync_api import sync_playwright
+
+                                profile_dir = manager.profile_dir("yandex.ru/jobs", yandex_account)
+                                cleanup.enter_context(_exclusive_profile_lock(profile_dir.parent))
+                                playwright = cleanup.enter_context(sync_playwright())
+                                context = manager._context_factory(
+                                    playwright, profile_dir, not args.visible,
+                                )
+                                cleanup.callback(context.close)
+
+                                def _yandex_letter(row: dict[str, Any]) -> str:
+                                    approved = str(row.get("approved_cover_letter") or "").strip()
+                                    if approved:
+                                        return approved
+                                    try:
+                                        return render_template(dict(row), profile)
+                                    except (ConfigError, ValueError, KeyError):
+                                        return ""
+
+                                drivers["yandex.ru/jobs"] = YandexPageDriver(
+                                    context.new_page, _yandex_letter,
+                                    min_interval_seconds=args.yandex_min_interval,
+                                )
+                            else:
+                                print(
+                                    f"Yandex driver unavailable: login={auth.get('status', 'unknown')}; "
+                                    "run sources login/check first",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # noqa: BLE001 - isolate one source setup failure
+                            print(
+                                f"Yandex driver initialization failed: {type(exc).__name__}: {str(exc)[:160]}",
+                                file=sys.stderr,
+                            )
+                    dispatch_run_id = uuid.uuid4().hex
+                    if args.execution_id:
+                        for source in selected:
+                            store.execution_run(args.execution_id, dispatch_run_id, source, args.track)
                     result = dispatch_apply(
-                        store, "default", args.track, selected, args.limit,
+                        store, "default", args.track, selected, args.limit, run_id=dispatch_run_id,
                         allow_live=bool(args.allow_live), drivers=drivers,
                         accounts=accounts, source_limits=source_limits, registry=registry,
                     )
@@ -1872,6 +2146,8 @@ def main(argv: list[str] | None = None) -> int:
         print("No applications submitted. Use batch-set and queue apply after selecting good fits.")
         return 2 if failures else 0
     if args.command == "run" and args.run_action == "campaign":
+        if args.until_exhausted or args.cycles > 1:
+            return _run_campaign_cycles(config, args, raw_argv)
         if (args.source is not None or args.until_complete or args.resume or args.apply):
             if args.apply and not args.allow_live:
                 print("campaign: --apply requires explicit --allow-live", file=sys.stderr)
@@ -1885,6 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
                     search_override=bool(args.search),
                 )
                 search = effective_search(selected_config.load_search(), args.preset)
+                operating_policy = selected_config.load_policy()
                 search["days"] = args.days
                 if args.query:
                     if isinstance(search.get("groups"), list):
@@ -1905,9 +2182,40 @@ def main(argv: list[str] | None = None) -> int:
                             group["only_remote"] = args.remote
                 if args.sort_mode is not None:
                     search["sort_mode"] = args.sort_mode
+                if args.salary_from is not None or args.salary_currency:
+                    salary = dict(search.get("salary") or {})
+                    if args.salary_from is not None:
+                        salary["from"] = args.salary_from
+                    if args.salary_currency:
+                        salary["currency"] = args.salary_currency
+                    search["salary"] = salary
+                    for group in search.get("groups", []):
+                        if isinstance(group, dict):
+                            group["salary"] = {**group.get("salary", {}), **salary}
+                for flag, field in (("pages", "max_pages"), ("request_budget", "request_budget"),
+                                    ("details_limit", "details_limit")):
+                    value = getattr(args, flag, None)
+                    if value is not None:
+                        search[field] = value
+                        for group in search.get("groups", []):
+                            if isinstance(group, dict):
+                                group[field] = value
+                for group in search.get("groups", []):
+                    if isinstance(group, dict):
+                        group["days"] = args.days
+                validate_search(search)
+                origins = search_origins(selected_config.load_search(), args.preset)
+                for flag, field in (("query", "queries"), ("area", "areas"),
+                                    ("remote", "only_remote"), ("salary_from", "salary.from"),
+                                    ("salary_currency", "salary.currency"), ("days", "days"),
+                                    ("pages", "max_pages"), ("request_budget", "request_budget"),
+                                    ("details_limit", "details_limit")):
+                    if getattr(args, flag, None) is not None:
+                        origins[field] = "cli"
                 profile = _profile(selected_config, search)
                 if not search.get("resume_key"):
                     profile["resume"] = str(track_info.get("resume") or profile.get("resume") or "")
+                from .decision import sweep_track_decisions
                 from .multisource import approve_scanned_fits, resolve_source_account, scan_sources
                 from .providers import default_registry
 
@@ -1972,6 +2280,9 @@ def main(argv: list[str] | None = None) -> int:
                             stops["hh.ru"] = f"sync blocked: {type(exc).__name__}: {str(exc)[:180]}"
                 scan_search = dict(search)
                 scan_search["days"] = args.days
+                scan_search["scan_scope"] = args.execution_id
+                print(f"campaign phase: discovery; track={args.track}; sources={','.join(selected)}; "
+                      f"queue_only={args.queue_only}", flush=True)
                 scanned = scan_sources(
                     selected_config, args.track, profile, scan_search, sources=selected,
                     until_complete=args.until_complete, resume=args.resume,
@@ -1979,7 +2290,11 @@ def main(argv: list[str] | None = None) -> int:
                     request_budget=args.request_budget, details_limit=args.details_limit,
                     limit=args.limit,
                     telegram_hints=("getmatch.ru" in selected), registry=registry,
-                )
+                ) if not args.queue_only else {
+                    "sources": [{"source": source, "status": "ok", "items": 0,
+                                 "candidate_ids": [], "coverage_complete": True} for source in selected],
+                    "partial_sources": [], "failed_sources": [],
+                }
                 if "getmatch.ru" in selected and telegram_sync.get("history", {}).get("status") == "ok":
                     try:
                         ledger_account = resolve_source_account(
@@ -1993,16 +2308,43 @@ def main(argv: list[str] | None = None) -> int:
                         telegram_sync["receipt_reconcile_error"] = (
                             f"{type(exc).__name__}: {str(exc)[:180]}"
                         )
+                from .multisource import refresh_queue
+
+                refreshed = {}
                 approvals: dict[str, dict[str, Any]] = {}
                 for row in scanned["sources"]:
                     source = row["source"]
                     account = resolve_source_account(selected_config, profile, source)
-                    approvals[source] = approve_scanned_fits(
-                        store, account, args.track, source, row.get("candidate_ids", []),
-                        search=search,
+                    print(f"campaign phase: rescore/enrich; source={source}", flush=True)
+                    refreshed[source] = refresh_queue(
+                        selected_config, args.track, profile, search, source,
+                        details_limit=(args.details_limit if args.details_limit is not None else
+                                       int(search.get("details_limit", 100))),
+                    )
+                    if operating_policy.get("auto_approve", True):
+                        approvals[source] = approve_scanned_fits(
+                            store, account, args.track, source, row.get("candidate_ids", []),
+                            search=search,
+                        )
+                    else:
+                        approvals[source] = {
+                            "source": source,
+                            "requested": len(row.get("candidate_ids", [])),
+                            "eligible": 0,
+                            "approved": 0,
+                            "blocked": {},
+                            "auto_approve": False,
+                        }
+                    # Re-evaluate the whole non-terminal track, not only IDs
+                    # from this scan window.  Old READY/NOT_STARTED rows must
+                    # not stay undecided for weeks.
+                    approvals[source]["sweep"] = sweep_track_decisions(
+                        store, account, args.track, source,
+                        search=search, profile=profile, policy=operating_policy,
                     )
                 live: dict[str, Any] = {}
                 if args.apply:
+                    print(f"campaign phase: apply/verify; batch={args.limit}", flush=True)
                     if profile.get("reviewed") is not True:
                         stops["campaign"] = "live sends blocked: selected private profile is not reviewed"
                     for source in selected:
@@ -2029,9 +2371,10 @@ def main(argv: list[str] | None = None) -> int:
                                 stops[source] = "live send blocked: exact track resume missing or mismatched"
                                 continue
                             run_id = uuid.uuid4().hex
+                            store.execution_run(args.execution_id, run_id, source, args.track)
                             code = _run_apply(
                                 selected_config, store, prepared, run_id, account,
-                                input_path, args.limit,
+                                input_path, args.limit, search_override=search,
                                 headless_override=(True if args.headless else
                                                    (False if args.visible else None)),
                             )
@@ -2050,7 +2393,7 @@ def main(argv: list[str] | None = None) -> int:
                             "--search", str(selected_config.search_path),
                             "sources", "dispatch-apply", "--track", args.track,
                             "--source", source, "--limit", str(args.limit),
-                            "--allow-live", "--json",
+                            "--allow-live", "--json", "--execution-id", args.execution_id,
                         ]
                         if args.visible:
                             cmd.append("--visible")
@@ -2062,6 +2405,8 @@ def main(argv: list[str] | None = None) -> int:
                         elif source == "geekjob.ru":
                             cmd.extend(("--enable-geekjob", "--geekjob-min-interval",
                                         str(args.geekjob_min_interval)))
+                        elif source == "yandex.ru/jobs":
+                            cmd.extend(("--enable-yandex", "--yandex-min-interval", "2"))
                         capture = io.StringIO()
                         previous_telegram_live = os.environ.get("APPLYPILOT_TELEGRAM_LIVE")
                         if source == "getmatch.ru":
@@ -2086,7 +2431,29 @@ def main(argv: list[str] | None = None) -> int:
                                                "output": capture.getvalue()[-2000:]}
                         live[source] = {"exit_code": code, "account": account,
                                         "dispatch": dispatch_result}
+                queue = {}
+                for source in selected:
+                    account = resolve_source_account(selected_config, profile, source)
+                    rows = store.list_campaign_vacancies(account, args.track, "all", None, source=source)
+                    store.observe_execution(args.execution_id, account, source, args.track, rows)
+                    queue[source] = {
+                        "unique": len(rows),
+                        "ready": sum(row.get("decision") == "APPLY"
+                                     and row.get("application_state") == "READY_TO_APPLY"
+                                     for row in rows),
+                        "needs_description": refreshed.get(source, {}).get("needs_description", 0),
+                        "enrichment_errors": refreshed.get(source, {}).get("errors", []),
+                        "description_deferred": refreshed.get(source, {}).get("description_deferred", 0),
+                        "review": sum(row.get("decision") == "REVIEW" for row in rows),
+                        "rejected": sum(row.get("decision") == "REJECT" for row in rows),
+                        "blocked": sum(row.get("decision") == "BLOCKED" for row in rows),
+                        "requires_user": sum(row.get("global_application_state") in {
+                            "UNKNOWN", "NEEDS_FORM", "NEEDS_LETTER", "NEEDS_MANUAL"} for row in rows),
+                    }
                 report = {
+                    "execution_id": args.execution_id,
+                    "effective_search": search, "search_origins": origins, "queue": queue,
+                    "refresh": refreshed,
                     "track": args.track, "sources": selected,
                     "search_days": args.days, "until_complete": bool(args.until_complete or args.resume),
                     "scan": scanned, "approvals": approvals, "live": live, "stops": stops,
@@ -2100,9 +2467,14 @@ def main(argv: list[str] | None = None) -> int:
                       f"scan={'complete' if not scanned['partial_sources'] else 'partial'}; "
                       f"live={'enabled' if args.apply else 'off'}")
                 for row in scanned["sources"]:
+                    approval = approvals.get(row["source"], {})
+                    sweep = approval.get("sweep") if isinstance(approval, dict) else {}
+                    sweep = sweep if isinstance(sweep, dict) else {}
                     print(f"  SCAN {row['source']}: {row['status']} · unique={row.get('items', 0)} "
                           f"· groups={row.get('groups', 1)} · passes={row.get('passes', 1)} "
-                          f"· FIT approved={approvals.get(row['source'], {}).get('approved', 0)}")
+                          f"· FIT approved={approval.get('approved', 0)} "
+                          f"· sweep_approved={sweep.get('approved', 0)} "
+                          f"· decisions={sweep.get('counts', {})}")
                 for source, result in live.items():
                     counts = _campaign_apply_summary(result)
                     print(
@@ -2179,6 +2551,149 @@ def main(argv: list[str] | None = None) -> int:
         return 2 if result["status"] == "partial" else 0
     if args.command == "queue":
         try:
+            if args.queue_action == "links":
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                profile = _profile(
+                    selected_config, effective_search(selected_config.load_search()),
+                )
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+
+                store = Store(selected_config.db_path)
+                sources = [args.source] if args.source else default_registry().sources()
+                merged: dict[str, dict[str, Any]] = {}
+                for source_name in sources:
+                    account = resolve_source_account(selected_config, profile, source_name)
+                    for group in store.application_groups(
+                        account, args.track, source=source_name, limit=args.limit,
+                    ):
+                        key = group["group_key"]
+                        if key not in merged:
+                            merged[key] = group
+                        else:
+                            existing = {
+                                item["source"]: item for item in merged[key]["sources"]
+                            }
+                            for item in group["sources"]:
+                                existing[item["source"]] = item
+                            merged[key]["sources"] = list(existing.values())
+                            merged[key]["applied_via"] = (
+                                group["applied_via"] if group["applied_via"] != "none"
+                                else merged[key]["applied_via"]
+                            )
+                            merged[key]["response_state"] = (
+                                group["response_state"] or merged[key]["response_state"]
+                            )
+                groups = list(merged.values())[:max(1, int(args.limit))]
+                if args.json:
+                    print(json.dumps(groups, ensure_ascii=False, indent=2))
+                else:
+                    print(f"queue links: track={args.track}; groups={len(groups)}")
+                    for group in groups:
+                        print(
+                            f"  {group['title'][:80]} — {group['company'][:40]} "
+                            f"· applied_via={group['applied_via']} "
+                            f"· response={group['response_state'] or '—'}"
+                        )
+                        for item in group["sources"]:
+                            note = f" · receipt={item['receipt'][:180]}" if item["receipt"] else ""
+                            print(
+                                f"    {item['source']}:{item['vacancy_id']} "
+                                f"{item['application_state']} ({item['decision']})"
+                                f"{' mirror=' + item['mirror_source'] if item['mirror_source'] else ''}"
+                                f"{note}"
+                            )
+                return 0
+            if args.queue_action == "stats":
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search())
+                profile = _profile(selected_config, search)
+                store = Store(selected_config.db_path)
+                sources = [args.source] if args.source else default_registry().sources()
+                report: dict[str, Any] = {"track": args.track, "sources": {}}
+                for source in sources:
+                    account = resolve_source_account(selected_config, profile, source)
+                    rows = store.list_campaign_vacancies(
+                        account, args.track, "all", 5000, source=source,
+                    )
+                    decisions: dict[str, int] = {}
+                    reviews: dict[str, int] = {}
+                    applications: dict[str, int] = {}
+                    ready = review = 0
+                    for row in rows:
+                        decision = str(row.get("decision") or "UNDECIDED").upper()
+                        decisions[decision] = decisions.get(decision, 0) + 1
+                        state = str(row.get("review_state") or "UNREVIEWED").upper()
+                        reviews[state] = reviews.get(state, 0) + 1
+                        app_state = str(row.get("application_state") or "NOT_STARTED").upper()
+                        applications[app_state] = applications.get(app_state, 0) + 1
+                        if app_state == "READY_TO_APPLY" and decision != "BLOCKED":
+                            ready += 1
+                        if decision == "REVIEW":
+                            review += 1
+                    report["sources"][source] = {
+                        "account": account,
+                        "total": len(rows),
+                        "decisions": decisions,
+                        "review_states": reviews,
+                        "application_states": applications,
+                        "ready": ready,
+                        "review": review,
+                    }
+                if args.json:
+                    print(json.dumps(report, ensure_ascii=False, indent=2))
+                else:
+                    print(f"queue stats: track={args.track}")
+                    for source, values in report["sources"].items():
+                        print(
+                            f"  {source}: total={values['total']} ready={values['ready']} "
+                            f"review={values['review']} decisions={values['decisions']}"
+                        )
+                return 0
+            if args.queue_action == "sweep":
+                from .decision import sweep_track_decisions
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                search = effective_search(selected_config.load_search())
+                profile = _profile(selected_config, search)
+                policy = selected_config.load_policy()
+                store = Store(selected_config.db_path)
+                sources = [args.source] if args.source else default_registry().sources()
+                result: dict[str, Any] = {"track": args.track, "sources": {}, "dry_run": bool(args.dry_run)}
+                for source in sources:
+                    account = resolve_source_account(selected_config, profile, source)
+                    if args.rescore:
+                        from .multisource import refresh_queue
+
+                        refresh_queue(selected_config, args.track, profile, search, source,
+                                      persist=not args.dry_run)
+                    result["sources"][source] = sweep_track_decisions(
+                        store, account, args.track, source,
+                        search=search, profile=profile, policy=policy,
+                        persist=not args.dry_run,
+                    )
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(f"queue sweep: track={args.track}; dry_run={bool(args.dry_run)}")
+                    for source, counts in result["sources"].items():
+                        print(f"  {source}: scanned={counts['scanned']} counts={counts['counts']} "
+                              f"approved={counts['approved']} review={len(counts['review_ids'])}")
+                return 0
             if args.queue_action == "list":
                 from .multisource import resolve_source_account
                 from .providers import default_registry
@@ -2215,8 +2730,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"queue: {args.view}; track={track or 'all'}; items={len(rows)}")
                 for index, item in enumerate(rows, 1):
                     print(f"{index:>3}. {item.get('id')} · {item.get('review_state')} · "
-                          f"{item.get('application_state')} · score={item.get('score')} · "
+                          f"{item.get('application_state')} · "
+                          f"decision={item.get('decision') or 'UNDECIDED'} · "
+                          f"score={item.get('score')} · "
                           f"{item.get('name','')} — {item.get('company','')}")
+                    if item.get("decision_reason"):
+                        print(f"     decision: {item['decision_reason'][:260]}")
                     print(f"     обнаружена: {item.get('discovery_status')} · "
                           f"фильтр: {item.get('filter_status')} · причины: "
                           f"{', '.join(item.get('reasons') or [])[:220]}")
@@ -2301,8 +2820,12 @@ def main(argv: list[str] | None = None) -> int:
                     for row in plan["blocked"]:
                         print(f"  BLOCKED {row['id']} · {row['reason']}")
                     if args.run:
-                        print("real submit is disabled for this source: needs_live_validation",
-                              file=sys.stderr)
+                        print(
+                            "queue apply is HH-specific; use "
+                            f"`sources dispatch-apply --track {args.track} --source {args.source} "
+                            "--allow-live --enable-habr` (or the matching source driver)",
+                            file=sys.stderr,
+                        )
                         return 2
                     return 0
                 from .campaigns import write_approved_input
@@ -3027,11 +3550,13 @@ def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
                account: str, input_path: Path, requested_limit: int,
                target_success: int | None = None,
-               headless_override: bool | None = None) -> int:
+               headless_override: bool | None = None,
+               search_override: dict[str, Any] | None = None) -> int:
     """Выполняет явно запрошенные браузерные отклики с аудируемыми условиями остановки."""
     try:
-        profile = _profile(config, effective_search(config.load_search(), None))
-        letter_enabled = letter_mode(profile) != "off"
+        profile = _profile(config, search_override or effective_search(config.load_search(), None))
+        letter_mode_value = letter_mode(profile)
+        letter_enabled = letter_mode_value != "off"
     except ConfigError as exc:
         print(f"invalid search configuration: {exc}", file=sys.stderr)
         return 2
@@ -3058,9 +3583,9 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         return 2
     limits = profile.get("limits", {})
     per_run = int(limits.get("per_run", 100))
-    per_day = int(limits.get("per_day", 300))
-    if per_run < 1 or per_day < 1:
-        print("profile limits must be positive", file=sys.stderr)
+    per_day = int(limits.get("per_day", 0))
+    if per_run < 1 or per_day < 0:
+        print("profile limits require per_run > 0 and per_day >= 0", file=sys.stderr)
         return 2
     timing = profile.get("apply", {}) or {}
     visibility_resume_id = str(timing.get("visibility_resume_id") or "").strip()
@@ -3092,6 +3617,8 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
     stop_reason = ""
     exit_code = 0
     confirmed_successes = 0
+    unknown_ids: list[str] = []
+    letter_failures = 0
     manual_questions: list[dict[str, str]] = []
     with store.run_lock():
         store.recover_interrupted_runs(account)
@@ -3129,15 +3656,19 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     continue
                 approved_letter = str(item.get("approved_cover_letter") or "").strip()
                 campaign_queue_item = bool(item.get("track"))
+                template_letter_available = (
+                    campaign_queue_item and letter_mode_value == "template" and not approved_letter
+                )
                 requires_letter = any(item.get(key) for key in (
                     "cover_letter_required", "requires_cover_letter", "letter_required",
                 ))
-                if campaign_queue_item and requires_letter and not approved_letter:
+                if campaign_queue_item and requires_letter and not approved_letter and not template_letter_available:
                     note = "required cover letter needs an owner-approved saved draft"
                     store.record(item, "needs_manual", note, run_id, account)
                     print(f"{item.get('id')}: needs_manual — {note}")
                     continue
-                item_letter_enabled = (bool(approved_letter) if campaign_queue_item
+                item_letter_enabled = (bool(approved_letter) or template_letter_available
+                                       if campaign_queue_item
                                        else letter_enabled or bool(approved_letter))
                 preflight_error = _submission_preflight(item, item_letter_enabled)
                 if preflight_error:
@@ -3156,13 +3687,15 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                 cover_letter = approved_letter
                 if approved_letter:
                     item["cover_letter_source"] = "owner_approved"
-                elif letter_enabled and not campaign_queue_item:
+                elif template_letter_available or (letter_enabled and not campaign_queue_item):
                     try:
                         cover_letter, source = _prepare_cover_letter(config, item, profile)
-                    except (Exception, KeyboardInterrupt):
+                    except (Exception, KeyboardInterrupt):  # noqa: BLE001 - isolate one letter
+                        letter_failures += 1
                         store.record(item, "failed_before_submit", "cover letter generation failed",
                                      run_id, account)
-                        raise
+                        print(f"{item.get('id')}: failed_before_submit — cover letter generation failed")
+                        continue
                     item["cover_letter_source"] = source
                     if source in {"generated", "cache"}:
                         item["llm_source"] = source
@@ -3177,6 +3710,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     manual_captcha_timeout=manual_captcha_timeout,
                     interactive=interactive_captcha,
                     screening_answers=profile.get("answers", {}),
+                    screening_facts=profile.get("facts", {}),
                 )
                 if (result.status == "needs_manual"
                         and result.note.startswith("unanswered screening questions:")):
@@ -3207,10 +3741,19 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         confirmed_successes += 1
                     else:
                         print(f"{vacancy_id}: unknown — {result.note}")
-                        run_status = "stopped_unknown"
-                        stop_reason = f"unknown result for vacancy {vacancy_id}"
+                        unknown_ids.append(vacancy_id)
+                        # A CAPTCHA can invalidate the whole browser session, so
+                        # stop the source until it is solved.  An ambiguous
+                        # submit without CAPTCHA is quarantined per vacancy and
+                        # the rest of the independent batch continues.
+                        if "CAPTCHA" in result.note.upper() or "КАПЧ" in result.note.upper():
+                            run_status = "stopped_captcha"
+                            stop_reason = f"CAPTCHA while submitting vacancy {vacancy_id}"
+                            exit_code = 5
+                            break
+                        run_status = "completed_with_unknown"
+                        stop_reason = f"unknown result for vacancy {vacancy_id}; quarantined"
                         exit_code = 3
-                        break
                 else:
                     store.record(item, result.status, result.note, run_id, account)
                     print(f"{item.get('id')}: {result.status} — {result.note}")
@@ -3285,6 +3828,16 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         playwright.stop()
                     except Exception:
                         LOGGER.debug("Could not stop Playwright", exc_info=True)
+            if letter_failures and run_status == "completed":
+                run_status = "completed_with_failures"
+                stop_reason = f"{letter_failures} cover-letter generation failure(s); batch continued"
+                exit_code = 3
+            if unknown_ids and run_status in {"completed", "completed_with_failures"}:
+                run_status = "completed_with_unknown"
+                stop_reason = (
+                    f"{len(unknown_ids)} ambiguous submit(s) quarantined; batch continued"
+                )
+                exit_code = 3
             if target_success is not None and run_status == "completed":
                 run_status = "completed_shortfall"
                 stop_reason = (
@@ -3297,6 +3850,8 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         print("manual screening questions (saved with each attempt):")
         for task in manual_questions:
             print(f"  {task['id']} · {task['url']} · {task['questions']}")
+    if unknown_ids:
+        print("quarantined ambiguous submits (not retried): " + ", ".join(unknown_ids))
     _print_run_summary(store, run_id)
     return exit_code
 

@@ -351,7 +351,7 @@ def execute_getmatch_pilot(
     allow_live: bool = False,
     run_id: str | None = None,
     per_run: int = 100,
-    per_day: int = 300,
+    per_day: int = 0,
     transport: Callable[..., dict[str, Any]] = click_and_confirm,
 ) -> dict[str, Any]:
     """Reserve, submit one approved Getmatch callback, verify, then quarantine."""
@@ -444,8 +444,11 @@ class GetmatchCallbackDriver:
         self._plans: dict[str, dict[str, Any]] = {}
         self._last_started: float | None = None
         self._paused_after_unknown = False
+        self._quarantined_ids: set[str] = set()
 
     def preflight(self, row: dict[str, Any]) -> ApplyOutcome:
+        if str(row.get("id") or "") in self._quarantined_ids:
+            return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         vacancy_id = str(row.get("id") or "")
         if self._paused_after_unknown:
             return ApplyOutcome(
@@ -476,6 +479,8 @@ class GetmatchCallbackDriver:
         return ApplyOutcome("ready")
 
     def apply(self, row: dict[str, Any]) -> ApplyOutcome:
+        if str(row.get("id") or "") in self._quarantined_ids:
+            return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         vacancy_id = str(row.get("id") or "")
         if self._paused_after_unknown:
             return ApplyOutcome(
@@ -515,7 +520,10 @@ class GetmatchCallbackDriver:
         if status not in {"success", "already_applied", "failed_before_submit", "needs_manual"}:
             status = "unknown"
         if status == "unknown":
-            self._paused_after_unknown = True
+            self._quarantined_ids.add(vacancy_id)
+            self._paused_after_unknown = ApplyOutcome(
+                status, str(outcome.get("reason") or ""),
+            ).blocks_source
         return ApplyOutcome(
             status,
             str(outcome.get("reason") or "no verified official Getmatch receipt")[:240],

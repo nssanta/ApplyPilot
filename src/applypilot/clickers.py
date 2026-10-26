@@ -56,16 +56,28 @@ CLICKERS: dict[str, ClickerSpec] = {
     "geekjob.ru": ClickerSpec(
         source="geekjob.ru", label="GeekJob",
         login_url="https://geekjob.ru/signin/geek",
+        submit_verified=True, apply_status="verified_native_form",
         selectors=('form #mycvlist', 'form #respond-text', 'form button[type="submit"]'),
-        notes=("Authorized native GeekJob response form inspected live: one stored CV, "
-               "mandatory vacancy-specific cover letter and submit button. "
-               "Form inspector and mock-browser click/receipt tests passed; real "
-               "submit/receipt unverified, no bulk sends enabled."),
+        notes=("Verified live native form: exact resume, vacancy-specific cover letter, "
+               "POST /json/respond/vacancy 200 and the exact vacancy in /responses. "
+               "Requires an authenticated account, APPROVED row and explicit live opt-in; "
+               "extra fields and external ATS remain manual."),
     ),
     "yandex.ru/jobs": ClickerSpec(
         source="yandex.ru/jobs", label="Yandex Jobs",
         login_url="https://yandex.ru/jobs/",
-        notes="Authorized form DOM not captured yet; no selector or submit is claimed.",
+        submit_verified=True, apply_status="verified_native_survey",
+        selectors=(
+            "button:has-text('Откликнуться')",
+            "iframe[src*='forms.yandex.ru']",
+            "textarea[name='cover_letter']",
+            "input[name='agree_considiration']",
+            "button[type='submit']",
+        ),
+        notes=("Official forms.yandex.ru survey verified live: success page, "
+               "postSurvey 200 and 'Вы откликнулись' vacancy state. Requires an "
+               "authenticated Yandex profile, APPROVED row and explicit live opt-in; "
+               "unknown survey fields stop the vacancy."),
     ),
     "getmatch.ru": ClickerSpec(
         source="getmatch.ru", label="Getmatch / Telegram",

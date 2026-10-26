@@ -366,8 +366,8 @@ class GeekJobProvider:
         inspect=True,
         login=True,
         check=True,
-        apply=False,
-        apply_status="needs_live_validation",
+        apply=True,
+        apply_status="verified_native_form",
     )
 
     def __init__(self) -> None:

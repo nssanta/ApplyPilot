@@ -1501,7 +1501,7 @@ class AdminApp:
             '# Укажи точное название резюме на HH; реальные отклики выключены до reviewed=true.\n'
             'name = ""\nlocation = ""\nenglish_level = ""\n'
             'reviewed = false\n\n'
-            '[limits]\nper_run = 100\nper_day = 300\n\n'
+            '[limits]\nper_run = 100\nper_day = 0\n\n'
             '[apply]\ndelay_min_seconds = 20\ndelay_max_seconds = 45\n'
             'long_pause_every = 8\nlong_pause_min_seconds = 60\nlong_pause_max_seconds = 150\n\n'
             '[screen]\nmodel = "gpt-5-mini"\n'
@@ -2602,7 +2602,7 @@ async function loadCampaignQueue(){
     const checks=[...(r.filter_reasons||[]),...(r.problems||[])].join(", ");
     const salary=r.salary?`${rub(r.salary.from)}–${rub(r.salary.to)} ${esc(r.salary.currency||"")}`:"не опубликована";
     const choice=`<select id="cdecision-${i}"><option>FIT</option><option>MAYBE</option><option>SKIP</option><option>APPROVED</option><option>DEFERRED</option></select>`;
-    h+=`<tr><td>${i+1}</td><td><b>${esc(r.review_state||"UNREVIEWED")}</b><div class="muted">${esc(r.discovery_status||"")}</div></td>
+    h+=`<tr><td>${i+1}</td><td><b>${esc(r.review_state||"UNREVIEWED")}</b><div class="muted">${esc(r.discovery_status||"")}</div><div class="badge">decision: ${esc(r.decision||"UNDECIDED")}</div></td>
       <td>${safeInt(r.score)}<div class="muted">${esc(r.score_decision||"unknown")}</div></td>
       <td>${title}<div class="muted">${esc(r.company||"")} · ${salary}</div><div class="muted">${esc(r.area||"")} · ${esc(r.experience||"")}</div><span class="badge">${esc(r.source||"hh.ru")}</span></td>
       <td class="reason"><div>${esc(reasons||"нет явных сигналов")}</div><div class="hl">${esc(checks)}</div>

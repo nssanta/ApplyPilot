@@ -276,8 +276,11 @@ class HabrPageDriver:
         self.min_interval_seconds = float(min_interval_seconds)
         self._last_apply_started: float | None = None
         self._paused_after_unknown = False
+        self._quarantined_ids: set[str] = set()
 
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if str(row.get("id") or "") in self._quarantined_ids:
+            return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         if self._paused_after_unknown:
             return ApplyOutcome(
                 "needs_manual",
@@ -317,6 +320,8 @@ class HabrPageDriver:
         return ApplyOutcome("ready")
 
     def apply(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if str(row.get("id") or "") in self._quarantined_ids:
+            return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         if self._paused_after_unknown:
             return ApplyOutcome("needs_manual", "Habr run is paused after UNKNOWN")
         if self._last_apply_started is not None:
@@ -332,7 +337,8 @@ class HabrPageDriver:
                 timeout_ms=self.timeout_ms,
             )
             if outcome.status == "unknown":
-                self._paused_after_unknown = True
+                self._quarantined_ids.add(str(row.get("id") or ""))
+                self._paused_after_unknown = outcome.blocks_source
             return outcome
         except Exception:
             self._paused_after_unknown = True

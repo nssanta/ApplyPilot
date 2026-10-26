@@ -184,8 +184,24 @@ def screening_answer_for(question: str, answers: dict | None) -> str:
     return str(answers.get(key) or "").strip()
 
 
-def _fill_known_screening_answers(root, answers: dict | None) -> tuple[bool, list[str]]:
-    """Fill simple text questions from private facts; leave unknown fields for review."""
+def _fill_known_screening_answers(root, answers: dict | None,
+                                  facts: dict | None = None) -> tuple[bool, list[str]]:
+    """Fill fields from private facts; leave unknown fields for review.
+
+    When structured facts are configured, the generic form engine handles
+    text, textarea, number, select, radio and checkbox controls.  The legacy
+    text-only path remains as a compatibility fallback for callers that have
+    no facts block.
+    """
+    if facts is not None:
+        try:
+            from .forms import fill_screening_form
+
+            result = fill_screening_form(root, answers or {}, facts or {})
+            if result.fields:
+                return result.resolved, list(result.unresolved)
+        except Exception:
+            LOGGER.debug("Structured screening form failed; trying text fallback", exc_info=True)
     try:
         tasks = root.locator("[data-qa='task-body']")
         count = tasks.count()
@@ -294,7 +310,8 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
               visibility_verified: bool = False,
               manual_captcha_timeout: float = 0.0,
               interactive: bool = False,
-              screening_answers: dict | None = None) -> ApplyResult:
+              screening_answers: dict | None = None,
+              screening_facts: dict | None = None) -> ApplyResult:
     item["cover_letter_submitted"] = False
     if not allowed_hh_url(str(item.get("url", ""))):
         return ApplyResult("needs_manual", "URL is not an allowed HH hostname")
@@ -391,7 +408,9 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         screening_resolved = False
         if dialog is None and not submit.is_visible(timeout=2000):
             if has_screening_form(page):
-                screening_resolved, unresolved = _fill_known_screening_answers(page, screening_answers)
+                screening_resolved, unresolved = _fill_known_screening_answers(
+                    page, screening_answers, screening_facts,
+                )
                 if not screening_resolved:
                     return ApplyResult(
                         "needs_manual", _screening_manual_note(unresolved, screening_answers),
@@ -422,7 +441,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("needs_manual", resume_error)
         if has_screening_form(response_root):
             screening_resolved, unresolved = _fill_known_screening_answers(
-                response_root, screening_answers,
+                response_root, screening_answers, screening_facts,
             )
             if not screening_resolved:
                 return ApplyResult(
@@ -441,7 +460,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 page.wait_for_timeout(random.randint(500, 1200))
         if has_screening_form(response_root) and not screening_resolved:
             screening_resolved, unresolved = _fill_known_screening_answers(
-                response_root, screening_answers,
+                response_root, screening_answers, screening_facts,
             )
             if not screening_resolved:
                 return ApplyResult(

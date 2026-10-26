@@ -311,7 +311,7 @@ def test_habr_driver_paces_two_confirmed_jobs(monkeypatch) -> None:
     assert round(calls[0], 2) == 1.3
 
 
-def test_habr_multi_job_dispatch_pauses_after_unknown(tmp_path, monkeypatch) -> None:
+def test_habr_multi_job_dispatch_quarantines_unknown_and_continues(tmp_path, monkeypatch) -> None:
     from applypilot.dispatch import ApplyOutcome, dispatch_apply
     from applypilot.storage import Store
 
@@ -359,18 +359,16 @@ def test_habr_multi_job_dispatch_pauses_after_unknown(tmp_path, monkeypatch) -> 
         accounts={"career.habr.com": "habr-primary"}, run_id="multi-batch",
     )
     assert result["summary"] == {
-        "success": 1, "unknown": 1, "needs_manual": 1,
+        "success": 1, "unknown": 2,
     }
-    # All three candidates were checked read-only before the first submit;
-    # only two pages were then opened for actual application attempts.
-    assert len(pages) == 5
+    # All candidates receive read-only preflight and an independent attempt.
+    assert len(pages) == 6
     assert all(page.routes for page in pages[:3])
     assert all(page.closed for page in pages)
     attempts = {item["vacancy_id"]: item["status"] for item in store.source_attempts(
         "habr-primary", "career.habr.com",
     )}
-    assert attempts == {ids[0]: "success", ids[1]: "unknown"}
-    assert ids[2] not in attempts
+    assert attempts == {ids[0]: "success", ids[1]: "unknown", ids[2]: "unknown"}
 
 
 def test_remote_signal_must_be_in_target_header_not_recommended_jobs() -> None:

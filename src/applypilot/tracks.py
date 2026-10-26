@@ -55,6 +55,7 @@ def _normalise_track(entry: dict[str, Any], *, strict_key: bool = False) -> dict
         "key": key,
         "label": str(entry.get("label") or key).strip() or key,
         "type": rubric,
+        "enabled": bool(entry.get("enabled", True)),
         "profile": _private_path(
             entry.get("profile"), f"private/config/profile-{key}.toml", "profile"
         ),
@@ -139,6 +140,7 @@ def _write_tracks_config(path: Path, entries: list[dict[str, Any]]) -> None:
             "key",
             "label",
             "type",
+            "enabled",
             "profile",
             "search",
             "resume",

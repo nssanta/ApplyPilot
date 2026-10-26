@@ -212,4 +212,6 @@ def test_ai_devops_plus_development_is_not_false_negative():
          "description": "Администрировать Kubernetes кластеры и CI/CD"},
         profile,
     )
-    assert pure_ops.decision == "reject"
+    # A mixed title without LLM duties is reviewable, not an automatic apply
+    # or a definitive rejection based on the word DevOps alone.
+    assert pure_ops.decision == "unknown"

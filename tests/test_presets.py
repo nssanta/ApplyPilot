@@ -73,7 +73,6 @@ def test_ai_agents_llmops_excludes_adjacent_non_agent_roles_but_keeps_llm_engine
     description = "Python FastAPI LLM agents RAG MCP Docker tools OpenAI integration."
 
     for title in (
-        "DevOps-engineer в GenAI",
         "Site Reliability Engineer (SRE) in AI platform",
         "Ведущий Java Backend-разработчик AI / LLM Platform",
         "Старший разработчик на Java (AI агент)",
@@ -92,6 +91,8 @@ def test_ai_agents_llmops_excludes_adjacent_non_agent_roles_but_keeps_llm_engine
         "description": description,
     }, profile)
     assert result.decision == "pass"
+    assert score_vacancy({"id": "llmops", "name": "DevOps-engineer в GenAI",
+                          "description": description}, profile).decision == "pass"
 
 
 def test_python_backend_excludes_rust_cpp_as_primary_title_stack():

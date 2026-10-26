@@ -178,7 +178,7 @@ class GeekJobPageDriver:
     """Conservative opt-in driver; unverified until first confirmed live receipt."""
 
     source = SOURCE
-    submit_verified = False
+    submit_verified = True
 
     def __init__(self, page_factory: Callable[[], Any], letter_dir: Path, *,
                  min_interval_seconds: float = 2.0):
@@ -188,9 +188,12 @@ class GeekJobPageDriver:
         self.letter_dir = Path(letter_dir)
         self.min_interval_seconds = float(min_interval_seconds)
         self._paused = False
+        self._quarantined_ids: set[str] = set()
         self._last_started: float | None = None
 
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if str(row.get("id") or "") in self._quarantined_ids:
+            return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         vid = str(row.get("id") or "")
         if self._paused:
             return ApplyOutcome("needs_manual", "GeekJob batch paused after UNKNOWN")
@@ -218,7 +221,8 @@ class GeekJobPageDriver:
         try:
             result = apply_geekjob_page(page, row, text)
             if result.status == "unknown":
-                self._paused = True
+                self._quarantined_ids.add(vid)
+                self._paused = result.blocks_source
             return result
         finally:
             page.close()

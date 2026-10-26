@@ -359,7 +359,9 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             item["score"] = candidate.score
             item["resume"] = track_resume or candidate.resume
             group = group_search.get(str(item.get("search_group") or "default"), search)
-            item["auto_apply_eligible"] = auto_apply_title_eligible(item, group)
+            professional = profile.get("professional")
+            skills = professional.get("skills", []) if isinstance(professional, dict) else []
+            item["auto_apply_eligible"] = auto_apply_title_eligible(item, group, skills)
             if not item["auto_apply_eligible"]:
                 item["auto_apply_reason"] = "title_requires_manual_role_review"
             filter_result = evaluate_search_filter(item, group)
@@ -452,6 +454,16 @@ def write_approved_input(config: AppConfig, track: str, account: str,
     """Создаёт приватный apply snapshot только из одобренных и ещё не отправленных строк."""
     rows = Store(config.db_path).approved_campaign_items(account, track, limit)
     rows = [row for row in rows if not needs_manual_reapproval(row)]
+    deduped: list[dict[str, Any]] = []
+    seen_groups: set[str] = set()
+    for row in rows:
+        group_key = str(row.get("job_group_key") or "")
+        if group_key and group_key in seen_groups:
+            continue
+        if group_key:
+            seen_groups.add(group_key)
+        deduped.append(row)
+    rows = deduped
     if vacancy_ids is not None:
         rows = [row for row in rows if str(row.get("id") or "") in vacancy_ids]
     if not rows:

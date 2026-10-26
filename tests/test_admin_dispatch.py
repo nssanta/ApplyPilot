@@ -77,9 +77,10 @@ def test_admin_clickers_show_habr_and_getmatch_as_verified(tmp_path: Path) -> No
     assert specs["career.habr.com"]["apply_status"] == "verified_native_one_click"
     assert specs["getmatch.ru"]["submit_verified"] is True
     assert specs["getmatch.ru"]["apply_status"] == "verified_telegram_callback"
-    for source in ("geekjob.ru", "yandex.ru/jobs"):
-        assert specs[source]["submit_verified"] is False
-        assert specs[source]["apply_status"] == "needs_live_validation"
+    assert specs["geekjob.ru"]["submit_verified"] is True
+    assert specs["geekjob.ru"]["apply_status"] == "verified_native_form"
+    assert specs["yandex.ru/jobs"]["submit_verified"] is True
+    assert specs["yandex.ru/jobs"]["apply_status"] == "verified_native_survey"
 
 
 def test_admin_dispatch_rejects_unknown_track(tmp_path: Path) -> None:
