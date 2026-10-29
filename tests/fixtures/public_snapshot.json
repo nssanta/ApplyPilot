@@ -7,7 +7,7 @@
       "company": {"visibleName": "Example Labs"},
       "compensation": {"from": 100000, "currencyCode": "RUR"},
       "workExperience": "between1And3",
-      "area": {"name": "Красноярск"},
+      "area": {"name": "Example City"},
       "@workSchedule": "remote",
       "workFormats": [{"workFormatsElement": ["remote"]}],
       "snippet": {"requirement": "Python and LLM", "responsibility": "Build agents"},

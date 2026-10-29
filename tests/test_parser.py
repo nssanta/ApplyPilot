@@ -26,7 +26,7 @@ def test_normalizes_hh_lux_vacancy_fields():
         "company": {"visibleName": "Acme"},
         "compensation": {"from": 100000, "to": 200000, "currencyCode": "RUR"},
         "workExperience": "between1And3",
-        "area": {"name": "Красноярск"},
+        "area": {"name": "Example City"},
         "@workSchedule": "remote",
         "workFormats": [{"workFormatsElement": ["remote"]}],
         "snippet": {"requirement": "Python", "responsibility": "agents"},

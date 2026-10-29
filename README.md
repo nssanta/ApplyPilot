@@ -54,7 +54,7 @@ cp examples/sources.toml private/config/sources.toml
 
 # Ad-hoc поиск и целевое число подтверждённых откликов
 .venv/bin/python -m applypilot go --track default \
-  --query "AI агент" --salary-from 100000 --sources all --target 10 --target-scope total --headless
+  --query "Example Role" --salary-from 100000 --sources all --target 10 --target-scope total --headless
 
 # Одна логическая вакансия: HH, DreamJob-зеркало, отклик и ответ
 .venv/bin/python -m applypilot queue links --track default --source dreamjob.ru
@@ -180,6 +180,7 @@ cp examples/sources.toml private/config/sources.toml
 .venv/bin/python -m pytest -q
 .venv/bin/python -m ruff check src tests scripts
 .venv/bin/python scripts/check_public.py
+.venv/bin/python scripts/check_public.py --audit-history-privacy
 .venv/bin/python scripts/offline_multisource_smoke.py
 git diff --check
 ~~~

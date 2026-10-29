@@ -116,7 +116,7 @@ cp examples/sources.toml private/config/sources.toml
 
 # ad-hoc запрос, зарплата и желаемое число подтверждённых откликов
 .venv/bin/python -m applypilot go --track default \
-  --query "AI агент" --salary-from 120000 --sources all --target 50 --target-scope total --headless
+  --query "Example Role" --salary-from 100000 --sources all --target 10 --target-scope total --headless
 
 # один цикл вместо until-exhausted
 .venv/bin/python -m applypilot go --track default --headless --once
@@ -171,6 +171,7 @@ HH использует пределы `[limits]`; остальные источ
 .venv/bin/python -m pytest -q
 .venv/bin/python -m ruff check src tests scripts
 .venv/bin/python scripts/check_public.py
+.venv/bin/python scripts/check_public.py --audit-history-privacy
 .venv/bin/python scripts/offline_multisource_smoke.py
 git diff --check
 ```

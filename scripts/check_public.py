@@ -15,6 +15,11 @@ SECRET_PATTERNS = (
     # fine-grained PATs use the separate github_pat_ prefix.
     re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
+    re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"),
+    re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
 )
 PRIVATE_CONTEXT_PATTERNS = (
     re.compile(r"/home/(?!user(?:/|\b)|example(?:/|\b))[^\s/]+/"),
@@ -38,9 +43,12 @@ def content_has_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
 
+def text_has_private_context(text: str) -> bool:
+    return any(pattern.search(text) for pattern in PRIVATE_CONTEXT_PATTERNS)
+
+
 def content_has_private_context(name: str, text: str) -> bool:
-    return (Path(name).suffix in PUBLIC_TEXT_SUFFIXES
-            and any(pattern.search(text) for pattern in PRIVATE_CONTEXT_PATTERNS))
+    return Path(name).suffix in PUBLIC_TEXT_SUFFIXES and text_has_private_context(text)
 
 
 def check_history(repo: str, *, private_context: bool = False) -> list[str]:
@@ -51,6 +59,14 @@ def check_history(repo: str, *, private_context: bool = False) -> list[str]:
                               "--branches", "--remotes", "--tags"],
                              check=True, text=True, capture_output=True).stdout.splitlines()
     errors: list[str] = []
+    if private_context:
+        for commit in commits:
+            message = subprocess.run(
+                ["git", "-c", f"safe.directory={repo}", "show", "-s", "--format=%B", commit],
+                check=True, text=True, capture_output=True,
+            ).stdout
+            if text_has_private_context(message) or content_has_secret(message):
+                errors.append(f"{commit[:12]}:commit-message")
     for commit in commits:
         paths = subprocess.run(["git", "-c", f"safe.directory={repo}", "ls-tree", "-r", "--name-only", commit],
                                check=True, text=True, capture_output=True).stdout.splitlines()
