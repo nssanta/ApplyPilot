@@ -133,6 +133,8 @@ def dispatch_plan(
     accounts: Mapping[str, str] | None = None,
     registry: ProviderRegistry | None = None,
     verified_sources: Iterable[str] | None = None,
+    scan_id: str | None = None,
+    vacancy_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Aggregates per-source dry-run plans without reserving or writing."""
     registry = registry or default_registry()
@@ -146,7 +148,8 @@ def dispatch_plan(
         source_account = str(account_for.get(source, account))
         plan = queue_plan(
             store, source_account, track, source, limit, registry=registry,
-            verified_driver=source in verified,
+            verified_driver=source in verified, scan_id=scan_id,
+            vacancy_ids=vacancy_ids,
         )
         plan["account"] = source_account
         plans[source] = plan
@@ -207,6 +210,8 @@ def dispatch_apply(
     registry: ProviderRegistry | None = None,
     run_id: str | None = None,
     unknown_before_pause: int = 0,
+    scan_id: str | None = None,
+    vacancy_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Executes a plan; dry-run unless ``allow_live`` and a driver are present.
 
@@ -221,7 +226,7 @@ def dispatch_apply(
     )
     plan = dispatch_plan(
         store, account, track, sources, limit, accounts=accounts, registry=registry,
-        verified_sources=verified_sources,
+        verified_sources=verified_sources, scan_id=scan_id, vacancy_ids=vacancy_ids,
     )
     if not allow_live:
         return {**plan, "executed": 0, "results": [], "summary": {"dry_run": plan["planned_count"]}}
@@ -268,10 +273,30 @@ def dispatch_apply(
                 "captcha", "auth_lost", "platform_block",
             }:
                 preflight_paused.add(source)
+            reason = preflight.note or preflight.evidence or "preflight blocked"
+            persistent_blocker = any(marker in reason.casefold() for marker in (
+                "external_ats", "external ats", "внешн",
+                "unsupported form", "form field requires",
+            ))
+            if (preflight.status == "needs_manual" and source != "hh.ru"
+                    and persistent_blocker):
+                # A durable preflight blocker (for example an external ATS or
+                # an unsupported owner-only form) must leave the approved
+                # queue instead of being retried on every apply invocation.
+                # A missing login/session is a source-level issue and must not
+                # silently mark every individual vacancy as manually handled.
+                try:
+                    store.record_source_application(
+                        str(row.get("account") or account), source,
+                        str(row.get("id") or ""), track,
+                        str(row.get("channel_key") or f"{source}:{row.get('id') or ''}"),
+                        "needs_manual", note=reason, run_id=run_id,
+                    )
+                except (ValueError, OSError):
+                    pass
             preflight_results[index] = {
                 **row, "action": "skipped", "status": preflight.status,
-                "reason": preflight.note or preflight.evidence or "preflight blocked",
-                "note": preflight.note or preflight.evidence or "preflight blocked",
+                "reason": reason, "note": reason,
             }
             continue
         ready_rows.append((index, row, driver, preflight))

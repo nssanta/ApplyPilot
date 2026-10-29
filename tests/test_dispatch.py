@@ -219,6 +219,35 @@ def test_dispatch_processes_full_hundred_candidate_pool(tmp_path: Path, monkeypa
     assert len(store.source_attempts("default", "getmatch.ru", 100)) == 100
 
 
+def test_preflight_needs_manual_is_persisted_and_leaves_the_queue(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    store = Store(tmp_path / "jobs.sqlite3")
+    import applypilot.dispatch as dispatch_module
+
+    monkeypatch.setattr(
+        dispatch_module, "queue_plan",
+        lambda *args, **kwargs: _fake_plan(store, "career.habr.com", "7001"),
+    )
+
+    class ExternalAtsDriver(FakeDriver):
+        def preflight(self, row):
+            self.preflights += 1
+            return ApplyOutcome("needs_manual", "Habr source preflight: external_ats")
+
+    driver = ExternalAtsDriver()
+    result = dispatch_apply(
+        store, "default", "ai_core", ["career.habr.com"], 10,
+        allow_live=True, drivers={"career.habr.com": driver}, run_id="run-external",
+    )
+    assert result["summary"] == {"needs_manual": 1}
+    assert driver.applies == 0
+    attempts = store.source_attempts("default", "career.habr.com")
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "needs_manual"
+    assert "external_ats" in attempts[0]["note"]
+
+
 def test_dispatch_apply_exception_becomes_unknown_and_never_retries(tmp_path: Path, monkeypatch) -> None:
     _config_obj, store = _seed(tmp_path)
     import applypilot.dispatch as dispatch_module

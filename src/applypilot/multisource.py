@@ -797,6 +797,7 @@ def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], s
                     pass
             passes: list[dict[str, Any]] = []
             hh_cursor_complete = False
+            hh_covered_queries: set[str] = set()
             pass_limit = max_passes if drain and source in {
                 "hh.ru", "getmatch.ru", "career.habr.com", "geekjob.ru",
             } else 1
@@ -819,8 +820,12 @@ def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], s
                     from .sources import HhSearchAdapter
 
                     for segment in result.get("segments_detail", []):
+                        query_name = str(segment.get("query") or "").strip()
+                        if (query_name and int(segment.get("pages") or 0) > 0
+                                and int(segment.get("requests") or 0) > 0):
+                            hh_covered_queries.add(query_name)
                         key = HhSearchAdapter.page_key(
-                            str(segment.get("query") or ""), int(segment.get("area") or 0),
+                            query_name, int(segment.get("area") or 0),
                             str(segment.get("order_by") or "relevance"),
                         )
                         current = hh_page_cursor.get(key, 0)
@@ -914,17 +919,33 @@ def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], s
                 "summary": totals, "errors": pass_errors,
             })
             if source == "hh.ru":
-                query_count = len({
+                group_queries = [
                     str(value).strip() for value in group_search.get("queries", [])
                     if str(value).strip()
-                })
+                ]
+                query_count = len(group_queries)
                 group_result["query_count"] = query_count
+                remaining_pages: list[dict[str, Any]] = []
                 if drain:
                     all_segments = [
                         segment for pass_result in passes
                         for segment in pass_result.get("segments_detail", [])
                     ]
                     group_result["segments_detail"] = all_segments
+                    from .sources import HhSearchAdapter
+
+                    for key, page in hh_page_cursor.items():
+                        if page is None:
+                            continue
+                        try:
+                            query_name, area_value, order_value = json.loads(key)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        remaining_pages.append({
+                            "query": str(query_name), "area": int(area_value),
+                            "order_by": str(order_value), "page": int(page),
+                        })
+                    group_result["remaining_pages"] = remaining_pages[:300]
                 if hh_cursor_complete:
                     # The legacy HH runner reports coverage within one bounded
                     # pass. The final pass may contain only the last unfinished
@@ -953,7 +974,10 @@ def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], s
                         "errors": residual_errors,
                     })
                 else:
-                    group_result["uncovered_queries"] = list(final.get("uncovered_queries") or [])
+                    group_result["covered_query_count"] = len(hh_covered_queries)
+                    group_result["uncovered_queries"] = sorted(
+                        set(group_queries) - hh_covered_queries
+                    )
             source_groups.append(group_result)
 
         candidate_ids = list(dict.fromkeys(
@@ -983,6 +1007,9 @@ def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], s
             and all(row.get("coverage_complete") is True for row in source_groups),
             "segments_detail": [
                 segment for row in source_groups for segment in row.get("segments_detail", [])
+            ] if source == "hh.ru" and drain else [],
+            "remaining_pages": [
+                page for row in source_groups for page in row.get("remaining_pages", [])
             ] if source == "hh.ru" and drain else [],
             "uncovered_queries": list(dict.fromkeys(
                 str(value) for row in source_groups for value in row.get("uncovered_queries", [])
@@ -1173,25 +1200,37 @@ def approve_scanned_fits(
 
 def queue_plan(store: Store, account: str, track: str, source: str, limit: int = 100,
                registry: ProviderRegistry | None = None,
-               *, verified_driver: bool = False) -> dict[str, Any]:
+               *, verified_driver: bool = False, scan_id: str | None = None,
+               vacancy_ids: Iterable[str] | None = None) -> dict[str, Any]:
     """Builds a dry-run plan; it never reserves, writes an event or clicks submit."""
     registry = registry or default_registry()
+    wanted = ({str(value).strip() for value in vacancy_ids if str(value).strip()}
+              if vacancy_ids is not None else None)
     # A source plan is read-only and must include every human-approved row,
     # including native forms that have no HH cover-letter workflow state yet.
     # Fetch beyond the requested batch size before filtering. Otherwise an
     # already-applied high-score row can consume the 100-row window and hide a
     # lower-score READY_TO_APPLY vacancy that should be sent this run.
-    eligible = [
-        row for row in store.list_campaign_vacancies(
-            account, track, "approved", 5000, source=source,
-        )
-        if not needs_manual_reapproval(row)
-        and not row.get("applied_before")
-        and str(row.get("decision") or "").upper() not in {"REVIEW", "REJECT", "BLOCKED"}
-        and row.get("score_decision") == "pass"
-        and (row.get("filter_status") in {"pass", "unknown"}
-             or str(row.get("decision") or "").upper() == "APPLY")
-    ]
+    eligible = []
+    for row in store.list_campaign_vacancies(
+        account, track, "approved", 5000, source=source, scan_id=scan_id,
+    ):
+        vacancy_id = str(row.get("id") or "")
+        decision = str(row.get("decision") or "").upper()
+        if wanted is not None and vacancy_id not in wanted:
+            continue
+        if needs_manual_reapproval(row) or row.get("applied_before"):
+            continue
+        if decision in {"REVIEW", "REJECT", "BLOCKED"}:
+            continue
+        if decision == "APPLY":
+            # Explicit owner approvals survive a stale score or an old
+            # publication window; preflight and channel guards still apply.
+            eligible.append(row)
+            continue
+        if (row.get("score_decision") == "pass"
+                and row.get("filter_status") in {"pass", "unknown"}):
+            eligible.append(row)
     # Keep scoring order *within* each group, but inspect ready work before
     # unfinished forms/letters when the batch limit is reached.  Also collapse
     # repeated employer+title postings so one role cannot consume two sends.

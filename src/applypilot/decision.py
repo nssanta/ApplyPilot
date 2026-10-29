@@ -239,6 +239,83 @@ def _minimum_experience(row: Mapping[str, Any]) -> float | None:
     return max(values) if values else None
 
 
+_OWNER_SOFT_PROBLEMS = {"role:title_not_target", "role:no_match"}
+_OWNER_SOFT_FILTER_PREFIXES = (
+    "salary:",
+    "publication:",
+    "role:title_not_target",
+    "role:no_match",
+)
+_OWNER_HARD_FILTER_PREFIXES = (
+    "geo:configured_exclusion",
+    "description:configured_exclusion",
+    "role:configured_title_exclusion",
+    "remote:not_matching",
+    "work_format:not_matching",
+    "experience:not_matching",
+    "hard:",
+    "preset_noise:",
+    "stack:title_incompatible",
+    "role:title_not_technical",
+)
+
+
+def _superseded_bulk_approval(
+    row: Mapping[str, Any], search: Mapping[str, Any] | None,
+) -> bool:
+    review_reason = str(row.get("review_reason") or "")
+    for pattern in (search or {}).get("superseded_bulk_approval_patterns", []):
+        try:
+            if re.search(str(pattern), review_reason, re.IGNORECASE):
+                return True
+        except re.error:
+            # A malformed guard cannot silently preserve stale blanket consent.
+            return True
+    return False
+
+
+def is_owner_approval(
+    row: Mapping[str, Any], search: Mapping[str, Any] | None = None,
+) -> bool:
+    """True only for an explicit human approval, not an automatic/bulk one."""
+    if str(row.get("review_state") or "").upper() != "APPROVED":
+        return False
+    if str(row.get("review_reason") or "") == AUTO_APPROVAL_REASON:
+        return False
+    return not _superseded_bulk_approval(row, search)
+
+
+def owner_hard_blockers(
+    row: Mapping[str, Any],
+    *,
+    search: Mapping[str, Any] | None = None,
+    profile: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Concrete profile/channel contradictions that survive owner approval.
+
+    Relevance gates (narrow titles, stale score, missing salary/publication)
+    are deliberately absent: an operator has already inspected those cards.
+    Explicit private exclusions and known personal-fact conflicts remain.
+    """
+    search = search or {}
+    profile = profile or {}
+    blockers: list[str] = []
+    for problem in (str(value) for value in row.get("problems", []) if str(value).strip()):
+        if problem in _OWNER_SOFT_PROBLEMS:
+            continue
+        status, reason = resolve_problem(
+            problem, row, search=search, profile=profile,
+        )
+        if status == "block":
+            blockers.append(f"{problem}: {reason}")
+    for code in (str(value) for value in row.get("filter_reasons", []) if str(value).strip()):
+        if code.startswith(_OWNER_SOFT_FILTER_PREFIXES):
+            continue
+        if code.startswith(_OWNER_HARD_FILTER_PREFIXES):
+            blockers.append(code)
+    return list(dict.fromkeys(blockers))
+
+
 def _soft_unknown_reasons(
     row: Mapping[str, Any],
     *,
@@ -298,6 +375,24 @@ def decide_row(
     if review_state in {"DEFERRED", "MAYBE"}:
         return Decision("REVIEW", f"owner_{review_state.casefold()}",
                         str(row.get("review_reason") or f"owner marked {review_state}"))
+    if state in WORKFLOW_STATES:
+        return Decision("BLOCKED", f"workflow_{state.casefold()}",
+                        f"vacancy is in {state}; resolve the workflow first")
+    # An exact owner approval is a new input, not another scoring pass.  It
+    # overrides stale title/score/window gates but never a verified personal
+    # contradiction or an already-used channel.
+    if is_owner_approval(row, search):
+        hard = owner_hard_blockers(row, search=search, profile=profile)
+        if hard:
+            return Decision(
+                "REJECT", "owner_approval_hard_blocker", "; ".join(hard)[:500],
+                blockers=tuple(hard),
+            )
+        if state == "READY_TO_APPLY":
+            return Decision("APPLY", "owner_approved",
+                            "operator approved this exact vacancy after review")
+        return Decision("REVIEW", "approved_without_ready",
+                        f"approved vacancy is in {state}; re-check preflight")
     if score_decision == "maybe" and str(row.get("description_status") or "") in {
         "telegram", "missing", "provisional",
     }:
@@ -324,27 +419,6 @@ def decide_row(
         if review_state != "APPROVED" or not soft_ok:
             return Decision("REJECT", "score_or_filter_reject",
                             "vacancy did not pass scoring/search rules")
-    if state in WORKFLOW_STATES:
-        return Decision("BLOCKED", f"workflow_{state.casefold()}",
-                        f"vacancy is in {state}; resolve the workflow first")
-    review_reason = str(row.get("review_reason") or "")
-    superseded_bulk_approval = False
-    for pattern in search.get("superseded_bulk_approval_patterns", []):
-        try:
-            if re.search(str(pattern), review_reason, re.IGNORECASE):
-                superseded_bulk_approval = True
-                break
-        except re.error:
-            # A malformed guard cannot silently preserve stale blanket consent.
-            superseded_bulk_approval = True
-            break
-    if (review_state == "APPROVED" and review_reason != AUTO_APPROVAL_REASON
-            and not superseded_bulk_approval):
-        if state == "READY_TO_APPLY":
-            return Decision("APPLY", "owner_approved", "owner approval is valid for this track")
-        return Decision("REVIEW", "approved_without_ready",
-                        f"approved vacancy is in {state}; re-check preflight")
-
     description_status = str(row.get("description_status") or "")
     if description_status in {"missing", "provisional"} or not str(row.get("description") or "").strip():
         return Decision("REVIEW", "needs_description", "full description is missing")
@@ -412,6 +486,7 @@ def sweep_track_decisions(
     limit: int | None = None,
     persist: bool = True,
     vacancy_ids: Iterable[str] | None = None,
+    approve_clean: bool = True,
 ) -> dict[str, Any]:
     """Evaluate selected or all non-terminal rows and auto-approve clean FITs.
 
@@ -459,7 +534,7 @@ def sweep_track_decisions(
             )
         counts[decision.action] += 1
         if decision.action == "APPLY" and row.get("review_state") == "UNREVIEWED":
-            if decision.auto_approve:
+            if decision.auto_approve and approve_clean:
                 approved.append(vacancy_id)
             else:
                 blocked[vacancy_id] = decision.reason_code

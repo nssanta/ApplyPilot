@@ -66,6 +66,49 @@ cp examples/sources.toml private/config/sources.toml
 
 Настраивайте собственные роли, зарплатные ожидания, географию, ограничения и резюме только в локальных профилях. Примеры в репозитории не описывают реальную кампанию какого-либо пользователя.
 
+## Ежедневный операторский поток
+
+Для ежедневной работы не нужен большой `go`: четыре независимые операции дают
+один `scan ID`, сохраняют выборку и передают точный утверждённый пакет кликеру.
+
+~~~bash
+# 1. Поиск. Возвращает scan ID, охват по источникам и команду продолжения.
+.venv/bin/python -m applypilot scan --track default \
+  --sources hh.ru,career.habr.com --days 3 --limit 100 \
+  --request-budget 120 --details-limit 80 --json
+
+# 2. Разбор топа конкретного скана: описание, зарплата, резюме,
+#    причины допуска/отсева и явные hard blockers.
+.venv/bin/python -m applypilot review --track default \
+  --scan SCAN_ID --view review --limit 100 --json
+
+# Массовое решение по конкретным ID (ID можно перечислять через запятую).
+.venv/bin/python -m applypilot review --track default --scan SCAN_ID \
+  --approve 12345,12346,12347 --skip 12348 --manual 12349 \
+  --reason "Проверены обязанности, удалёнка и требования" --json
+
+# 3. Dry-run и затем точная отправка только одобренного пакета этого скана.
+.venv/bin/python -m applypilot apply --track default --scan SCAN_ID \
+  --limit 20 --dry-run --json
+.venv/bin/python -m applypilot apply --track default --scan SCAN_ID \
+  --limit 20 --run --visible --json
+
+# 4. Статус очереди, scan и входящих; чтение переписки остаётся отдельной командой.
+.venv/bin/python -m applypilot status --track default --scan SCAN_ID --json
+.venv/bin/python -m applypilot sources inbox-status --track default --json
+~~~
+
+`review` разделяет скор релевантности и обязательные требования. Точное
+одобрение оператора снимает устаревший title/score/window gate, поэтому
+проверенная Python/Go/Fullstack/AI-first вакансия не теряется из-за узкого
+совпадения слов. Оно не обходит подтверждённое противоречие профилю
+(например, обязательный язык ниже подтверждённого уровня), уже использованный
+канал, `UNKNOWN` или внешний ATS. Каждое заблокированное ID получает причину.
+
+`apply` не запускает новый поиск. Повторный запуск с тем же `--scan`/`--id`
+продолжает неотработанные ID: подтверждённые и `UNKNOWN` исключаются, а
+`UNKNOWN` не переотправляется без независимой сверки.
+
 ## Короткие проходы и продолжение
 
 `go` сначала обрабатывает проверенную READY-очередь текущего источника, затем

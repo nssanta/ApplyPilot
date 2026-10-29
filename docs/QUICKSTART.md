@@ -29,6 +29,49 @@ cp examples/sources.toml private/config/sources.toml
 
 Настройте треки ролей, поисковые условия, названия резюме и source-аккаунты. Ролевой `--preset` заменяет словарь поиска и выбирает соответствующий ключ резюме из `profile.toml`; зарплата, регионы и прочие фильтры остаются настройками пользователя. Параметры источников можно задавать отдельно в `[source_limits]`.
 
+## Операторский поток scan → review → apply → status
+
+`scan` создаёт отдельный scan ID и не отправляет отклики. `review` показывает
+вакансии именно этого скана и позволяет массово одобрить, отклонить или
+отложить конкретные ID. `apply` берёт только одобренный пакет и не смешивает
+отправку с новым поиском.
+
+```bash
+# Поиск за 3 дня; scan ID и охват печатаются в JSON.
+.venv/bin/python -m applypilot scan --track default \
+  --sources hh.ru,career.habr.com --days 3 \
+  --request-budget 120 --details-limit 80 --json
+
+# Топ-100 разбор: скор, описание, требования, резюме и hard blockers.
+.venv/bin/python -m applypilot review --track default \
+  --scan SCAN_ID --view review --limit 100 --json
+
+# Массовые решения по ID; approve сохраняет точное решение оператора.
+.venv/bin/python -m applypilot review --track default --scan SCAN_ID \
+  --approve 12345,12346 --skip 12347 --manual 12348 \
+  --reason "Проверено вручную" --json
+
+# План и ограниченная отправка точного пакета.
+.venv/bin/python -m applypilot apply --track default --scan SCAN_ID \
+  --limit 20 --dry-run --json
+.venv/bin/python -m applypilot apply --track default --scan SCAN_ID \
+  --limit 20 --run --visible --json
+
+# Очередь, scan и доступный способ проверки входящих.
+.venv/bin/python -m applypilot status --track default --scan SCAN_ID --json
+.venv/bin/python -m applypilot sources inbox-status --track default --json
+```
+
+Если `scan` вернул `scan_partial`, в отчёте перечислены незавершённые запросы,
+ошибки и готовая команда продолжения с тем же `--scan-id --resume
+--until-complete`. Повторный `apply` продолжает только неотработанные ID.
+`UNKNOWN` остаётся карантином и не повторяется без подтверждения площадки.
+
+Точное одобрение оператора снимает устаревший title/score/window gate, но не
+обходит реальное противоречие профилю, занятый канал, внешний ATS или
+`UNKNOWN`. Поэтому одобренный пакет либо попадает в план кликера, либо получает
+конкретную причину блокировки.
+
 ## Поиск и очередь
 
 Обычный поиск ничего не отправляет. Для bounded-прохода с возобновляемыми курсорами:

@@ -417,12 +417,12 @@ def effective_track_application_state(
         # APPROVED flag must not keep such a role dispatchable.
         if str(decision or "").upper() in {"REVIEW", "REJECT", "BLOCKED"}:
             return "NOT_STARTED"
-        # An explicit decision=APPLY is a human/engine decision that survives a
-        # later scan-window change (for example, an old approved vacancy falling
-        # outside ``days``).  It never bypasses a rejected score.
-        if (approved and score_decision == "pass"
-                and (filter_status in {"pass", "unknown"}
-                     or str(decision or "").upper() == "APPLY")):
+        # An exact operator approval sets decision=APPLY and must survive a
+        # stale score/filter from before the review.
+        if approved and str(decision or "").upper() == "APPLY":
+            return state
+        # A clean engine decision still needs a passing score.
+        if approved and score_decision == "pass" and filter_status in {"pass", "unknown"}:
             return state
         return "NOT_STARTED"
     # NEEDS_FORM/NEEDS_LETTER/FAILED_BEFORE_SUBMIT describe a real channel
@@ -2026,7 +2026,8 @@ class Store:
 
     def list_campaign_vacancies(self, account: str = "default", track: str | None = None,
                                 view: str = "all", limit: int | None = 100,
-                                source: str | None = None) -> list[dict[str, Any]]:
+                                source: str | None = None,
+                                scan_id: str | None = None) -> list[dict[str, Any]]:
         if view not in CAMPAIGN_VIEWS:
             raise ValueError(f"unknown campaign view: {view}")
         query = """SELECT v.*,s.track,s.score,s.score_decision,s.filter_status,s.reasons_json,
@@ -2054,6 +2055,12 @@ class Store:
         if track:
             query += " AND s.track=?"
             params.append(track)
+        if scan_id:
+            query += (" AND EXISTS (SELECT 1 FROM execution_vacancies e "
+                      "WHERE e.execution_id=? AND e.account=v.account "
+                      "AND e.source=v.source AND e.vacancy_id=v.vacancy_id "
+                      "AND e.track=s.track)")
+            params.append(str(scan_id))
         query += " ORDER BY s.score DESC,s.last_seen_at DESC,v.vacancy_id"
         with self.connect() as conn:
             rows = [dict(row) for row in conn.execute(query, params).fetchall()]
@@ -2218,6 +2225,28 @@ class Store:
             ))
         return result if limit is None else result[:max(1, min(5000, int(limit)))]
 
+    def update_track_resume(self, account: str, source: str, vacancy_id: str, track: str,
+                            resume: str) -> None:
+        """Persist the operator's resume choice for one approved vacancy."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """UPDATE vacancy_track_scores SET resume=?
+                   WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
+                (str(resume or ""), account, source, str(vacancy_id), track),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"vacancy {vacancy_id} is not present in track {track}")
+
+    def scan_vacancy_keys(self, scan_id: str) -> set[tuple[str, str, str]]:
+        """Return ``(account, source, vacancy_id)`` included in one scan run."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT account,source,vacancy_id FROM execution_vacancies WHERE execution_id=?",
+                (str(scan_id),),
+            ).fetchall()
+        return {(str(row["account"]), str(row["source"]), str(row["vacancy_id"]))
+                for row in rows}
+
     def set_track_decision(self, account: str, source: str, vacancy_id: str, track: str,
                            decision: str, reason: str = "", next_action_at: str = "") -> None:
         """Persist the generic decision for one vacancy/track pair.
@@ -2283,7 +2312,8 @@ class Store:
             return [dict(row) for row in conn.execute(query, params).fetchall()]
 
     def set_review_state(self, account: str, source: str, vacancy_id: str, state: str,
-                         *, reason: str, notes: str | None = None, track: str | None = None) -> None:
+                         *, reason: str, notes: str | None = None, track: str | None = None,
+                         allow_relevance_override: bool = False) -> None:
         normalized = str(state).strip().upper()
         if normalized not in REVIEW_STATES:
             raise ValueError(f"review state must be one of {', '.join(sorted(REVIEW_STATES))}")
@@ -2319,7 +2349,10 @@ class Store:
                     str(score["score_decision"]) != "pass"
                     or str(score["filter_status"]) not in {"pass", "unknown"}
                     for score in scores
-                ):
+                ) and not allow_relevance_override:
+                    # The operator UI passes ``allow_relevance_override`` only
+                    # after independently checking the card.  That path is an
+                    # explicit human decision, not an automatic bypass.
                     raise ValueError(f"vacancy {vacancy_id} did not pass screening rules")
             if track is not None:
                 score = conn.execute(
@@ -2342,6 +2375,35 @@ class Store:
                        review_notes=COALESCE(?,review_notes) WHERE account=? AND source=? AND vacancy_id=?""",
                     (normalized, reason, notes, account, source, str(vacancy_id)),
                 )
+            # Explicit owner decisions must reach the clicker immediately.
+            # Automatic approvals keep their decision for the next policy
+            # sweep, which may demote them after a relevance change.
+            decision = ""
+            decision_reason = ""
+            if normalized == "APPROVED" and reason != AUTO_APPROVAL_REASON:
+                decision = "APPLY"
+                decision_reason = f"owner_approved: {reason}"[:500]
+            elif normalized == "SKIP":
+                decision = "REJECT"
+                decision_reason = f"owner_skip: {reason}"[:500]
+            elif normalized in {"MAYBE", "DEFERRED"}:
+                decision = "REVIEW"
+                decision_reason = f"owner_{normalized.casefold()}: {reason}"[:500]
+            elif normalized == "UNREVIEWED":
+                decision_reason = ""
+            if decision or normalized == "UNREVIEWED":
+                decision_sql = (
+                    "UPDATE vacancy_track_scores SET decision=?,decision_reason=?,"
+                    "decision_at=?,decision_streak=0,decision_signature='' "
+                    "WHERE account=? AND source=? AND vacancy_id=?"
+                )
+                decision_params: list[Any] = [
+                    decision, decision_reason, timestamp, account, source, str(vacancy_id),
+                ]
+                if track is not None:
+                    decision_sql += " AND track=?"
+                    decision_params.append(track)
+                conn.execute(decision_sql, decision_params)
             application_state = row["application_state"]
             if normalized == "APPROVED" and application_state in {"NOT_STARTED", "FAILED_BEFORE_SUBMIT"}:
                 application_state = "READY_TO_APPLY"
@@ -2352,7 +2414,8 @@ class Store:
             )
 
     def set_review_state_batch(self, account: str, source: str, vacancy_ids: list[str],
-                               state: str, *, reason: str, track: str) -> int:
+                               state: str, *, reason: str, track: str,
+                               allow_relevance_override: bool = False) -> int:
         """Атомарно применяет одно явное решение к пакету ID без частичного подтверждения."""
         normalized = str(state).strip().upper()
         if normalized not in REVIEW_STATES:
@@ -2382,7 +2445,9 @@ class Store:
                 if normalized == "APPROVED":
                     if app_state not in {"NOT_STARTED", "FAILED_BEFORE_SUBMIT", "READY_TO_APPLY"}:
                         raise ValueError(f"cannot batch approve {vacancy_id} in {app_state}")
-                    if row["score_decision"] != "pass" or row["filter_status"] not in {"pass", "unknown"}:
+                    if (row["score_decision"] != "pass"
+                            or row["filter_status"] not in {"pass", "unknown"}) \
+                            and not allow_relevance_override:
                         raise ValueError(f"vacancy {vacancy_id} did not pass screening rules")
                     # Legacy HH attempts are keyed by HH vacancy ID, even when
                     # the discovered apply channel points to an external ATS.
@@ -2438,6 +2503,25 @@ class Store:
                     WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
                     (normalized, reason, account, source, vacancy_id, track),
                 )
+                decision = ""
+                decision_reason = ""
+                if normalized == "APPROVED" and reason != AUTO_APPROVAL_REASON:
+                    decision = "APPLY"
+                    decision_reason = f"owner_approved: {reason}"[:500]
+                elif normalized == "SKIP":
+                    decision = "REJECT"
+                    decision_reason = f"owner_skip: {reason}"[:500]
+                elif normalized in {"MAYBE", "DEFERRED"}:
+                    decision = "REVIEW"
+                    decision_reason = f"owner_{normalized.casefold()}: {reason}"[:500]
+                if decision or normalized == "UNREVIEWED":
+                    conn.execute(
+                        """UPDATE vacancy_track_scores SET decision=?,decision_reason=?,
+                           decision_at=?,decision_streak=0,decision_signature=''
+                           WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
+                        (decision, decision_reason, timestamp, account, source,
+                         vacancy_id, track),
+                    )
                 if normalized == "APPROVED":
                     conn.execute(
                         """UPDATE vacancies SET application_state='READY_TO_APPLY',updated_at=?
@@ -2605,8 +2689,14 @@ class Store:
         return None
 
     def approved_campaign_items(self, account: str, track: str, limit: int = 10,
-                                source: str = "hh.ru") -> list[dict[str, Any]]:
-        rows = self.list_campaign_vacancies(account, track, "approved", limit=1000, source=source)
+                                source: str = "hh.ru", *, scan_id: str | None = None,
+                                vacancy_ids: set[str] | None = None) -> list[dict[str, Any]]:
+        rows = self.list_campaign_vacancies(
+            account, track, "approved", limit=1000, source=source, scan_id=scan_id,
+        )
+        if vacancy_ids is not None:
+            wanted = {str(value) for value in vacancy_ids}
+            rows = [row for row in rows if str(row.get("id") or "") in wanted]
         result = []
         with self.connect() as conn:
             for row in rows:
@@ -2614,14 +2704,16 @@ class Store:
                     continue
                 if str(row.get("decision") or "").upper() in {"REVIEW", "REJECT", "BLOCKED"}:
                     continue
-                # APPROVED is a track-scoped human override for reviewable unknown
-                # filters (for example, unpublished salary), never for an
-                # uncertain mechanical fit score.  An explicit decision=APPLY
-                # survives a later scan-window reject (see decision.py).
+                # APPROVED is a track-scoped human override for reviewable
+                # title/score/window gates.  An explicit decision=APPLY is the
+                # durable owner/engine result that survives a stale rescan.
                 decision = str(row.get("decision") or "").upper()
-                if (row.get("applied_before") or row.get("score_decision") != "pass"
-                        or (row.get("filter_status") not in {"pass", "unknown"}
-                            and decision != "APPLY")):
+                if row.get("applied_before"):
+                    continue
+                if decision != "APPLY" and (
+                    row.get("score_decision") != "pass"
+                    or row.get("filter_status") not in {"pass", "unknown"}
+                ):
                     continue
                 if self.cross_source_attempt_conflict(
                     source, str(row.get("id") or ""),

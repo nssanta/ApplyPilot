@@ -126,7 +126,12 @@ def normalize_vacancy(raw: dict[str, Any]) -> Candidate:
 
 def _title_excluded(term: str, title: str) -> bool:
     if str(term).casefold() == "qa":
-        return bool(re.search(r"(?<![\w])(?:a?qa|sdet|test(?:ing)? automation)(?![\w])", title))
+        return bool(re.search(
+            r"(?<![\w])(?:a?qa|sdet|quality\s+assurance|"
+            r"(?:software\s+development\s+)?engineer\s+in\s+test|"
+            r"test(?:ing)?\s+(?:automation|engineer)|тестировщик)(?![\w])",
+            title,
+        ))
     normalized = re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(term).casefold())).strip()
     if not normalized:
         return False

@@ -123,6 +123,25 @@ def _review_problems(item: dict[str, Any], search: dict[str, Any]) -> list[str]:
             problems.append("salary:below_or_unverified")
     if re.search(r"\b(senior|lead|principal|staff|head|chief)\b|старш\w+|ведущ\w+|руководител\w+|архитектор", title, re.IGNORECASE):
         problems.append("grade:seniority_check")
+    # Explicit "4+ years" in the body is a real minimum even when the title
+    # does not say Senior.  Keep it for resolve_problem to compare with the
+    # private experience fact instead of silently treating it as a preference.
+    for match in re.finditer(
+        r"(?<!\d)(\d+)(?:\s*[-–—]\s*\d+)?\s*\+?\s*(?:лет|года?|years?)",
+        description, re.IGNORECASE,
+    ):
+        context = description[max(0, match.start() - 80):match.end() + 35]
+        if not re.search(r"опыт|стаж|experience", context, re.IGNORECASE):
+            continue
+        if re.search(r"желатель|будет плюсом|nice.to.have|preferred", context, re.IGNORECASE):
+            continue
+        try:
+            required_years = int(match.group(1))
+        except ValueError:
+            continue
+        if required_years >= 4:
+            problems.append("grade:seniority_check")
+            break
     if re.search(r"\b(english|английск\w*)\b.{0,100}\b(b2|c1|c2|advanced|fluent|upper[- ]intermediate)\b|"
                  r"\b(b2|c1|c2|advanced|fluent)\b.{0,70}\b(english|английск\w*)\b", description, re.IGNORECASE):
         problems.append("language:english_requirement_check")
@@ -386,6 +405,26 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                 # counting it as a verified salary match.
                 filter_status = "unknown"
                 filter_reasons.append("salary:unpublished_not_verified")
+            # The same private regex guards used by the multi-source scanner
+            # must apply to the legacy HH path.  Otherwise a frontend/sales
+            # title can remain in review after the operator changed guards.
+            title_text = str(item.get("name") or "")
+            description_text = str(item.get("description") or "")
+            configured_guards = (
+                ("exclude_title_patterns", title_text,
+                 "role:configured_title_exclusion", True),
+                ("exclude_description_patterns", description_text,
+                 "description:configured_exclusion", False),
+                ("exclude_location_patterns", description_text,
+                 "geo:configured_exclusion", False),
+            )
+            for setting, text_value, reason, reject_score in configured_guards:
+                if any(re.search(pattern, text_value, re.IGNORECASE)
+                       for pattern in (group.get(setting) or [])):
+                    filter_status = "reject"
+                    filter_reasons.append(reason)
+                    if reject_score:
+                        item["score_decision"] = "reject"
             item["filter_status"] = filter_status
             item["filter_reasons"] = list(dict.fromkeys(filter_reasons))
             item["filter_fields"] = list(filter_result.fields)
@@ -457,10 +496,13 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
 
 
 def write_approved_input(config: AppConfig, track: str, account: str,
-                         limit: int = 10, vacancy_ids: set[str] | None = None
+                         limit: int = 10, vacancy_ids: set[str] | None = None,
+                         scan_id: str | None = None
                          ) -> tuple[Path | None, list[dict[str, Any]]]:
     """Создаёт приватный apply snapshot только из одобренных и ещё не отправленных строк."""
-    rows = Store(config.db_path).approved_campaign_items(account, track, limit)
+    rows = Store(config.db_path).approved_campaign_items(
+        account, track, limit, scan_id=scan_id,
+    )
     rows = [row for row in rows if not needs_manual_reapproval(row)]
     deduped: list[dict[str, Any]] = []
     seen_groups: set[str] = set()

@@ -94,6 +94,14 @@ def _campaign_apply_summary(result: dict[str, Any]) -> dict[str, int | str]:
     }
 
 
+class _ExplicitValueAction(argparse.Action):
+    """Store a value and mark that the operator actually supplied the flag."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", help="каталог рабочих данных")
     parser.add_argument("--profile", help="приватный TOML-профиль")
@@ -114,6 +122,19 @@ def build_parser() -> argparse.ArgumentParser:
     session.add_argument("action", choices=["check"])
 
     scan_cmd = sub.add_parser("scan", help="получить снимок вакансий")
+    scan_cmd.add_argument("--track", help="трек для мультиплатформенного scan ID")
+    scan_cmd.add_argument("--scan-id", help="продолжить сохранённый scan ID")
+    scan_cmd.add_argument("--sources", help="все или список источников через запятую")
+    scan_cmd.add_argument("--source", action="append", help="источник; можно повторить")
+    scan_cmd.add_argument("--until-complete", action="store_true",
+                          help="проходить оставшиеся страницы до завершения бюджета")
+    scan_cmd.add_argument("--resume", action="store_true",
+                          help="продолжить сохранённые курсоры страниц")
+    scan_cmd.add_argument("--rescore-only", action="store_true",
+                          help="пересчитать решения существующего scan ID без сети")
+    scan_cmd.add_argument("--max-passes", type=int, default=1)
+    scan_cmd.add_argument("--limit", type=int, default=100)
+    scan_cmd.add_argument("--json", action="store_true")
     scan_cmd.add_argument("--query")
     scan_cmd.add_argument("--add-query", action="append",
                           help="добавить запрос, не заменяя запросы пресета")
@@ -189,8 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     go.add_argument("--sources", default="all",
                     help="all или список источников через запятую")
     go.add_argument("--source", action="append", help="источник; можно повторить")
-    go.add_argument("--days", type=int, default=None,
+    go.add_argument("--days", type=int, default=30, action=_ExplicitValueAction,
                     help="окно поиска в днях; при продолжении меняет только окно поиска, не счётчик откликов")
+    go.set_defaults(_days_explicit=False)
     go.add_argument("--limit", type=int, default=100)
     go.add_argument("--target", type=int, default=0,
                     help="желаемое число подтверждённых откликов; shortfall печатается")
@@ -413,6 +435,9 @@ def build_parser() -> argparse.ArgumentParser:
     sources_dispatch_apply.add_argument("--track", required=True)
     sources_dispatch_apply.add_argument("--source", action="append")
     sources_dispatch_apply.add_argument("--limit", type=int, default=100)
+    sources_dispatch_apply.add_argument("--scan", help="ограничить точным scan ID")
+    sources_dispatch_apply.add_argument("--id", action="append", default=[],
+                                        help="точные ID или список через запятую")
     sources_dispatch_apply.add_argument("--execution-id", default="", help=argparse.SUPPRESS)
     sources_dispatch_apply.add_argument("--allow-live", action="store_true",
                                         help="разрешить live-драйверы; без драйвера источник пропускается")
@@ -655,13 +680,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text in (("plan", "офлайн-отбор кандидатов"), ("apply", "подготовить или отправить отклики")):
         cmd = sub.add_parser(name, help=help_text)
-        cmd.add_argument("--input", required=True, type=Path)
+        cmd.add_argument("--input", type=Path)
         cmd.add_argument("--limit", type=int, help="максимум выбранных вакансий")
         cmd.add_argument("--min-score", type=int)
         cmd.add_argument("--rescore", action="store_true",
                          help="пересчитать старые snapshots вместо сохранения исторического score")
         cmd.add_argument("--skip-security", action="store_true")
         if name == "apply":
+            cmd.add_argument("--track", help="трек очереди для пакетного apply без --input")
+            cmd.add_argument("--scan", help="точный scan ID утверждённого пакета")
+            cmd.add_argument("--source", action="append",
+                             help="источник; можно повторить; по умолчанию все нативные")
+            cmd.add_argument("--id", action="append", default=[],
+                             help="ID или список ID через запятую")
+            cmd.add_argument("--json", action="store_true")
             cmd.add_argument("--dry-run", action="store_true")
             cmd.add_argument("--run", action="store_true")
             cmd.add_argument(
@@ -718,11 +750,40 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark = sub.add_parser("benchmark", help="запустить офлайн benchmark качества сканера")
     benchmark.add_argument("--suite", default="tech-roles")
     benchmark.add_argument("--control-only", action="store_true")
-    review = sub.add_parser("review", help="создать локальный HTML-обзор вакансий")
-    review.add_argument("--input", required=True, type=Path)
+    review = sub.add_parser("review", help="обзор очереди или локальный HTML-обзор snapshot")
+    review.add_argument("--input", type=Path, help="legacy: JSON snapshot для HTML-обзора")
     review.add_argument("--top", type=int, default=20)
     review.add_argument("--output", type=Path)
     review.add_argument("--preset", choices=PRESET_CHOICES)
+    review.add_argument("--track")
+    review.add_argument("--scan", help="показать вакансии конкретного scan ID")
+    review.add_argument("--source", action="append", help="источник; можно повторить")
+    review.add_argument("--view", choices=(
+        "all", "new", "top", "review", "deferred", "approved", "ready",
+        "needs_letter", "needs_form", "unknown", "applied", "skip",
+    ), default="review")
+    review.add_argument("--limit", type=int, default=50,
+                        help="топ-N для показа: 50/100/300 или любое число")
+    review.add_argument("--json", action="store_true")
+    review.add_argument("--full-description", action="store_true")
+    review.add_argument("--approve", action="append", default=[],
+                        help="ID или список ID через запятую для APPROVED")
+    review.add_argument("--skip", action="append", default=[],
+                        help="ID или список ID для SKIP")
+    review.add_argument("--manual", action="append", default=[],
+                        help="ID или список ID для MAYBE/ручной проверки")
+    review.add_argument("--defer", action="append", default=[],
+                        help="ID или список ID для DEFERRED")
+    review.add_argument("--reset", action="append", default=[],
+                        help="ID или список ID обратно в UNREVIEWED")
+    review.add_argument("--reason", default="", help="причина решения оператора")
+    review.add_argument("--resume", help="назначить это точное резюме выбранным ID")
+
+    status_cmd = sub.add_parser("status", help="компактный статус scan/очереди/входящих")
+    status_cmd.add_argument("--track")
+    status_cmd.add_argument("--scan", help="scan/execution ID")
+    status_cmd.add_argument("--source", action="append")
+    status_cmd.add_argument("--json", action="store_true")
 
     screen = sub.add_parser("screen", help="LLM-скрининг отфильтрованных вакансий (opt-in)")
     screen.add_argument("--input", required=True, type=Path)
@@ -1398,9 +1459,910 @@ def _run_campaign_cycles(_config, args, raw_argv: list[str]) -> int:
     return 2 if args.until_exhausted else last_code
 
 
+def _split_action_ids(values: list[str] | None) -> list[str]:
+    result: list[str] = []
+    for chunk in values or []:
+        result.extend(value.strip() for value in str(chunk).split(",") if value.strip())
+    return list(dict.fromkeys(result))
+
+
+def _scan_source_list(args: argparse.Namespace, registry: Any) -> list[str]:
+    if args.source:
+        selected = list(dict.fromkeys(args.source))
+    elif getattr(args, "sources", None) and args.sources != "all":
+        selected = [value.strip() for value in args.sources.split(",") if value.strip()]
+    else:
+        selected = [source for source in registry.sources() if source != "dreamjob.ru"]
+    unknown = [source for source in selected if source not in registry.sources()]
+    if unknown:
+        raise ValueError(f"unknown source(s): {', '.join(unknown)}")
+    return selected
+
+
+def _apply_scan_overrides(search: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    search = dict(search)
+    if getattr(args, "query", None):
+        if isinstance(search.get("groups"), list):
+            for group in search["groups"]:
+                if isinstance(group, dict):
+                    group["queries"] = list(args.query)
+        else:
+            search["queries"] = list(args.query)
+    if getattr(args, "area", None):
+        search["areas"] = list(args.area)
+        for group in search.get("groups", []):
+            if isinstance(group, dict):
+                group["areas"] = list(args.area)
+    if getattr(args, "days", None) is not None:
+        search["days"] = int(args.days)
+        for group in search.get("groups", []):
+            if isinstance(group, dict):
+                group["days"] = int(args.days)
+    if getattr(args, "remote", None) is not None:
+        search["only_remote"] = bool(args.remote)
+        for group in search.get("groups", []):
+            if isinstance(group, dict):
+                group["only_remote"] = bool(args.remote)
+    if getattr(args, "sort_mode", None):
+        search["sort_mode"] = args.sort_mode
+    if getattr(args, "salary_from", None) is not None or getattr(args, "salary_currency", None):
+        salary = dict(search.get("salary") or {})
+        if args.salary_from is not None:
+            salary["from"] = args.salary_from
+        if args.salary_currency:
+            salary["currency"] = args.salary_currency
+        search["salary"] = salary
+        for group in search.get("groups", []):
+            if isinstance(group, dict):
+                group["salary"] = {**group.get("salary", {}), **salary}
+    for flag, field in (("pages", "max_pages"), ("request_budget", "request_budget"),
+                        ("details_limit", "details_limit")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            search[field] = value
+            for group in search.get("groups", []):
+                if isinstance(group, dict):
+                    group[field] = value
+    return search
+
+
+def _rescore_scan(
+    selected_config: AppConfig, args: argparse.Namespace, store: Store,
+    profile: dict[str, Any], search: dict[str, Any], selected: list[str],
+    existing: dict[str, Any], scan_id: str,
+) -> int:
+    from .decision import sweep_track_decisions
+    from .multisource import refresh_queue, resolve_source_account
+
+    previous_progress = existing.get("progress") or {}
+    previous_coverage = previous_progress.get("coverage") or {}
+    scan_keys = store.scan_vacancy_keys(scan_id)
+    coverage: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    detail_limit = (args.details_limit if args.details_limit is not None
+                    else int(search.get("details_limit", 100)))
+    for source in selected:
+        account = resolve_source_account(selected_config, profile, source)
+        wanted = sorted(
+            vacancy_id for key_account, key_source, vacancy_id in scan_keys
+            if key_source == source and key_account == account
+        )
+        if not wanted:
+            continue
+        rows = store.list_campaign_vacancies(
+            account, args.track, "all", None, source=source,
+        )
+        missing = [
+            item for item in rows if str(item.get("id") or "") in set(wanted)
+            and (not item.get("description")
+                 or item.get("description_status") in {"missing", "provisional",
+                                                       "network_error", "parse_error"})
+        ]
+        refreshed = refresh_queue(
+            selected_config, args.track, profile, search, source,
+            details_limit=(min(int(detail_limit), len(missing))
+                           if missing and int(detail_limit or 0) > 0 else 0),
+            vacancy_ids=wanted,
+        )
+        sweep_track_decisions(
+            store, account, args.track, source, search=search, profile=profile,
+            policy=selected_config.load_policy(), vacancy_ids=wanted,
+            approve_clean=False,
+        )
+        rows = [item for item in store.list_campaign_vacancies(
+            account, args.track, "all", None, source=source,
+        ) if str(item.get("id") or "") in set(wanted)]
+        store.observe_execution(scan_id, account, source, args.track, rows)
+        counts[source] = len(rows)
+        previous = previous_coverage.get(source, {}) if isinstance(
+            previous_coverage.get(source, {}), dict,
+        ) else {}
+        coverage[source] = {
+            **previous,
+            "status": previous.get("status", "ok"),
+            "found": len(rows),
+            "new_now": 0,
+            "refreshed": refreshed,
+        }
+    result = {
+        "scan_id": scan_id, "track": args.track,
+        "status": existing.get("status", "scan_partial"),
+        "mode": "rescore_only", "sources": coverage, "counts": counts,
+        "total": sum(counts.values()),
+    }
+    store.update_execution(
+        scan_id, str(existing.get("status") or "scan_partial"),
+        str(existing.get("reason") or "rescore_only"),
+        {
+            **previous_progress,
+            "scan_id": scan_id, "track": args.track,
+            "coverage": coverage, "counts": counts,
+            "rescored_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"scan rescore: {scan_id} · status={result['status']} "
+              f"· total={result['total']}")
+        for source, info in coverage.items():
+            print(f"  {source}: found={info['found']} status={info['status']}")
+    return 0 if result["status"] == "scan_complete" else 2
+
+
+def _run_unified_scan(config: AppConfig, args: argparse.Namespace) -> int:
+    from .decision import sweep_track_decisions
+    from .multisource import refresh_queue, resolve_source_account, scan_sources
+    from .providers import default_registry
+
+    registry = default_registry()
+    selected_config, track_info = _track_config(
+        config, args.track, profile_override=bool(args.profile),
+        search_override=bool(args.search),
+    )
+    search = effective_search(selected_config.load_search(), args.preset)
+    search = _apply_scan_overrides(search, args)
+    validate_search(search)
+    profile = _profile(selected_config, search)
+    if not search.get("resume_key"):
+        profile["resume"] = str(track_info.get("resume") or profile.get("resume") or "")
+    selected = _scan_source_list(args, registry)
+    if not selected:
+        raise ValueError("no sources selected")
+    if not 1 <= int(args.limit) <= 100:
+        raise ValueError("--limit must be between 1 and 100")
+    if not 1 <= int(args.max_passes) <= 100:
+        raise ValueError("--max-passes must be between 1 and 100")
+    scan_id = str(args.scan_id or uuid.uuid4().hex)
+    store = Store(selected_config.db_path)
+    existing = store.execution(scan_id) if args.scan_id else None
+    if existing and str(existing.get("spec", {}).get("track") or "") not in {"", args.track}:
+        raise ValueError("scan ID belongs to a different track")
+    if args.rescore_only:
+        if not existing:
+            raise ValueError("--rescore-only requires an existing --scan-id")
+        return _rescore_scan(
+            selected_config, args, store, profile, search, selected, existing, scan_id,
+        )
+    if (existing and args.resume
+            and str(existing.get("status") or "") == "scan_complete"):
+        raise ValueError(
+            "this scan is already complete; start a new scan ID, or use "
+            "--rescore-only to recalculate decisions without network access"
+        )
+    spec = {
+        "mode": "scan", "track": args.track, "sources": selected,
+        "args": json.loads(json.dumps(vars(args), default=str)),
+        "search": search,
+    }
+    if existing:
+        store.update_execution_spec(scan_id, spec)
+    else:
+        store.create_execution(scan_id, spec)
+    store.update_execution(scan_id, "running", "scan", {"scan_id": scan_id})
+    print(f"scan_id: {scan_id}", file=sys.stderr if args.json else sys.stdout, flush=True)
+    scan_search = dict(search)
+    scan_search["scan_scope"] = scan_id
+    scanned = scan_sources(
+        selected_config, args.track, profile, scan_search, sources=selected,
+        until_complete=bool(args.until_complete), resume=bool(args.resume),
+        max_passes=int(args.max_passes), pages=args.pages,
+        request_budget=args.request_budget, details_limit=args.details_limit,
+        limit=int(args.limit),
+    )
+    coverage: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    problems: dict[str, str] = {}
+    existing_scan_keys = store.scan_vacancy_keys(scan_id)
+    previous_coverage = (
+        (existing or {}).get("progress", {}).get("coverage", {})
+        if isinstance((existing or {}).get("progress", {}).get("coverage", {}), dict)
+        else {}
+    )
+    configured_queries = {
+        str(value).strip() for value in search.get("queries", []) if str(value).strip()
+    }
+    detail_limit = (args.details_limit if args.details_limit is not None
+                    else int(search.get("details_limit", 100)))
+    for row in scanned.get("sources", []):
+        source = str(row.get("source") or "")
+        account = resolve_source_account(selected_config, profile, source)
+        candidate_ids = [str(value) for value in row.get("candidate_ids", []) if str(value)]
+        wanted = set(candidate_ids) | {
+            vacancy_id for key_account, key_source, vacancy_id in existing_scan_keys
+            if key_source == source and key_account == account
+        }
+        rows = store.list_campaign_vacancies(
+            account, args.track, "all", None, source=source,
+        )
+        missing = [
+            item for item in rows
+            if str(item.get("id") or "") in wanted
+            and (not item.get("description")
+                 or item.get("description_status") in {"missing", "provisional", "network_error",
+                                                       "parse_error"})
+        ]
+        if wanted:
+            # Rescore the whole selected scan with the current private guard
+            # configuration; only missing descriptions spend network budget.
+            refresh_queue(
+                selected_config, args.track, profile, search, source,
+                details_limit=(min(int(detail_limit), len(missing))
+                               if missing and int(detail_limit or 0) > 0 else 0),
+                vacancy_ids=sorted(wanted),
+            )
+            sweep_track_decisions(
+                store, account, args.track, source, search=search, profile=profile,
+                policy=selected_config.load_policy(), vacancy_ids=sorted(wanted),
+                approve_clean=False,
+            )
+        rows = store.list_campaign_vacancies(
+            account, args.track, "all", None, source=source,
+        )
+        rows = [item for item in rows if str(item.get("id") or "") in wanted]
+        store.observe_execution(scan_id, account, source, args.track, rows)
+        counts[source] = len(rows)
+        if not row.get("coverage_complete") and row.get("status") in {
+            "partial", "truncated", "failed", "blocked",
+        }:
+            problems[source] = (
+                f"status={row.get('status')}; uncovered={row.get('uncovered_queries') or []}; "
+                f"errors={row.get('errors') or []}"
+            )[:1000]
+        coverage[source] = {
+            "status": row.get("status"),
+            "found": len(rows),
+            "new_now": len(candidate_ids),
+            "passes": int(row.get("passes", 1) or 1),
+            "query_count": int(row.get("query_count", 0) or 0),
+            "covered_query_count": int(row.get("covered_query_count", 0) or 0),
+            "coverage_complete": bool(row.get("coverage_complete")),
+            "uncovered_queries": list(row.get("uncovered_queries") or []),
+            "remaining_pages": list(row.get("remaining_pages") or []),
+            "errors": list(row.get("errors") or []),
+            "campaign_ids": list(row.get("campaign_ids") or []),
+            "covered_queries": [],
+        }
+        if source == "hh.ru" and configured_queries:
+            previous = previous_coverage.get(source, {}) if isinstance(
+                previous_coverage.get(source, {}), dict,
+            ) else {}
+            previous_covered = {
+                str(value) for value in previous.get("covered_queries", []) if str(value)
+            }
+            # A cursor at page > 0 proves the query was already requested; a
+            # cursor at page 0 is the only proof that it was never covered.
+            zero_page_queries = {
+                str(page.get("query") or "")
+                for page in coverage[source]["remaining_pages"]
+                if int(page.get("page") or 0) == 0 and str(page.get("query") or "")
+            }
+            cursor_known = bool(coverage[source]["remaining_pages"]) or bool(
+                previous.get("remaining_pages")
+            )
+            cumulative = set(previous_covered)
+            if coverage[source]["coverage_complete"]:
+                cumulative = set(configured_queries)
+            elif cursor_known:
+                cumulative |= configured_queries - zero_page_queries
+            else:
+                cumulative |= configured_queries - {
+                    str(value) for value in coverage[source]["uncovered_queries"]
+                    if str(value)
+                }
+            coverage[source]["covered_queries"] = sorted(cumulative)
+            coverage[source]["covered_query_count"] = len(cumulative)
+            coverage[source]["uncovered_queries"] = sorted(
+                configured_queries - cumulative
+            )
+    from collections import Counter
+
+    scan_keys = store.scan_vacancy_keys(scan_id)
+    counts = dict(Counter(key[1] for key in scan_keys))
+    for source, info in coverage.items():
+        info["scan_total"] = int(counts.get(source, 0))
+    partial = list(scanned.get("partial_sources") or [])
+    successful = [source for source, info in coverage.items()
+                  if info.get("status") not in {"failed", "blocked"}]
+    status = "scan_complete" if successful and not partial else (
+        "scan_partial" if successful else "scan_failed"
+    )
+    result = {
+        "scan_id": scan_id, "track": args.track, "status": status,
+        "days": search.get("days"), "sources": coverage,
+        "counts": counts, "total": sum(counts.values()),
+        "partial_sources": partial, "problems": problems,
+        "resume": (
+            f"applypilot scan --track {args.track} --scan-id {scan_id} "
+            f"--sources {','.join(selected)} --days {search.get('days')} "
+            "--resume --until-complete --json"
+        ) if partial else "",
+    }
+    store.update_execution(
+        scan_id, status, "; ".join(f"{key}: {value}" for key, value in problems.items()),
+        {
+            "scan_id": scan_id, "track": args.track, "status": status,
+            "coverage": coverage, "counts": counts, "partial_sources": partial,
+            "problems": problems, "days": search.get("days"),
+        },
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"scan: {scan_id} · track={args.track} · status={status} · days={search.get('days')}")
+        for source, info in coverage.items():
+            print(
+                f"  {source}: status={info['status']} found={info['found']} "
+                f"new_now={info.get('new_now', 0)} "
+                f"passes={info['passes']} coverage="
+                f"{'complete' if info['coverage_complete'] else 'partial'} "
+                f"queries={info['covered_query_count']}/{info['query_count']}"
+            )
+            for error in info["errors"][:4]:
+                print(f"    note: {str(error)[:240]}")
+            if info["uncovered_queries"]:
+                print(f"    remaining queries: {', '.join(info['uncovered_queries'][:8])}")
+            if info["remaining_pages"]:
+                sample = ", ".join(
+                    f"{page['query']}@{page['page']}" for page in info["remaining_pages"][:8]
+                )
+                print(f"    remaining pages: {sample}")
+        if result["resume"]:
+            print(f"  continue: {result['resume']}")
+        print(f"  review: applypilot review --track {args.track} --scan {scan_id} --limit 100 --json")
+    return 0 if status == "scan_complete" else 2
+
+
+def _review_rows(
+    config: AppConfig, args: argparse.Namespace,
+) -> tuple[AppConfig, dict[str, Any], dict[str, dict[str, Any]], Store, list[dict[str, Any]],
+           dict[tuple[str, str], dict[str, Any]]]:
+    from .multisource import resolve_source_account
+    from .providers import default_registry
+
+    registry = default_registry()
+    selected_config, _track_info = _track_config(
+        config, args.track, profile_override=bool(args.profile),
+        search_override=bool(args.search),
+    )
+    search = effective_search(selected_config.load_search(), args.preset)
+    profile = _profile(selected_config, search)
+    store = Store(selected_config.db_path)
+    sources = args.source or [source for source in registry.sources() if source != "dreamjob.ru"]
+    accounts = {
+        source: resolve_source_account(selected_config, profile, source)
+        for source in sources
+    }
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        rows.extend(store.list_campaign_vacancies(
+            accounts[source], args.track, args.view, args.limit,
+            source=source, scan_id=args.scan,
+        ))
+    rows.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("id") or "")))
+    rows = rows[:max(1, int(args.limit))]
+    by_key = {(str(row.get("source") or ""), str(row.get("id") or "")): row
+              for row in rows}
+    return selected_config, search, profile, store, rows, by_key
+
+
+def _run_review(config: AppConfig, args: argparse.Namespace) -> int:
+    from .decision import owner_hard_blockers
+    from .operator_review import review_counts, review_item
+    from .providers import default_registry
+
+    if not args.track:
+        args.track = _default_track(config)
+    selected_config, search, profile, store, rows, _by_key = _review_rows(config, args)
+    policy = selected_config.load_policy()
+    items = [
+        review_item(row, search=search, profile=profile, policy=policy,
+                    full_description=bool(args.full_description))
+        for row in rows
+    ]
+    actions = {
+        "APPROVED": _split_action_ids(args.approve),
+        "SKIP": _split_action_ids(args.skip),
+        "MAYBE": _split_action_ids(args.manual),
+        "DEFERRED": _split_action_ids(args.defer),
+        "UNREVIEWED": _split_action_ids(args.reset),
+    }
+    action_result: dict[str, Any] = {"requested": 0, "updated": {}, "blocked": {}}
+    if any(actions.values()) or args.resume:
+        from .multisource import resolve_source_account
+        from .providers import default_registry
+
+        registry = default_registry()
+        all_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        # Action lookups must not be limited by the display window.
+        sources = args.source or [source for source in registry.sources() if source != "dreamjob.ru"]
+        for source in sources:
+            account = resolve_source_account(selected_config, profile, source)
+            for row in store.list_campaign_vacancies(
+                account, args.track, "all", 5000, source=source, scan_id=args.scan,
+            ):
+                all_rows[(source, str(row.get("id") or ""))] = row
+        accounts = {
+            source: resolve_source_account(selected_config, profile, source)
+            for source in sources
+        }
+        for state, tokens in actions.items():
+            for token in tokens:
+                action_result["requested"] += 1
+                if ":" in token and token.split(":", 1)[0] in registry.sources():
+                    source, vacancy_id = token.split(":", 1)
+                    matches = [(source, vacancy_id)] if (source, vacancy_id) in all_rows else []
+                else:
+                    vacancy_id = token
+                    matches = [key for key in all_rows if key[1] == vacancy_id]
+                if not matches:
+                    action_result["blocked"][token] = "not found in this scan/track"
+                    continue
+                if len(matches) > 1 and not args.source:
+                    action_result["blocked"][token] = (
+                        "ambiguous across sources; use source:id: "
+                        + ", ".join(f"{src}:{vid}" for src, vid in matches)
+                    )
+                    continue
+                for source, vacancy_id in matches:
+                    row = all_rows[(source, vacancy_id)]
+                    if state == "APPROVED":
+                        hard = owner_hard_blockers(row, search=search, profile=profile)
+                        if hard:
+                            action_result["blocked"][f"{source}:{vacancy_id}"] = (
+                                "hard requirement: " + "; ".join(hard)
+                            )[:500]
+                            continue
+                    try:
+                        if args.resume:
+                            store.update_track_resume(
+                                accounts[source], source, vacancy_id, args.track, args.resume,
+                            )
+                        store.set_review_state(
+                            accounts[source], source, vacancy_id, state,
+                            reason=args.reason or (
+                                "Operator approved after manual review"
+                                if state == "APPROVED" else f"Operator marked {state}"
+                            ),
+                            track=args.track,
+                            allow_relevance_override=(state == "APPROVED"),
+                        )
+                        action_result["updated"][f"{source}:{vacancy_id}"] = state
+                    except ValueError as exc:
+                        action_result["blocked"][f"{source}:{vacancy_id}"] = str(exc)[:500]
+        action_result["counts"] = {}
+        for state in action_result["updated"].values():
+            action_result["counts"][state] = action_result["counts"].get(state, 0) + 1
+    result = {
+        "track": args.track, "scan": args.scan or "", "view": args.view,
+        "count": len(items), "counts": review_counts(items),
+        "items": items, "actions": action_result,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"review: track={args.track} scan={args.scan or 'latest queue'} items={len(items)} "
+              f"counts={result['counts']}")
+        for index, item in enumerate(items, 1):
+            print(
+                f"{index:>3}. {item['source']}:{item['id']} · score={item['score']} · "
+                f"{item['suggested_action']} · {item['name']} — {item['company']} "
+                f"· {item['salary']} · resume={item['resume'] or '—'}"
+            )
+            if item["admit_reasons"]:
+                print(f"     за: {', '.join(item['admit_reasons'][:8])[:260]}")
+            if item["warnings"]:
+                print(f"     проверить: {', '.join(item['warnings'][:8])[:260]}")
+            if item["hard_blockers"]:
+                print(f"     hard: {'; '.join(item['hard_blockers'])[:260]}")
+            print(f"     {item['url']}")
+        if action_result["requested"]:
+            print(f"actions: requested={action_result['requested']} "
+                  f"updated={action_result['counts']} blocked={len(action_result['blocked'])}")
+            for key, reason in action_result["blocked"].items():
+                print(f"  BLOCKED {key}: {reason}")
+    return 0 if not action_result["blocked"] else 2
+
+
+def _approved_package(
+    store: Store, track: str, sources: list[str], accounts: dict[str, str],
+    *, scan_id: str | None, ids: set[str], limit: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for source in sources:
+        rows.extend(store.approved_campaign_items(
+            accounts[source], track, 100, source=source, scan_id=scan_id,
+            vacancy_ids=ids or None,
+        ))
+    rows.sort(key=lambda row: (-int(row.get("score") or 0), str(row.get("source") or ""),
+                               str(row.get("id") or "")))
+    return rows[:max(1, min(100, int(limit)))]
+
+
+def _dispatch_status_counts(summary: dict[str, Any]) -> dict[str, int]:
+    result = {
+        "confirmed": 0, "already_applied": 0, "unknown": 0,
+        "needs_manual": 0, "failed_before_submit": 0, "skipped": 0,
+    }
+    mapping = {
+        "success": "confirmed", "already_applied": "already_applied",
+        "unknown": "unknown", "needs_manual": "needs_manual",
+        "failed": "failed_before_submit",
+        "failed_before_submit": "failed_before_submit",
+        "needs_live_validation": "skipped", "skipped": "skipped",
+        "channel_conflict": "skipped", "limit_reached": "skipped",
+    }
+    for status, count in (summary or {}).items():
+        key = mapping.get(str(status), "skipped")
+        result[key] += int(count or 0)
+    return result
+
+
+def _run_apply_package(config: AppConfig, args: argparse.Namespace) -> int:
+    from .multisource import resolve_source_account
+    from .providers import default_registry
+
+    if not args.track:
+        raise ValueError("apply --track is required without --input")
+    if bool(args.run) == bool(args.dry_run):
+        raise ValueError("choose exactly one: --run or --dry-run")
+    if args.limit is None:
+        args.limit = 100
+    if not 1 <= int(args.limit) <= 100:
+        raise ValueError("--limit must be between 1 and 100")
+    registry = default_registry()
+    selected_config, track_info = _track_config(
+        config, args.track, profile_override=bool(args.profile),
+        search_override=bool(args.search),
+    )
+    search = effective_search(selected_config.load_search(), args.preset)
+    profile = _profile(selected_config, search)
+    store = Store(selected_config.db_path)
+    sources = args.source or [source for source in registry.sources()
+                              if source != "dreamjob.ru"]
+    unknown = [source for source in sources if source not in registry.sources()]
+    if unknown:
+        raise ValueError(f"unknown source(s): {', '.join(unknown)}")
+    accounts = {
+        source: resolve_source_account(selected_config, profile, source)
+        for source in sources
+    }
+    requested_ids = set(_split_action_ids(args.id))
+    package = _approved_package(
+        store, args.track, sources, accounts,
+        scan_id=args.scan, ids=requested_ids, limit=int(args.limit),
+    )
+    package_by_source: dict[str, list[dict[str, Any]]] = {}
+    for row in package:
+        package_by_source.setdefault(str(row.get("source") or ""), []).append(row)
+    if args.dry_run:
+        plans = {}
+        for source in sources:
+            from .multisource import queue_plan
+            package_ids = {
+                str(row.get("id") or "") for row in package_by_source.get(source, [])
+            }
+            plan = queue_plan(
+                store, accounts[source], args.track, source,
+                max(1, len(package_ids) or int(args.limit)),
+                scan_id=args.scan,
+                vacancy_ids=package_ids or requested_ids or None,
+                verified_driver=source in {
+                    "career.habr.com", "getmatch.ru", "geekjob.ru", "yandex.ru/jobs",
+                },
+            )
+            plans[source] = plan
+        result = {
+            "mode": "dry_run", "track": args.track, "scan": args.scan or "",
+            "package_count": len(package), "sources": {
+                source: {
+                    "package": [
+                        {"id": row.get("id"), "name": row.get("name"),
+                         "resume": row.get("resume"), "score": row.get("score")}
+                        for row in package_by_source.get(source, [])
+                    ],
+                    "planned": plan.get("planned_count", 0),
+                    "blocked": plan.get("blocked", []),
+                    "planned_rows": plan.get("planned", []),
+                }
+                for source, plan in plans.items()
+            },
+        }
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(f"apply dry-run: package={len(package)} scan={args.scan or 'approved queue'}")
+            for source, info in result["sources"].items():
+                print(f"  {source}: package={len(info['package'])} planned={info['planned']} "
+                      f"blocked={len(info['blocked'])}")
+                for row in info["blocked"][:10]:
+                    print(f"    BLOCKED {row.get('id')}: {row.get('reason')}")
+        return 0
+    if profile.get("reviewed") is not True:
+        raise ValueError("live sends require reviewed = true in the selected private profile")
+    policy = selected_config.load_policy()
+    if policy.get("live_apply") is not True:
+        raise ValueError("operating policy does not grant live_apply")
+    if not package:
+        print("apply: approved package is empty for this scan/IDs", file=sys.stderr)
+        return 2
+    summaries: dict[str, Any] = {}
+    run_ids: dict[str, str] = {}
+    overall = {"confirmed": 0, "already_applied": 0, "unknown": 0,
+               "needs_manual": 0, "failed_before_submit": 0, "skipped": 0}
+    for source in sources:
+        rows = package_by_source.get(source, [])
+        if not rows:
+            summaries[source] = {"status": "empty", **{key: 0 for key in overall}}
+            continue
+        try:
+            if source == "hh.ru":
+                from .campaigns import write_approved_input
+
+                account = accounts[source]
+                sync = store.latest_sync(account)
+                max_age_hours = max(1, int((profile.get("apply") or {}).get(
+                    "sync_max_age_hours", 24,
+                )))
+                fresh = False
+                if sync and sync.get("status") == "ok":
+                    try:
+                        fetched_at = datetime.fromisoformat(str(sync["created_at"]))
+                        if fetched_at.tzinfo is None:
+                            fetched_at = fetched_at.replace(tzinfo=UTC)
+                        fresh = (datetime.now(UTC) - fetched_at.astimezone(UTC)
+                                 <= timedelta(hours=max_age_hours))
+                    except (KeyError, ValueError):
+                        fresh = False
+                if not fresh:
+                    summaries[source] = {
+                        "status": "blocked_stale_sync",
+                        "reason": f"run `applypilot sync --track {args.track}` "
+                                  f"successfully first (max age {max_age_hours}h)",
+                        **{key: 0 for key in overall},
+                    }
+                    continue
+                permitted = _permitted_hh_resumes(
+                    profile, str(track_info.get("resume") or ""),
+                )
+                mismatches = [
+                    str(row.get("id")) for row in rows
+                    if str(row.get("resume") or "").strip() not in permitted
+                ]
+                if not permitted or mismatches:
+                    summaries[source] = {
+                        "status": "blocked_resume",
+                        "reason": f"resume mismatch; allowed {sorted(permitted)}; "
+                                  f"IDs {mismatches}",
+                        **{key: 0 for key in overall},
+                    }
+                    continue
+                input_path, selected = write_approved_input(
+                    selected_config, args.track, account, 100,
+                    vacancy_ids={str(row.get("id") or "") for row in rows},
+                    scan_id=args.scan,
+                )
+                if input_path is None or not selected:
+                    summaries[source] = {"status": "empty", **{key: 0 for key in overall}}
+                    continue
+                run_id = uuid.uuid4().hex
+                run_ids[source] = run_id
+                if args.scan:
+                    store.execution_run(args.scan, run_id, source, args.track)
+                code = _run_apply(
+                    selected_config, store, selected, run_id, account,
+                    input_path, len(selected), args.target_success,
+                    headless_override=(True if args.headless else
+                                       (False if args.visible else None)),
+                    search_override=search,
+                )
+                run_summary = store.run_summary(run_id) or {}
+                counts = run_summary.get("counts") or {}
+                mapped = {
+                    "confirmed": int(counts.get("success", 0)),
+                    "already_applied": int(counts.get("already_applied", 0)),
+                    "unknown": int(counts.get("unknown", 0)),
+                    "needs_manual": int(counts.get("needs_manual", 0)),
+                    "failed_before_submit": int(counts.get("failed_before_submit", 0)),
+                    "skipped": sum(int(counts.get(key, 0)) for key in (
+                        "skipped", "prepared",
+                    )),
+                }
+                summaries[source] = {
+                    "status": "completed" if code == 0 else f"exit_{code}",
+                    "run_id": run_id, "selected": len(selected), **mapped,
+                    "stop_reason": (run_summary.get("run") or {}).get("stop_reason", ""),
+                }
+            else:
+                cmd = [
+                    "--data-dir", str(selected_config.data_dir),
+                    "--profile", str(selected_config.profile_path),
+                    "--search", str(selected_config.search_path),
+                    "sources", "dispatch-apply", "--track", args.track,
+                    "--source", source, "--limit", str(max(1, len(rows))),
+                    "--allow-live", "--json",
+                ]
+                if args.scan:
+                    cmd.extend(("--scan", args.scan, "--execution-id", args.scan))
+                for row in rows:
+                    cmd.extend(("--id", str(row.get("id") or "")))
+                if args.visible:
+                    cmd.append("--visible")
+                if source == "career.habr.com":
+                    cmd.extend(("--enable-habr", "--habr-min-interval", "2.0"))
+                elif source == "getmatch.ru":
+                    cmd.extend(("--enable-getmatch", "--getmatch-min-interval", "2.0"))
+                elif source == "geekjob.ru":
+                    cmd.extend(("--enable-geekjob", "--geekjob-min-interval", "2.0"))
+                elif source == "yandex.ru/jobs":
+                    cmd.extend(("--enable-yandex", "--yandex-min-interval", "2.0"))
+                capture = io.StringIO()
+                previous_telegram_live = os.environ.get("APPLYPILOT_TELEGRAM_LIVE")
+                if source == "getmatch.ru":
+                    os.environ["APPLYPILOT_TELEGRAM_LIVE"] = "1"
+                try:
+                    with redirect_stdout(capture):
+                        code = main(cmd)
+                finally:
+                    if source == "getmatch.ru":
+                        if previous_telegram_live is None:
+                            os.environ.pop("APPLYPILOT_TELEGRAM_LIVE", None)
+                        else:
+                            os.environ["APPLYPILOT_TELEGRAM_LIVE"] = previous_telegram_live
+                try:
+                    dispatch_result = json.loads(capture.getvalue())
+                except json.JSONDecodeError:
+                    dispatch_result = {"status": "non_json", "output": capture.getvalue()[-2000:]}
+                mapped = _dispatch_status_counts(dispatch_result.get("summary") or {})
+                summaries[source] = {
+                    "status": dispatch_result.get("mode", "unknown"),
+                    "exit_code": code, **mapped,
+                    "executed": int(dispatch_result.get("executed", 0) or 0),
+                    "send_attempts": int(dispatch_result.get("send_attempts", 0) or 0),
+                    "problems": [
+                        {"id": row.get("id"), "status": row.get("status"),
+                         "reason": row.get("reason", row.get("note", ""))}
+                        for row in dispatch_result.get("results", [])
+                        if row.get("status") not in {"success", "already_applied"}
+                    ][:20],
+                }
+        except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
+            summaries[source] = {
+                "status": "source_error", "reason": f"{type(exc).__name__}: {str(exc)[:300]}",
+                **{key: 0 for key in overall},
+            }
+        for key in overall:
+            overall[key] += int(summaries[source].get(key, 0) or 0)
+    result = {
+        "mode": "live", "track": args.track, "scan": args.scan or "",
+        "limit": int(args.limit), "package_count": len(package),
+        "requested_ids": sorted(requested_ids), "sources": summaries,
+        "counts": overall, "run_ids": run_ids,
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"apply: package={len(package)} scan={args.scan or 'approved queue'} "
+              f"confirmed={overall['confirmed']} unknown={overall['unknown']} "
+              f"needs_manual={overall['needs_manual']} "
+              f"failed={overall['failed_before_submit']}")
+        for source, info in summaries.items():
+            print(f"  {source}: {info.get('status')} {info}")
+    return 0 if overall["confirmed"] or all(
+        info.get("status") == "empty" for info in summaries.values()
+    ) else 2
+
+
+def _run_status(config: AppConfig, args: argparse.Namespace) -> int:
+    from collections import Counter
+
+    from .multisource import resolve_source_account
+    from .providers import default_registry
+
+    track = args.track or _default_track(config)
+    selected_config, _track_info = _track_config(
+        config, track, profile_override=bool(args.profile),
+        search_override=bool(args.search),
+    )
+    profile = _profile(selected_config, effective_search(selected_config.load_search()))
+    store = Store(selected_config.db_path)
+    registry = default_registry()
+    sources = args.source or [source for source in registry.sources() if source != "dreamjob.ru"]
+    response: dict[str, Any] = {"track": track, "scan": args.scan or "", "sources": {}}
+    scan_counts: dict[str, dict[str, int]] = {}
+    if args.scan:
+        execution = store.execution(args.scan)
+        scan_counts = store.execution_counts(args.scan) if execution else {}
+        response["scan_status"] = {
+            "status": execution.get("status") if execution else "missing",
+            "reason": execution.get("reason") if execution else "",
+            "progress": execution.get("progress") if execution else {},
+            "confirmed": scan_counts,
+        }
+    for source in sources:
+        account = resolve_source_account(selected_config, profile, source)
+        rows = store.list_campaign_vacancies(
+            account, track, "all", 5000, source=source, scan_id=args.scan,
+        )
+        app_states = Counter(str(row.get("application_state") or "NOT_STARTED") for row in rows)
+        decisions = Counter(str(row.get("decision") or "UNDECIDED") for row in rows)
+        inbox = store.latest_sync(account, "hh.ru/messages" if source == "hh.ru" else source)
+        response["sources"][source] = {
+            "account": account,
+            "total": len(rows),
+            "approved": sum(row.get("review_state") == "APPROVED" for row in rows),
+            "ready": sum(
+                row.get("review_state") == "APPROVED"
+                and str(row.get("decision") or "").upper() == "APPLY"
+                and str(row.get("application_state") or "") == "READY_TO_APPLY"
+                for row in rows
+            ),
+            "review": sum(str(row.get("decision") or "").upper() == "REVIEW" for row in rows),
+            "decisions": dict(decisions),
+            "application_states": dict(app_states),
+            "confirmed": int(app_states.get("APPLIED_CONFIRMED", 0)
+                             + app_states.get("ALREADY_APPLIED", 0)),
+            "scan_confirmed": int((scan_counts.get(source) or {}).get("success", 0)),
+            "scan_unknown": int((scan_counts.get(source) or {}).get("unknown", 0)),
+            "unknown": int(app_states.get("UNKNOWN", 0)),
+            "needs_manual": sum(int(app_states.get(key, 0)) for key in (
+                "NEEDS_MANUAL", "NEEDS_FORM", "NEEDS_LETTER",
+            )),
+            "inbox": {
+                "status": (inbox or {}).get("status", "not_checked"),
+                "checked_at": (inbox or {}).get("created_at", ""),
+                "coverage": ("official HH read-only API; browser check may be needed"
+                             if source == "hh.ru" else
+                             "SQLite application history; incoming chats are not automated"),
+            },
+        }
+    if args.json:
+        print(json.dumps(response, ensure_ascii=False, indent=2))
+    else:
+        print(f"status: track={track} scan={args.scan or 'all queue'}")
+        if args.scan:
+            scan = response["scan_status"]
+            print(f"  scan: {scan['status']} · {scan['reason']}")
+        for source, info in response["sources"].items():
+            print(
+                f"  {source}: total={info['total']} approved={info['approved']} "
+                f"ready={info['ready']} review={info['review']} "
+                f"confirmed={info['confirmed']} unknown={info['unknown']} "
+                f"scan_confirmed={info.get('scan_confirmed', 0)} "
+                f"scan_unknown={info.get('scan_unknown', 0)} "
+                f"manual={info['needs_manual']} inbox={info['inbox']['status']}"
+            )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_parser().parse_args(raw_argv)
+    # ``go`` has a documented default window, but a resume without an
+    # explicit --days must keep the campaign's saved window.
+    args._days_explicit = any(
+        token == "--days" or token.startswith("--days=") for token in raw_argv
+    )
     config = _config(args)
 
     if args.command == "go":
@@ -1448,6 +2410,39 @@ def main(argv: list[str] | None = None) -> int:
                                profile=config.load_profile())
         print(f"session: {result.status} ({result.detail})")
         return 0 if result.status in {"confirmed", "valid-format"} else 1
+    if args.command == "status":
+        try:
+            return _run_status(config, args)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"status: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+    if args.command == "scan" and args.track:
+        try:
+            return _run_unified_scan(config, args)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"scan: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - CLI reports the exact failure type
+            print(f"scan: error ({type(exc).__name__}: {str(exc)[:240]})", file=sys.stderr)
+            return 3
+    if args.command == "review" and not args.input:
+        try:
+            return _run_review(config, args)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"review: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"review: error ({type(exc).__name__}: {str(exc)[:240]})", file=sys.stderr)
+            return 3
+    if args.command == "apply" and args.track and not args.input:
+        try:
+            return _run_apply_package(config, args)
+        except (ConfigError, ValueError, OSError) as exc:
+            print(f"apply: error ({str(exc)[:240]})", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001
+            print(f"apply: error ({type(exc).__name__}: {str(exc)[:240]})", file=sys.stderr)
+            return 3
     if args.command == "sources":
         from .multisource import queue_plan, scan_sources, source_status
         from .providers import default_registry
@@ -2063,6 +3058,8 @@ def main(argv: list[str] | None = None) -> int:
                         store, "default", args.track, selected, args.limit, run_id=dispatch_run_id,
                         allow_live=bool(args.allow_live), drivers=drivers,
                         accounts=accounts, source_limits=source_limits, registry=registry,
+                        scan_id=getattr(args, "scan", None),
+                        vacancy_ids=_split_action_ids(getattr(args, "id", [])),
                     )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -3488,6 +4485,10 @@ def main(argv: list[str] | None = None) -> int:
                   f"status={segment.status} items={segment.items}")
         return 0 if status in {"ok", "empty", "truncated"} else 2
     if args.command in {"plan", "apply"}:
+        if args.input is None:
+            print(f"{args.command}: --input is required in the legacy snapshot mode",
+                  file=sys.stderr)
+            return 2
         items = load_items(args.input)
         try:
             search = effective_search(config.load_search(), args.preset)

@@ -132,6 +132,7 @@ def _run_locked(config, args, main, store, registry, roster) -> int:
         # Saved CLI filters and target are stable; profile facts and mutable
         # defaults are loaded again and recorded in each cycle's effective report.
         values = dict(saved["args"])
+        days_explicit = bool(getattr(args, "_days_explicit", False))
         for field in ("query", "area", "salary_from", "remote", "preset", "pages",
                       "details_limit", "request_budget", "target_scope"):
             value = getattr(args, field, None)
@@ -147,9 +148,9 @@ def _run_locked(config, args, main, store, registry, roster) -> int:
             raise ValueError("days must be 1..365")
         # Daily freshness is an operator-controlled scan window, not a new
         # application campaign. Keep the target, receipts and source roster.
-        changed_days = args.days is not None and args.days != values.get("days")
+        changed_days = days_explicit and args.days != values.get("days")
         values.update(campaign_id=execution_id, max_cycles=args.max_cycles,
-                      days=(args.days if args.days is not None else values.get("days", 30)),
+                      days=(args.days if days_explicit else values.get("days", 30)),
                       queue_only=bool(getattr(args, "queue_only", False) or values.get("queue_only", False)),
                       visible=(args.visible if args.visible or args.headless else values.get("visible", False)))
         if changed_days:
