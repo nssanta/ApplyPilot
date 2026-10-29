@@ -168,6 +168,7 @@ cp examples/sources.toml private/config/sources.toml
 
 - [Быстрый старт](docs/QUICKSTART.md)
 - [Multi-Source](docs/MULTISOURCE.md)
+- [Опциональный MCP и HH chat](docs/MCP.md)
 - [Аккаунты и сессии](docs/ACCOUNTS.md)
 - [Архитектура](docs/ARCHITECTURE.md)
 - [Сборка Debian-пакета](packaging/README.md)
@@ -191,5 +192,5 @@ git diff --check
 
 Спасибо участникам, чьи изменения вошли в основной код проекта:
 
-- [@Vova4o](https://github.com/Vova4o) — контур сопроводительных писем на подтверждённых фактах и улучшения надёжности откликов ([PR #1](https://github.com/nssanta/ApplyPilot/pull/1)).
+- [@Vova4o](https://github.com/Vova4o) — контур сопроводительных писем на подтверждённых фактах и улучшения надёжности откликов ([PR #1](https://github.com/nssanta/ApplyPilot/pull/1)); опциональный MCP и безопасный HH chat адаптированы из [PR #4](https://github.com/nssanta/ApplyPilot/pull/4).
 - [@artemius125](https://github.com/artemius125) — LLM-скрининг вакансий, локальная веб-админка, треки, watcher/packaging и основа hardening-прохода ([PR #3](https://github.com/nssanta/ApplyPilot/pull/3); заменил PR #2).

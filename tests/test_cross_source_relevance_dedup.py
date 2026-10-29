@@ -93,3 +93,31 @@ def test_hh_reposted_near_duplicate_with_new_id_is_not_sent_twice(tmp_path: Path
     assert match and match["source"] == "hh.ru"
     assert match["vacancy_id"] == "hh-original"
     assert store.approved_campaign_items("hh-account", "ai") == []
+
+
+def test_same_description_with_different_role_is_not_a_duplicate(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    _save(store, "hh.ru", "hh-account", "hh-1", AI_DESCRIPTION, "Example Labs")
+    assert store.record_manual_application("hh-account", "hh.ru", "hh-1")
+    assert store.cross_source_attempt_conflict(
+        "career.habr.com", "habr-1", "Java backend engineer", AI_DESCRIPTION,
+    ) is None
+
+
+def test_unknown_attempt_also_blocks_a_reposted_near_duplicate(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    _save(store, "hh.ru", "hh-account", "hh-original", AI_DESCRIPTION, "Example Studio")
+    store.record(
+        {"id": "hh-original", "name": TITLE, "company": "Example Studio"},
+        "unknown", note="ambiguous submit", account="hh-account",
+    )
+    _save(store, "hh.ru", "hh-account", "hh-repost", AI_DESCRIPTION, "EXAMPLE STUDIO")
+    store.set_review_state(
+        "hh-account", "hh.ru", "hh-repost", "APPROVED", reason="approved", track="ai",
+    )
+    match = store.cross_source_attempt_conflict(
+        "hh.ru", "hh-repost", TITLE, AI_DESCRIPTION,
+    )
+    assert match and match["vacancy_id"] == "hh-original"
+    assert match["status"] == "UNKNOWN"
+    assert store.approved_campaign_items("hh-account", "ai") == []

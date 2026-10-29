@@ -466,6 +466,30 @@ class Store:
         return {**dict(row), "spec": json.loads(row["spec_json"]),
                 "progress": json.loads(row["progress_json"])}
 
+    def recent_executions(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Read-only list of scan/apply execution IDs without changing the ledger."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT execution_id,status,reason,progress_json,created_at,updated_at
+                   FROM execution_campaigns ORDER BY created_at DESC, rowid DESC LIMIT ?""",
+                (max(1, min(100, int(limit))),),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                progress = json.loads(row["progress_json"] or "{}")
+            except (TypeError, ValueError):
+                progress = {}
+            result.append({
+                "scan_id": str(row["execution_id"]),
+                "status": str(row["status"]),
+                "reason": str(row["reason"]),
+                "progress": progress if isinstance(progress, dict) else {},
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            })
+        return result
+
     def create_execution(self, execution_id: str, spec: dict[str, Any]) -> None:
         with self.connect() as conn:
             conn.execute("INSERT INTO execution_campaigns "
@@ -1766,6 +1790,20 @@ class Store:
         params.append(max(1, min(5000, int(limit))))
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def source_attempt(self, account: str, source: str, vacancy_id: str,
+                       track: str | None = None) -> dict[str, Any] | None:
+        """Latest source-aware attempt for one vacancy, if any."""
+        query = """SELECT * FROM source_application_attempts
+                   WHERE account=? AND source=? AND vacancy_id=?"""
+        params: list[Any] = [str(account), str(source), str(vacancy_id)]
+        if track:
+            query += " AND track=?"
+            params.append(str(track))
+        query += " ORDER BY updated_at DESC LIMIT 1"
+        with self.connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return dict(row) if row else None
 
     def start_campaign(self, campaign_id: str, account: str, track: str,
                        config: dict[str, Any], source: str = "hh.ru") -> str:

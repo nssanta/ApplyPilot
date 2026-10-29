@@ -52,6 +52,10 @@
 | `autoapply.py` | браузерная отправка одного отклика и классификация результата |
 | `negotiations.py` | read-only синхронизация статусов откликов HH |
 | `inbox.py` | bounded read-only чтение HH chats/messages через OAuth API; без отправки и read-mark |
+| `hh_chat.py` | opt-in чтение и один проверенный ответ в HH-чате через существующий Chrome; отдельный at-most-once журнал |
+| `chat_safety.py` | binding thread/vacancy/company/inbound и fingerprint последнего входящего сообщения |
+| `chat_journal.py` | приватный `chat-replies.sqlite3`: резерв до клика, `sent/unknown/stale`, запрет повтора |
+| `mcp_server.py` | необязательный local-stdio MCP-адаптер к scan/review/apply/status и HH chat |
 | `cover_letters.py` | выбор режима off/template/llm и строгий локальный шаблон |
 | `letters.py` | генератор индивидуального письма через OpenAI-compatible API |
 | `llm.py` | совместимый OpenRouter-путь писем и bounded rerank |
@@ -370,6 +374,27 @@ PDF/DOCX автоматически не парсятся.
 
 Отправка сообщений не входит в read-only CLI. Отдельный рабочий путь — авторизованный интерфейс HH: прочитать диалог, подготовить черновик, получить согласование точного текста, отправить и проверить сообщение в нужном чате. Операционный порядок хранится в локальной стартовой инструкции; отсутствие CLI отправки не запрещает этот браузерный путь.
 
+### Optional MCP adapter
+
+`mcp_server.py` — тонкая обёртка над существующим CLI. Она не добавляет второй
+сканер, очередь или кликер: `scan`, `review`, `apply` и `status` вызываются как
+обычные команды, а `vacancy_detail`/`application_status` читают тот же SQLite.
+Транспорт только локальный stdio; HTTP endpoint не открывается. Изменяющие
+инструменты требуют `confirm=true`, live apply — ещё и стартовый
+`--enable-apply`, chat send — `--enable-chat-send`. MCP не обходит reviewed-
+профиль, policy, свежесть sync, выбранное резюме, APPROVED-пакет и карантин
+`UNKNOWN`. Подробности в [MCP](MCP.md).
+
+### HH chat follow-up
+
+`hh_chat.py` использует тот же persistent Chrome и `hh_session.json`, что и
+apply. `chat_safety.py` принимает ответ только при совпадении `thread_id`,
+`vacancy_id`, работодателя и fingerprint последнего входящего сообщения.
+`chat_journal.py` хранит резерв в отдельном `private/data/chat-replies.sqlite3`;
+`submitting` после падения читается как `unknown` и блокирует повтор. Успех —
+только новое исходящее сообщение с точным текстом после предыдущей границы ID.
+Основной ledger откликов и его формат не меняются.
+
 `execution.py` оркестрирует `go`. `execution_campaigns` хранит сохранённый набор CLI-параметров, область цели и checkpoints; `execution_runs` связывает кампанию с конкретными HH/нативными отправителями до первого submit. Подтверждения пересчитываются из `run_items` / `source_application_attempts`, поэтому исторические отправки не попадают в новую цель, а прерывание до записи JSON-отчёта не теряет прогресс. Одновременные `go` сериализуются отдельным process lock. Возобновление использует сохранённые CLI-параметры и доступные сейчас разрешения. Факты профиля и изменяемые локальные настройки перечитываются; эффективные условия каждого цикла сохраняются в его отчёте.
 
 Полнота discovery и состояние очереди различаются. После завершённого поиска `--queue-only` позволяет дозагрузить описания и продолжить отправки без повторного обхода тех же страниц. `refresh_queue` пересчитывает автоматические оценки, сохраняя явные решения владельца и историю попыток. Неопубликованная зарплата регулируется настройками; отсутствие описания остаётся REVIEW, а не доказанным несоответствием.
@@ -433,6 +458,10 @@ PDF/DOCX автоматически не парсятся.
 | `inbox sync` | HH API, GET only | OAuth bearer token | нет |
 | `apply --dry-run` | нет | нет | нет |
 | `apply --run` | HH через Playwright | да | **да** |
+| MCP read tools | локальный SQLite; `chat_*` — HH | для чата нужна сессия | нет |
+| MCP `scan` / `review_decide` | как одноимённый CLI | как CLI | нет |
+| MCP `apply` | как `apply --run` | как CLI | **да, при opt-in** |
+| MCP `chat_send` | HH chat | да | **да, только сообщение** |
 | `queue apply --dry-run` | нет | нет | нет |
 | `queue apply --run` | HH через Playwright | да | **да** |
 | `run campaign --apply --allow-live` | Выбранные источники | по драйверу | **да** |
