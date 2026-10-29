@@ -22,9 +22,56 @@ LOGGER = logging.getLogger(__name__)
 _MAX_VISIBLE_MESSAGES = 400
 _MAX_RETURNED_MESSAGES = 100
 
+# HH currently emits Magritte-style classes on the iframe message wrapper and
+# its descendants.  Older builds used BEM-style names.  Only positive markers
+# are accepted; a message with both kinds or no marker remains ``unknown``.
+_OUTBOUND_MARKERS = {
+    "magritte-outgoing",
+    "magritte-tail-outgoing",
+    "message-my",
+    "message_my",
+    "message-text-outgoing",
+    "chat-bubble_outgoing",
+}
+_INBOUND_MARKERS = {
+    "magritte-with-avatar",
+    "chat-bubble-avatar",
+    "chat-bubble-label",
+    "message-with-avatar-space",
+    "chat-bubble_bot",
+    "chat-bubble_with-left-tail",
+}
+
 
 class ChatUnavailable(RuntimeError):
     pass
+
+
+def _class_bases(classes: str) -> set[str]:
+    """Strip Magritte/BEM hash suffixes from a concatenated class attribute."""
+    result: set[str] = set()
+    for token in str(classes or "").split():
+        if not token:
+            continue
+        result.add(re.split(r"___|--", token, maxsplit=1)[0])
+    return result
+
+
+def message_direction(classes: str) -> str:
+    """Classify one observed message without guessing from order or text.
+
+    Outgoing and inbound markers must be mutually exclusive.  Unknown/ambiguous
+    classes stay ``unknown`` so ``latest_inbound_key`` remains ``None`` and the
+    reply path stays blocked.
+    """
+    bases = _class_bases(classes)
+    outbound = bool(bases & _OUTBOUND_MARKERS)
+    inbound = bool(bases & _INBOUND_MARKERS)
+    if outbound and not inbound:
+        return "outbound"
+    if inbound and not outbound:
+        return "inbound"
+    return "unknown"
 
 
 def clean_company(value: str) -> str:
@@ -159,12 +206,7 @@ def read_frame(frame) -> dict:
             '(node) => [node, ...node.querySelectorAll("[class]")]'
             '.map(n => String(n.className)).join(" ")'
         )
-        if "chat-bubble_outgoing--" in classes or "message_my--" in classes:
-            direction = "outbound"
-        elif "chat-bubble_bot--" in classes or "chat-bubble_with-left-tail--" in classes:
-            direction = "inbound"
-        else:
-            direction = "unknown"
+        direction = message_direction(classes)
         text = root.locator('[data-qa="chat-bubble-text"]').first
         value = text.inner_text() if text.count() else ""
         messages.append({"id": match.group(1), "direction": direction, "text": value})

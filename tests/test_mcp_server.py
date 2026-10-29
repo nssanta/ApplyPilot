@@ -7,7 +7,7 @@ import pytest
 
 from applypilot.chat_journal import ChatJournal
 from applypilot.config import AppConfig
-from applypilot.mcp_server import Service, main
+from applypilot.mcp_server import Service, bounded, main
 from applypilot.storage import Store
 
 
@@ -32,6 +32,40 @@ def service(config: AppConfig, monkeypatch) -> Service:
     return service
 
 
+def _track_repo(tmp_path: Path) -> AppConfig:
+    root = tmp_path / "track-repo"
+    config_dir = root / "private" / "config"
+    config_dir.mkdir(parents=True)
+    tracks = []
+    for key in ("ai", "backend", "ai_core"):
+        tracks.append(
+            f'[[track]]\nkey = "{key}"\nlabel = "{key}"\ntype = "ai"\n'
+            f'profile = "private/config/profile-{key}.toml"\n'
+            f'search = "private/config/search-{key}.toml"\n'
+            f'resume = "{key} fallback"\n'
+        )
+        (config_dir / f"profile-{key}.toml").write_text(
+            f'account = "account-{key}"\nreviewed = true\n'
+            f'[resumes]\n{key}_resume = "{key} resume"\n'
+            '[cover_letter]\nmode = "off"\n',
+            encoding="utf-8",
+        )
+        (config_dir / f"search-{key}.toml").write_text(
+            f'queries = ["{key} query"]\nresume_key = "{key}_resume"\n'
+            'days = 3\n',
+            encoding="utf-8",
+        )
+    (config_dir / "tracks.toml").write_text("\n".join(tracks), encoding="utf-8")
+    data_dir = root / "private" / "data"
+    data_dir.mkdir(parents=True)
+    return AppConfig(
+        root,
+        data_dir,
+        config_dir / "profile-global.toml",
+        config_dir / "search-global.toml",
+    )
+
+
 def _store(config: AppConfig, *, status: str = "NOT_STARTED") -> Store:
     store = Store(config.db_path)
     store.start_campaign("campaign-1", "default", "ai", {}, source="hh.ru")
@@ -51,6 +85,129 @@ def _store(config: AppConfig, *, status: str = "NOT_STARTED") -> Store:
             "unknown", account="default",
         )
     return store
+
+
+def test_bounded_preserves_deep_status_and_queue_structure():
+    payload = {
+        "sources": {
+            "hh.ru": {
+                "decisions": {"APPLY": 4, "REVIEW": 7},
+                "application_states": {
+                    "READY_TO_APPLY": 3,
+                    "UNKNOWN": 1,
+                    "NEEDS_LETTER": 2,
+                },
+                "inbox": {"status": "ok", "coverage": "partial"},
+            },
+        },
+        "items": [{
+            "id": "1",
+            "warnings": ["salary unknown", "grade ambiguous"],
+            "admit_reasons": ["python", "llm"],
+            "counts": {"nested": {"confirmed": 2, "unknown": 1}},
+        }],
+    }
+    for _ in range(8):
+        payload = {"level": payload}
+    result = bounded(payload)
+    cursor = result
+    for _ in range(8):
+        cursor = cursor["level"]
+    assert cursor["sources"]["hh.ru"]["decisions"] == {"APPLY": 4, "REVIEW": 7}
+    assert cursor["sources"]["hh.ru"]["application_states"]["READY_TO_APPLY"] == 3
+    assert cursor["items"][0]["warnings"] == ["salary unknown", "grade ambiguous"]
+    assert cursor["items"][0]["admit_reasons"] == ["python", "llm"]
+    assert cursor["items"][0]["counts"]["nested"]["confirmed"] == 2
+    json.dumps(result, ensure_ascii=False)
+
+
+def test_bounded_truncation_is_deterministic_and_json_safe():
+    value = {"text": "x" * 13000, "items": list(range(600))}
+    first = bounded(value)
+    second = bounded(value)
+    assert first == second
+    assert len(first["text"]) == 12000
+    assert len(first["items"]) == 500
+    assert first["items"][0] == 0 and first["items"][-1] == 499
+    json.dumps(first, ensure_ascii=False)
+
+
+def test_bounded_falls_back_to_smaller_limits_for_large_payloads():
+    result = bounded({"items": ["x" * 12000 for _ in range(500)]})
+    assert len(result["items"]) == 100
+    assert len(result["items"][0]) == 4000
+    assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) < 2_000_000
+
+
+def test_bounded_cycle_does_not_break_serialization():
+    value = {"name": "root"}
+    value["self"] = value
+    result = bounded(value)
+    assert result["name"] == "root"
+    assert result["self"] == "[cyclic]"
+    json.dumps(result, ensure_ascii=False)
+
+
+def test_json_command_keeps_nested_status_payload(service: Service, monkeypatch):
+    payload = {
+        "sources": {"hh.ru": {"decisions": {"APPLY": 1}, "application_states": {
+            "READY_TO_APPLY": 1,
+        }}},
+        "scan_status": {"confirmed": {"hh.ru": {"success": 1}}},
+    }
+    monkeypatch.setattr(service, "_execute", lambda argv, timeout=None: {
+        "exit_code": 0, "timed_out": False,
+        "stdout": json.dumps(payload), "stderr": "",
+    })
+    result = service._json_command(["status"])
+    assert result["data"]["sources"]["hh.ru"]["decisions"] == {"APPLY": 1}
+    assert result["data"]["scan_status"]["confirmed"]["hh.ru"]["success"] == 1
+
+
+def test_track_context_selects_profile_search_resume_and_account(tmp_path: Path):
+    config = _track_repo(tmp_path)
+    service = Service(config)
+    for key in ("ai", "backend", "ai_core"):
+        selected, _info, search, profile = service._track(key)
+        assert selected.profile_path == config.root / f"private/config/profile-{key}.toml"
+        assert selected.search_path == config.root / f"private/config/search-{key}.toml"
+        assert search["queries"] == [f"{key} query"]
+        assert profile["account"] == f"account-{key}"
+        assert profile["resume"] == f"{key} resume"
+
+
+def test_default_command_does_not_override_track_paths(tmp_path: Path, monkeypatch):
+    config = _track_repo(tmp_path)
+    service = Service(config)
+    captured = []
+
+    def fake_execute(argv, timeout=None):
+        captured.append(service._command(argv))
+        return {
+            "exit_code": 0, "timed_out": False,
+            "stdout": json.dumps({"ok": True, "counts": {"confirmed": 0}}),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(service, "_execute", fake_execute)
+    service.status("ai")
+    service.apply_dry_run("backend", ["123"])
+    service.enable_apply = True
+    service.apply("ai_core", ["456"], confirm=True)
+    for command in captured:
+        assert "--profile" not in command
+        assert "--search" not in command
+        assert "--track" in command
+    assert any("--dry-run" in command for command in captured)
+    assert any("--run" in command for command in captured)
+
+
+def test_explicit_profile_and_search_overrides_are_forwarded(tmp_path: Path):
+    config = _track_repo(tmp_path)
+    service = Service(config, profile_override=True, search_override=True)
+    command = service._command(["status", "--track", "ai"])
+    assert "--profile" in command and str(config.profile_path) in command
+    assert "--search" in command and str(config.search_path) in command
 
 
 def test_capabilities_are_fail_closed(service: Service):

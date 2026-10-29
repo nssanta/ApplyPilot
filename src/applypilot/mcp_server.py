@@ -41,22 +41,71 @@ _PUBLIC_FIELDS = (
 )
 
 
-def bounded(value: Any, depth: int = 0) -> Any:
-    """Bound nested data before returning it through an MCP tool."""
-    if depth > 4:
-        return None
+def _bounded_copy(value: Any, max_string: int, max_items: int,
+                  seen: set[int]) -> Any:
+    """Copy JSON-like data without changing shape at arbitrary depth.
+
+    Depth is not a limit: status counters, warning lists and nested decision
+    maps are useful precisely when they are several levels deep.  Size is
+    controlled by predictable string/list/dict limits instead.
+    """
     if isinstance(value, str):
-        return value[:12000]
+        return value[:max_string]
     if isinstance(value, dict):
-        return {
-            str(key)[:80]: bounded(item, depth + 1)
-            for key, item in list(value.items())[:60]
-        }
+        marker = id(value)
+        if marker in seen:
+            return "[cyclic]"
+        seen.add(marker)
+        try:
+            return {
+                str(key)[:200]: _bounded_copy(item, max_string, max_items, seen)
+                for key, item in list(value.items())[:max_items]
+            }
+        finally:
+            seen.discard(marker)
     if isinstance(value, (tuple, list)):
-        return [bounded(item, depth + 1) for item in value[:100]]
+        marker = id(value)
+        if marker in seen:
+            return "[cyclic]"
+        seen.add(marker)
+        try:
+            return [
+                _bounded_copy(item, max_string, max_items, seen)
+                for item in list(value)[:max_items]
+            ]
+        finally:
+            seen.discard(marker)
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)[:200]
+
+
+def _serialized_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return _MAX_RESULT_BYTES + 1
+
+
+def bounded(value: Any, *, max_string: int = 12000,
+            max_items: int = 500) -> Any:
+    """Bound payloads by content, preserving nested structure and semantics.
+
+    The first pass keeps every useful nested map/list.  Only if the serialized
+    payload exceeds the transport budget are progressively smaller string/list
+    limits applied; the same input always produces the same truncation.
+    """
+    result = _bounded_copy(value, max_string, max_items, set())
+    for string_limit, item_limit in (
+        (max_string, max_items),
+        (4000, 100),
+        (1000, 25),
+        (300, 10),
+    ):
+        if _serialized_size(result) <= _MAX_RESULT_BYTES:
+            return result
+        result = _bounded_copy(value, string_limit, item_limit, set())
+    return result
 
 
 def _number(value: Any, low: int, high: int, name: str) -> int:
@@ -162,12 +211,17 @@ class Service:
         return ["--preset", self.preset] if self.preset else []
 
     def _command(self, argv: list[str]) -> list[str]:
+        # AppConfig.discover() always populates these paths, but the CLI treats
+        # any ``--profile/--search`` value as an explicit override.  Passing the
+        # defaults here would silently replace the selected track's own
+        # profile-ai.toml/search-ai-unified-broad.toml with global files.
         result = [
             sys.executable, "-m", "applypilot",
             "--data-dir", str(self.config.data_dir),
-            "--profile", str(self.config.profile_path),
         ]
-        if self.config.search_path:
+        if self.profile_override:
+            result.extend(["--profile", str(self.config.profile_path)])
+        if self.search_override and self.config.search_path:
             result.extend(["--search", str(self.config.search_path)])
         result.extend(argv)
         return result

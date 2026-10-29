@@ -1,8 +1,11 @@
+import re
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from bs4 import BeautifulSoup
 
 from applypilot import hh_chat
 from applypilot.chat_journal import ChatJournal
@@ -146,6 +149,35 @@ def test_dry_run_rejects_changed_binding(monkeypatch, browser):
 ])
 def test_exact_chat_origin(url):
     assert hh_chat.frame_thread(url) is None
+
+
+def test_real_dom_wrapper_classes_classify_without_private_text():
+    fixture = Path(__file__).parent / "fixtures" / "hh_chat_anonymized.html"
+    soup = BeautifulSoup(fixture.read_text(encoding="utf-8"), "html.parser")
+    directions = []
+    for node in soup.select('[data-qa^="chatik-chat-message-"]'):
+        qa = node.get("data-qa") or ""
+        if not re.fullmatch(r"chatik-chat-message-[0-9]+", qa):
+            continue
+        classes = " ".join(
+            " ".join(item.get("class") or [])
+            for item in [node, *node.select("[class]")]
+        )
+        directions.append(hh_chat.message_direction(classes))
+    assert directions == ["inbound", "outbound", "inbound"]
+
+
+def test_message_direction_is_positive_and_ambiguous_is_unknown():
+    assert hh_chat.message_direction(
+        "magritte-message___x magritte-outgoing___x message-my--x"
+    ) == "outbound"
+    assert hh_chat.message_direction(
+        "magritte-message___x magritte-with-avatar___x chat-bubble-label___x"
+    ) == "inbound"
+    assert hh_chat.message_direction("magritte-message___x") == "unknown"
+    assert hh_chat.message_direction(
+        "magritte-outgoing___x magritte-with-avatar___x"
+    ) == "unknown"
 
 
 def test_virtual_scroll_is_bounded():
