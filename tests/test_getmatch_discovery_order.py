@@ -190,3 +190,41 @@ def test_telegram_priority_links_do_not_replace_sitemap_coverage(
     assert requested.count("https://getmatch.ru/vacancies/100-ai-agent-engineer") == 1
     assert "https://getmatch.ru/vacancies/200-python-developer" in requested
     assert [segment.query for segment in segments] == ["detail_urls", "sitemap", "details"]
+
+
+def test_many_telegram_links_leave_sitemap_detail_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sitemap = _sitemap("https://getmatch.ru/vacancies/900-ai-agent-engineer")
+    requested: list[str] = []
+
+    def fake_fetch(_filters: object, url: str, _timeout: float):
+        requested.append(url)
+        if url.endswith("/sitemap.xml"):
+            return sitemap, "ok", "", 1
+        html = (
+            "<html><body><h1>AI Agent Engineer</h1>"
+            + "<div class='vacancy-description'>Python and agents</div></body></html>"
+        )
+        return html, "ok", "", 1
+
+    monkeypatch.setattr(getmatch_module, "_fetch", fake_fetch)
+    filters = {
+        "detail_urls": [
+            f"https://getmatch.ru/vacancies/{i}-python-developer"
+            for i in range(100, 110)
+        ],
+        "include_sitemap": True,
+        "sitemap_url": "https://getmatch.ru/sitemap.xml",
+        "state_path": str(tmp_path / "sitemap.json"),
+        "telegram_state_path": str(tmp_path / "telegram.json"),
+        "primary_role_terms": ["agent"],
+        "details_limit": 6,
+        "request_budget": 12,
+    }
+    items, segments = GetMatchProvider().discover(filters)
+    assert "900" in {item["native_id"] for item in items}
+    assert sum("/vacancies/" in url for url in requested) <= 6
+    assert [segment.query for segment in segments] == [
+        "detail_urls", "sitemap", "details",
+    ]

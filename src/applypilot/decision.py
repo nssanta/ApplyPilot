@@ -327,7 +327,19 @@ def decide_row(
     if state in WORKFLOW_STATES:
         return Decision("BLOCKED", f"workflow_{state.casefold()}",
                         f"vacancy is in {state}; resolve the workflow first")
-    if review_state == "APPROVED" and row.get("review_reason") != AUTO_APPROVAL_REASON:
+    review_reason = str(row.get("review_reason") or "")
+    superseded_bulk_approval = False
+    for pattern in search.get("superseded_bulk_approval_patterns", []):
+        try:
+            if re.search(str(pattern), review_reason, re.IGNORECASE):
+                superseded_bulk_approval = True
+                break
+        except re.error:
+            # A malformed guard cannot silently preserve stale blanket consent.
+            superseded_bulk_approval = True
+            break
+    if (review_state == "APPROVED" and review_reason != AUTO_APPROVAL_REASON
+            and not superseded_bulk_approval):
         if state == "READY_TO_APPLY":
             return Decision("APPLY", "owner_approved", "owner approval is valid for this track")
         return Decision("REVIEW", "approved_without_ready",
@@ -346,6 +358,12 @@ def decide_row(
     if not title_eligible:
         return Decision("REVIEW", "title_requires_manual_role_review",
                         "title gate did not accept this role automatically")
+
+    # Discovery stays broad while automatic sends need stronger evidence.
+    minimum = int(search.get("auto_apply_min_score") or 0)
+    if minimum and int(row.get("score") or 0) < minimum:
+        return Decision("REVIEW", "score_requires_manual_review",
+                        f"score below automatic threshold ({minimum})")
 
     problems = [str(value) for value in row.get("problems", []) if str(value).strip()]
     resolved: list[str] = []

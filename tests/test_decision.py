@@ -249,3 +249,20 @@ def test_single_set_review_state_cannot_approve_a_rejected_score(tmp_path: Path)
         store.set_review_state(
             "account", "hh.ru", "bad", "APPROVED", reason="mistake", track="ai_core",
         )
+
+
+def test_repeated_unchanged_decision_is_reported_as_stagnant(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.save_campaign_items(
+        "campaign", "account", "ai_core", [_item("stuck")],
+        status="ok", snapshot_path="x.json",
+    )
+    for _ in range(3):
+        store.set_track_decision(
+            "account", "hh.ru", "stuck", "ai_core", "REVIEW",
+            "needs_evidence: remote format is not verified",
+        )
+    rows = store.list_campaign_vacancies("account", "ai_core", "all", 10)
+    assert rows[0]["decision_streak"] == 2
+    stagnant = store.stagnant_vacancies("account", "ai_core", min_streak=2)
+    assert [row["vacancy_id"] for row in stagnant] == ["stuck"]

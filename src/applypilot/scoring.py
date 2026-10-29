@@ -144,6 +144,19 @@ def _title_term_present(term: str, title: str) -> bool:
     return f" {normalized} " in f" {title} "
 
 
+def _configured_review_pattern_hit(patterns: Iterable[str], value: str) -> bool:
+    """A broken private guard must never silently authorize an automatic send."""
+    for pattern in patterns:
+        if not str(pattern).strip():
+            continue
+        try:
+            if re.search(str(pattern), value, re.IGNORECASE):
+                return True
+        except re.error:
+            return True
+    return False
+
+
 def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
                               skills: Iterable[str] | None = None) -> bool:
     """Apply an optional private title gate before automatically approving a FIT.
@@ -164,6 +177,15 @@ def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
     title = re.sub(
         r"\s+", " ", re.sub(r"[^\w]+", " ", raw_title),
     ).strip()
+    if _configured_review_pattern_hit(search.get("auto_apply_review_title_patterns", []), raw_title):
+        return False
+    # HH descriptions may be HTML; evaluate requirements on visible text.
+    description = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
+    description = re.sub(r"\s+", " ", description)
+    if _configured_review_pattern_hit(
+        search.get("auto_apply_review_description_patterns", []), description,
+    ):
+        return False
     if not terms:
         return True
 

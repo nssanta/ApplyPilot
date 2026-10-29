@@ -209,3 +209,62 @@ def test_scan_only_continues_pages_and_never_enables_apply(tmp_path):
 
     assert run_go(cfg, args('--track', 'first', '--sources', 'hh.ru', '--scan-only'), main) == 0
     assert len(calls) == 2
+
+
+def test_go_queue_only_preserves_prechecked_batch_and_resume(tmp_path):
+    cfg = config(tmp_path)
+    main, calls, sent = fake_runner(cfg, interrupted=True)
+    with pytest.raises(KeyboardInterrupt):
+        run_go(cfg, args('--track', 'first', '--sources', 'hh.ru', '--target', '4',
+                         '--limit', '3', '--target-scope', 'total', '--queue-only'), main)
+    store = Store(cfg.db_path)
+    with store.connect() as conn:
+        execution_id = conn.execute('SELECT execution_id FROM execution_campaigns').fetchone()[0]
+    assert calls[0].queue_only is True
+    assert run_go(cfg, args('--campaign-id', execution_id, '--queue-only'), main) == 0
+    assert len(sent) == 4
+    assert len(calls) == 2 and all(call.queue_only for call in calls)
+
+
+def test_go_queue_only_cannot_be_combined_with_scan_only(tmp_path):
+    cfg = config(tmp_path)
+    with pytest.raises(ValueError, match='incompatible'):
+        run_go(cfg, args('--track', 'first', '--sources', 'hh.ru',
+                         '--queue-only', '--scan-only'), lambda _: pytest.fail('must not run'))
+
+
+def _ready_item(vacancy_id: str) -> dict:
+    return {
+        "id": vacancy_id, "name": "AI/LLM Engineer", "company": "Example",
+        "url": f"https://hh.ru/vacancy/{vacancy_id}",
+        "description": "Build LLM agents with Python.", "description_status": "ok",
+        "score": 80, "score_decision": "pass", "filter_status": "pass",
+        "review_lane": "FIT", "problems": [], "filter_reasons": [],
+        "auto_apply_eligible": True, "resume": "AI Engineer",
+    }
+
+
+def test_ready_queue_is_sent_before_any_new_scan(tmp_path):
+    cfg = config(tmp_path)
+    store = Store(cfg.db_path)
+    store.start_campaign("seed", "example", "first", {"query": "AI"})
+    store.save_campaign_items(
+        "seed", "example", "first", [_ready_item("ready-1")],
+        status="ok", snapshot_path="seed.json",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE vacancies SET application_state='READY_TO_APPLY' "
+            "WHERE account='example' AND source='hh.ru' AND vacancy_id='ready-1'"
+        )
+        conn.execute(
+            "UPDATE vacancy_track_scores SET review_state='APPROVED',"
+            "review_reason='owner approved',decision='APPLY' "
+            "WHERE account='example' AND source='hh.ru' AND vacancy_id='ready-1'"
+        )
+    main, calls, _ = fake_runner(cfg)
+    assert run_go(cfg, args("--track", "first", "--sources", "hh.ru",
+                            "--target", "1", "--target-scope", "total", "--once"),
+                  main) == 0
+    assert calls[0].queue_only is True
+    assert len(calls) == 1

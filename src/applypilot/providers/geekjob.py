@@ -21,6 +21,7 @@ from .base import (
     SourceCapabilities,
     canonical_url,
     clean_text,
+    deadline_expired,
     job_group_key,
     make_item,
     parse_iso_datetime,
@@ -396,6 +397,13 @@ class GeekJobProvider:
 
         page_window_exhausted = True
         for page in range(start_page, start_page + max_pages):
+            if deadline_expired(filters):
+                segments.append(segment(
+                    "geekjob", status="truncated", error="pass time budget reached",
+                    pages=page - 1,
+                ))
+                page_window_exhausted = False
+                break
             if fixture_mode:
                 path = _list_fixture(filters, page)
                 if path is None:
@@ -623,6 +631,12 @@ class GeekJobProvider:
         cached_details = filters.get("known_descriptions") or {}
         for item in _prioritized(collected):
             if attempted >= max_details:
+                break
+            if deadline_expired(filters):
+                segments.append(segment(
+                    "detail", status="truncated", error="pass time budget reached",
+                    requests=attempted,
+                ))
                 break
             native_id = str(item.get("native_id") or "")
             if not native_id:

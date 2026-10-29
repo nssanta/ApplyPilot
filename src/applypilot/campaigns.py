@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -141,7 +142,8 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                  only_remote: bool | None = None, salary_from: int | None = None,
                  salary_currency: str | None = None, sort_mode: str = "newest",
                  track_resume: str = "", preset: str | None = None,
-                 start_pages: dict[str, int | None] | None = None) -> dict[str, Any]:
+                 start_pages: dict[str, int | None] | None = None,
+                 pass_seconds: float = 0) -> dict[str, Any]:
     """Запускает один bounded HH scan, сохраняет snapshot и актуализирует SQLite очередь."""
     if days < 1 or days > 365 or limit < 1 or limit > 100:
         raise ValueError("days must be 1-365 and limit must be 1-100")
@@ -287,6 +289,8 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
                     "date_from": spec["date_from"], "pause_seconds": 1.0,
                     "request_budget": remaining, "order_by": order_by,
                     "start_pages": start_pages or {},
+                    "deadline": (time.monotonic() + float(pass_seconds)
+                                 if pass_seconds and pass_seconds > 0 else None),
                 })
                 remaining -= sum(segment.requests for segment in group_segments)
                 for item in group_items:
@@ -337,7 +341,11 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
         for item in needs_full_description:
             if str(item.get("id") or "") not in candidate_ids:
                 item["description_status"] = "provisional"
-        enriched, detail_errors = enrich_items(enrichment_items, details, pause_seconds=1.0)
+        enriched, detail_errors = enrich_items(
+            enrichment_items, details, pause_seconds=1.0,
+            deadline=(time.monotonic() + float(pass_seconds)
+                      if pass_seconds and pass_seconds > 0 else None),
+        )
         enriched_by_id = {str(item.get("id") or ""): item for item in enriched}
         for item in all_items:
             fresh = enriched_by_id.get(str(item.get("id") or ""))

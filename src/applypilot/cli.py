@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import sys
 import time
 import uuid
@@ -166,6 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
     campaign.add_argument("--resume", action="store_true",
                           help="продолжить сохранённые страницы и sitemap cursors")
     campaign.add_argument("--max-passes", type=int, default=30)
+    campaign.add_argument("--pass-seconds", type=float, default=0,
+                          help="мягкий лимит времени одного прохода; 0 — без лимита")
+    campaign.add_argument("--source-retries", type=int, default=2)
+    campaign.add_argument("--retry-delay", type=float, default=5)
     campaign.add_argument("--apply", action="store_true", help="после сканирования выполнить live отправки")
     campaign.add_argument("--allow-live", action="store_true", help="обязательное явное подтверждение live режима")
     campaign_visibility = campaign.add_mutually_exclusive_group()
@@ -201,9 +206,21 @@ def build_parser() -> argparse.ArgumentParser:
     go.add_argument("--details-limit", type=int)
     go.add_argument("--max-passes", type=int, default=1,
                     help="порций поиска перед отправкой; продолжение — в следующих циклах")
+    go.add_argument("--pass-request-budget", type=int, default=40,
+                    help="максимум HTTP-запросов на один короткий проход источника")
+    go.add_argument("--pass-details-limit", type=int, default=20,
+                    help="максимум описаний на один короткий проход источника")
+    go.add_argument("--pass-seconds", type=float, default=240,
+                    help="мягкий лимит времени одного прохода; проверяется между операциями")
+    go.add_argument("--source-retries", type=int, default=2,
+                    help="повторы только временных ошибок одного источника")
+    go.add_argument("--retry-delay", type=float, default=5,
+                    help="пауза между повторами временной ошибки источника")
     go.add_argument("--max-cycles", type=int, default=100)
     go.add_argument("--scan-only", action="store_true",
                     help="только scan/decide, без live-отправок")
+    go.add_argument("--queue-only", action="store_true",
+                    help="не сканировать заново; отправлять только уже проверенную READY-очередь")
     go.add_argument("--once", action="store_true",
                     help="один цикл вместо until-exhausted")
     go_visibility = go.add_mutually_exclusive_group()
@@ -260,6 +277,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue_stats.add_argument("--track", required=True)
     queue_stats.add_argument("--source", help="источник; без флага — все источники трека")
     queue_stats.add_argument("--json", action="store_true")
+    queue_actions = queue_sub.add_parser(
+        "actions", help="показать следующее действие и зависшие без прогресса вакансии",
+    )
+    queue_actions.add_argument("--track", required=True)
+    queue_actions.add_argument("--source", help="источник; без флага — все источники трека")
+    queue_actions.add_argument("--min-streak", type=int, default=2)
+    queue_actions.add_argument("--limit", type=int, default=100)
+    queue_actions.add_argument("--json", action="store_true")
     queue_links = queue_sub.add_parser(
         "links", help="одна вакансия → все источники/зеркала, отклик и ответ",
     )
@@ -303,6 +328,13 @@ def build_parser() -> argparse.ArgumentParser:
     sources_status = sources_sub.add_parser("status", help="показать очередь и состояние источников")
     sources_status.add_argument("--track", required=True)
     sources_status.add_argument("--json", action="store_true")
+    sources_inbox = sources_sub.add_parser(
+        "inbox-status", help="показать доступный способ и охват проверки входящих",
+    )
+    sources_inbox.add_argument("--track", required=True)
+    sources_inbox.add_argument("--source", action="append",
+                               help="повторить для выбора нескольких источников")
+    sources_inbox.add_argument("--json", action="store_true")
     for action_name, action_help in (
         ("login", "открыть видимое окно ручной авторизации источника"),
         ("check", "проверить сохранённую сессию источника"),
@@ -751,6 +783,22 @@ def _profile(config: AppConfig, search: dict | None = None) -> dict:
             selected_resume = str(resumes.get(resume_key) or "").strip()
             profile["resume"] = selected_resume
     return profile
+
+
+def _permitted_hh_resumes(profile: dict, track_resume: str) -> set[str]:
+    """Allow reviewed per-role resumes only when the profile explicitly opts in."""
+    primary = str(profile.get("resume") or track_resume or "").strip()
+    if not primary:
+        return set()
+    permitted = {primary}
+    apply_policy = profile.get("apply") or {}
+    if profile.get("reviewed") is True and apply_policy.get("allow_profile_resumes") is True:
+        configured = profile.get("resumes") or {}
+        if isinstance(configured, dict):
+            permitted.update(
+                str(title).strip() for title in configured.values() if str(title).strip()
+            )
+    return permitted
 
 
 def _track_config(config: AppConfig, track: str, *, profile_override: bool = False,
@@ -1432,6 +1480,76 @@ def main(argv: list[str] | None = None) -> int:
                           f"reviewable={row.get('reviewable', 0)} approved={row['approved']} "
                           f"apply={row['capabilities']['apply_status']}")
             return 0
+        if args.sources_action == "inbox-status":
+            from collections import Counter
+
+            from .multisource import resolve_source_account
+
+            selected_config, _track_info = _track_config(
+                config, args.track, profile_override=bool(args.profile),
+                search_override=bool(args.search),
+            )
+            profile = _profile(selected_config, effective_search(selected_config.load_search()))
+            store = Store(selected_config.db_path)
+            sources = args.source or list(registry.sources())
+            rows = []
+            for source in sources:
+                account = resolve_source_account(selected_config, profile, source)
+                if source == "hh.ru":
+                    messages_sync = store.latest_sync(account, "hh.ru/messages")
+                    status_sync = store.latest_sync(account, "hh.ru")
+                    messages = store.inbox_messages(account)
+                    incoming = [m for m in messages
+                                if str(m.get("sender_type") or "") in {"recruiter", "bot"}]
+                    negotiations = store.negotiation_details(account)
+                    rows.append({
+                        "source": source,
+                        "account": account,
+                        "checked": bool(messages_sync and messages_sync.get("status") in {"ok", "partial"}),
+                        "checked_at": messages_sync.get("created_at") if messages_sync else "",
+                        "status": messages_sync.get("status") if messages_sync else "not_checked",
+                        "coverage": "official HH read-only API; one bounded page/chat window",
+                        "stored_incoming": len(incoming),
+                        "read_state_verified": False,
+                        "negotiation_statuses": dict(Counter(
+                            str(row.get("status") or "unknown") for row in negotiations.values()
+                        )),
+                        "negotiations_sync": status_sync,
+                    })
+                else:
+                    attempts = store.source_attempts(account, source, 500)
+                    rows.append({
+                        "source": source,
+                        "account": account,
+                        "checked": False,
+                        "checked_at": "",
+                        "status": "not_checked",
+                        "coverage": ("application history in SQLite is readable; "
+                                     "incoming chats require an authorized browser check"),
+                        "stored_attempts": len(attempts),
+                        "attempt_statuses": dict(Counter(
+                            str(row.get("status") or "unknown") for row in attempts
+                        )),
+                        "latest_attempt_at": max(
+                            (str(row.get("updated_at") or "") for row in attempts), default="",
+                        ),
+                    })
+            result = {"track": args.track, "sources": rows}
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    print(
+                        f"{row['source']}: checked={row['checked']} status={row['status']} "
+                        f"at={row['checked_at'] or '—'} · {row['coverage']}"
+                    )
+                    if row["source"] == "hh.ru":
+                        print(f"  incoming_stored={row['stored_incoming']} "
+                              f"unread_verified=false negotiations={row['negotiation_statuses']}")
+                    else:
+                        print(f"  attempts={row['stored_attempts']} "
+                              f"statuses={row['attempt_statuses']}")
+            return 0
         if args.sources_action in {"login", "check"}:
             from .multisource import resolve_source_account
             from .provider_sessions import ProviderSessionManager
@@ -1712,9 +1830,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"source dry-run: {args.source}; planned={plan['planned_count']} "
                       f"blocked={plan['blocked_count']} · apply={plan['apply_status']}")
                 for row in plan["planned"]:
-                    print(f"  PLAN {row['id']} · {row['name']} — {row['company']}")
+                    print(f"  PLAN {row['id']} · {row['name']} — {row['company']} "
+                          f"· next={row.get('next_action', 'send')}")
                 for row in plan["blocked"]:
-                    print(f"  BLOCKED {row['id']} · {row['reason']}")
+                    print(f"  BLOCKED {row['id']} · {row['reason']} "
+                          f"· next={row.get('next_action', 'review')}")
             return 0
         if args.sources_action in {"dispatch-plan", "dispatch-apply"}:
             selected_config, _track_info = _track_config(
@@ -2289,6 +2409,9 @@ def main(argv: list[str] | None = None) -> int:
                     max_passes=args.max_passes, pages=args.pages,
                     request_budget=args.request_budget, details_limit=args.details_limit,
                     limit=args.limit,
+                    pass_seconds=float(getattr(args, "pass_seconds", 0) or 0),
+                    source_retries=int(getattr(args, "source_retries", 2) or 0),
+                    retry_delay=float(getattr(args, "retry_delay", 5) or 0),
                     telegram_hints=("getmatch.ru" in selected), registry=registry,
                 ) if not args.queue_only else {
                     "sources": [{"source": source, "status": "ok", "items": 0,
@@ -2312,15 +2435,23 @@ def main(argv: list[str] | None = None) -> int:
 
                 refreshed = {}
                 approvals: dict[str, dict[str, Any]] = {}
-                for row in scanned["sources"]:
+
+                def _refresh_one(row: dict[str, Any]) -> None:
                     source = row["source"]
                     account = resolve_source_account(selected_config, profile, source)
                     print(f"campaign phase: rescore/enrich; source={source}", flush=True)
-                    refreshed[source] = refresh_queue(
-                        selected_config, args.track, profile, search, source,
-                        details_limit=(args.details_limit if args.details_limit is not None else
-                                       int(search.get("details_limit", 100))),
-                    )
+                    if args.queue_only:
+                        # A frozen approved shortlist must not spend minutes
+                        # enriching the entire historical queue or promote new
+                        # candidates before this dedicated send.
+                        refreshed[source] = {"rescored": 0, "needs_description": 0,
+                                             "detail_attempts": 0, "queue_only": True}
+                    else:
+                        refreshed[source] = refresh_queue(
+                            selected_config, args.track, profile, search, source,
+                            details_limit=(args.details_limit if args.details_limit is not None else
+                                           int(search.get("details_limit", 100))),
+                        )
                     if operating_policy.get("auto_approve", True):
                         approvals[source] = approve_scanned_fits(
                             store, account, args.track, source, row.get("candidate_ids", []),
@@ -2338,10 +2469,44 @@ def main(argv: list[str] | None = None) -> int:
                     # Re-evaluate the whole non-terminal track, not only IDs
                     # from this scan window.  Old READY/NOT_STARTED rows must
                     # not stay undecided for weeks.
-                    approvals[source]["sweep"] = sweep_track_decisions(
-                        store, account, args.track, source,
-                        search=search, profile=profile, policy=operating_policy,
+                    approvals[source]["sweep"] = (
+                        {"scanned": 0, "queue_only": True}
+                        if args.queue_only else sweep_track_decisions(
+                            store, account, args.track, source,
+                            search=search, profile=profile, policy=operating_policy,
+                        )
                     )
+
+                for row in scanned["sources"]:
+                    source = str(row.get("source") or "")
+                    try:
+                        _refresh_one(row)
+                    except KeyboardInterrupt:
+                        raise
+                    except sqlite3.Error as exc:
+                        from .multisource import CampaignFatalError
+
+                        raise CampaignFatalError(
+                            f"database failure while preparing {source}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    except Exception as exc:  # noqa: BLE001 - isolate source post-processing
+                        from .multisource import classify_source_error
+
+                        detail = f"{type(exc).__name__}: {str(exc)[:180]}"
+                        if classify_source_error(detail) == "blocked":
+                            stops[source] = f"source preparation failed: {detail}"
+                        else:
+                            refreshed.setdefault(source, {})
+                            refreshed[source].setdefault("errors", []).append(
+                                f"source preparation failed: {detail}"
+                            )
+                        approvals[source] = {
+                            "source": source, "requested": 0, "eligible": 0,
+                            "approved": 0, "blocked": {}, "error": detail,
+                        }
+                        print(f"campaign source preparation error: {source}: {detail}",
+                              file=sys.stderr)
                 live: dict[str, Any] = {}
                 if args.apply:
                     print(f"campaign phase: apply/verify; batch={args.limit}", flush=True)
@@ -2363,12 +2528,14 @@ def main(argv: list[str] | None = None) -> int:
                             if not prepared or input_path is None:
                                 live[source] = {"status": "no READY approved HH vacancies", "sent": 0}
                                 continue
-                            expected_resume = str(profile.get("resume") or track_info.get("resume") or "").strip()
-                            if not expected_resume or any(
-                                str(item.get("resume") or "").strip() != expected_resume
+                            permitted_resumes = _permitted_hh_resumes(
+                                profile, str(track_info.get("resume") or "")
+                            )
+                            if not permitted_resumes or any(
+                                str(item.get("resume") or "").strip() not in permitted_resumes
                                 for item in prepared
                             ):
-                                stops[source] = "live send blocked: exact track resume missing or mismatched"
+                                stops[source] = "live send blocked: resume not approved in reviewed profile"
                                 continue
                             run_id = uuid.uuid4().hex
                             store.execution_run(args.execution_id, run_id, source, args.track)
@@ -2415,15 +2582,28 @@ def main(argv: list[str] | None = None) -> int:
                             # gate as well; restore the caller's environment
                             # immediately after this isolated source dispatch.
                             os.environ["APPLYPILOT_TELEGRAM_LIVE"] = "1"
+                        dispatch_error = ""
                         try:
                             with redirect_stdout(capture):
                                 code = main(cmd)
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - isolate one source driver
+                            dispatch_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+                            code = 3
                         finally:
                             if source == "getmatch.ru":
                                 if previous_telegram_live is None:
                                     os.environ.pop("APPLYPILOT_TELEGRAM_LIVE", None)
                                 else:
                                     os.environ["APPLYPILOT_TELEGRAM_LIVE"] = previous_telegram_live
+                        if dispatch_error:
+                            live[source] = {
+                                "exit_code": code, "account": account,
+                                "dispatch": {"status": "source dispatch exception",
+                                             "error": dispatch_error},
+                            }
+                            continue
                         try:
                             dispatch_result = json.loads(capture.getvalue())
                         except json.JSONDecodeError:
@@ -2432,9 +2612,11 @@ def main(argv: list[str] | None = None) -> int:
                         live[source] = {"exit_code": code, "account": account,
                                         "dispatch": dispatch_result}
                 queue = {}
+                rows_by_source: dict[str, list[dict[str, Any]]] = {}
                 for source in selected:
                     account = resolve_source_account(selected_config, profile, source)
                     rows = store.list_campaign_vacancies(account, args.track, "all", None, source=source)
+                    rows_by_source[source] = rows
                     store.observe_execution(args.execution_id, account, source, args.track, rows)
                     queue[source] = {
                         "unique": len(rows),
@@ -2460,6 +2642,30 @@ def main(argv: list[str] | None = None) -> int:
                     "telegram_sync": telegram_sync,
                     "created_at": datetime.now(UTC).isoformat(),
                 }
+                from .execution import cycle_state
+                from .reporting import management_report
+
+                source_states = {
+                    source: cycle_state(report, source,
+                                        scan_only=bool(getattr(args, "scan_only", False)))
+                    for source in selected
+                }
+                report["source_states"] = source_states
+                execution_row = store.execution(args.execution_id) if args.execution_id else None
+                campaign_started_at = (
+                    execution_row.get("created_at") if execution_row else report["created_at"]
+                )
+                source_accounts = {
+                    source: resolve_source_account(selected_config, profile, source)
+                    for source in selected
+                }
+                report["management"] = management_report(
+                    store, track=args.track, sources=selected, accounts=source_accounts,
+                    execution_id=args.execution_id,
+                    campaign_started_at=str(campaign_started_at),
+                    states=source_states, scan=scanned, live=live, stops=stops,
+                    queue=queue, rows_by_source=rows_by_source,
+                )
                 report_path = _default_artifact(selected_config, "reports", "json")
                 _write_private_json(report_path, report)
                 os.chmod(report_path, 0o600)
@@ -2484,6 +2690,20 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 for source, reason in stops.items():
                     print(f"  STOP {source}: {reason}")
+                management = report.get("management") or {}
+                print(
+                    "  MANAGEMENT "
+                    f"new_confirmed={management.get('new_confirmed', 0)} "
+                    f"found={management.get('found_cards', 0)} "
+                    f"checked={management.get('descriptions_checked', 0)} "
+                    f"ready={management.get('ready_queue', 0)} "
+                    f"refusals_new={management.get('refusals', {}).get('new', 0)} "
+                    f"invitations_new={management.get('invitations', {}).get('new', 0)} "
+                    f"inbox_new={management.get('inbox', {}).get('new_incoming', 0)} "
+                    f"unknown={management.get('unknown_quarantine', 0)}"
+                )
+                for problem_source, count in (management.get("problems", {}).get("counts") or {}).items():
+                    print(f"  PROBLEM {problem_source}={count}")
                 print(f"private_report: {report_path}")
                 return 2 if scanned["partial_sources"] or stops else 0
             except (ConfigError, ValueError, OSError) as exc:
@@ -2607,9 +2827,70 @@ def main(argv: list[str] | None = None) -> int:
                                 f"{note}"
                             )
                 return 0
-            if args.queue_action == "stats":
+            if args.queue_action == "actions":
                 from .multisource import resolve_source_account
                 from .providers import default_registry
+                from .queue_actions import next_action
+
+                selected_config, _track_info = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                profile = _profile(selected_config, effective_search(selected_config.load_search()))
+                store = Store(selected_config.db_path)
+                sources = [args.source] if args.source else default_registry().sources()
+                rows: list[dict[str, Any]] = []
+                for source in sources:
+                    account = resolve_source_account(selected_config, profile, source)
+                    rows.extend(store.list_campaign_vacancies(
+                        account, args.track, "all", 5000, source=source,
+                    ))
+                items = []
+                for row in rows:
+                    action = next_action(row)
+                    if action["next_action"] in {"send", "reject"}:
+                        continue
+                    items.append({
+                        "source": row.get("source"), "id": row.get("id"),
+                        "name": row.get("name"), "company": row.get("company"),
+                        "score": row.get("score"), "decision": row.get("decision"),
+                        "application_state": row.get("global_application_state"),
+                        "decision_streak": row.get("decision_streak", 0),
+                        **action,
+                    })
+                items.sort(key=lambda item: (
+                    -int(item.get("decision_streak") or 0), -int(item.get("score") or 0),
+                ))
+                items = items[:max(1, int(args.limit))]
+                stagnant = []
+                for source in sources:
+                    account = resolve_source_account(selected_config, profile, source)
+                    stagnant.extend(store.stagnant_vacancies(
+                        account, args.track, source=source,
+                        min_streak=max(1, int(args.min_streak)), limit=args.limit,
+                    ))
+                stagnant.sort(key=lambda row: (-int(row.get("decision_streak") or 0),
+                                               -int(row.get("score") or 0)))
+                stagnant = stagnant[:max(1, int(args.limit))]
+                payload = {"track": args.track, "items": items, "stagnant": stagnant}
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                else:
+                    print(f"queue actions: track={args.track}; unresolved={len(items)}")
+                    for item in items:
+                        print(
+                            f"  {item['source']}:{item['id']} · {item['next_action']} "
+                            f"· score={item['score']} · {item['action_reason'][:180]}"
+                        )
+                    if stagnant:
+                        print(f"  stagnant={len(stagnant)} (same decision for >= {args.min_streak} passes)")
+                return 0
+            if args.queue_action == "stats":
+                from collections import Counter
+
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+                from .queue_actions import next_action
 
                 selected_config, _track_info = _track_config(
                     config, args.track, profile_override=bool(args.profile),
@@ -2648,6 +2929,12 @@ def main(argv: list[str] | None = None) -> int:
                         "application_states": applications,
                         "ready": ready,
                         "review": review,
+                        "next_actions": dict(Counter(
+                            next_action(row)["next_action"] for row in rows
+                        )),
+                        "stagnant": sum(
+                            int(row.get("decision_streak") or 0) >= 2 for row in rows
+                        ),
                     }
                 if args.json:
                     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -2656,7 +2943,8 @@ def main(argv: list[str] | None = None) -> int:
                     for source, values in report["sources"].items():
                         print(
                             f"  {source}: total={values['total']} ready={values['ready']} "
-                            f"review={values['review']} decisions={values['decisions']}"
+                            f"review={values['review']} decisions={values['decisions']} "
+                            f"next={values.get('next_actions', {})} stagnant={values.get('stagnant', 0)}"
                         )
                 return 0
             if args.queue_action == "sweep":
@@ -2850,14 +3138,16 @@ def main(argv: list[str] | None = None) -> int:
                 if input_path is None or not selected:
                     print("approved queue is empty or every approved vacancy is blocked", file=sys.stderr)
                     return 2
-                expected_resume = str(track_info.get("resume") or "").strip()
-                if not expected_resume:
+                permitted_resumes = _permitted_hh_resumes(
+                    profile, str(track_info.get("resume") or "")
+                )
+                if not permitted_resumes:
                     print("track has no exact HH resume configured; apply is blocked", file=sys.stderr)
                     return 2
                 mismatches = [str(item.get("id")) for item in selected
-                              if str(item.get("resume") or "").strip() != expected_resume]
+                              if str(item.get("resume") or "").strip() not in permitted_resumes]
                 if mismatches:
-                    print(f"resume mismatch; expected {expected_resume!r}; blocked IDs: {', '.join(mismatches)}",
+                    print(f"resume mismatch; allowed {sorted(permitted_resumes)!r}; blocked IDs: {', '.join(mismatches)}",
                           file=sys.stderr)
                     return 2
                 run_id = uuid.uuid4().hex
@@ -3381,8 +3671,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sync_report: {output}")
         return 0
     if args.command == "analytics":
+        from .analytics import report as render_analytics_report
+
         account = _account(_profile(config))
-        result = report(Store(config.db_path), account)
+        result = render_analytics_report(Store(config.db_path), account)
         output = args.output or _default_artifact(config, "reports", "txt")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(result + "\n", encoding="utf-8")
@@ -3545,6 +3837,17 @@ def _run_dry(store: Store, selected: list[dict], run_id: str, account: str,
         store.finish_run(run_id, "completed")
     _print_run_summary(store, run_id)
     return 0
+
+
+def _browser_context_lost(note: str) -> bool:
+    """A closed Playwright context is a source-wide stop, never another retry."""
+    lowered = str(note).casefold()
+    return any(marker in lowered for marker in (
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "context has been closed",
+        "target closed",
+    ))
 
 
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
@@ -3722,6 +4025,13 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                     })
                 if result.status == "unknown":
                     store.record(item, result.status, result.note, run_id, account)
+                    if _browser_context_lost(result.note):
+                        print(f"{vacancy_id}: unknown — browser context lost; stopping HH batch")
+                        unknown_ids.append(vacancy_id)
+                        run_status = "session_unavailable"
+                        stop_reason = "Chrome/Playwright context closed; reconcile HH before resuming"
+                        exit_code = 5
+                        break
                     if run_headless and "CAPTCHA" in result.note:
                         print(
                             "CAPTCHA in headless mode: solve it in visible Chrome, then run "

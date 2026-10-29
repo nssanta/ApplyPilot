@@ -29,6 +29,7 @@ from .base import (
     SourceCapabilities,
     canonical_url,
     clean_text,
+    deadline_expired,
     json_ld,
     make_item,
     parse_iso_datetime,
@@ -262,6 +263,9 @@ def _persist_seen(
     archived_ids: set[str] | None = None,
 ) -> None:
     if path is not None:
+        target_path = path
+        if filters.get("defer_cursor_persist"):
+            target_path = path.with_name(path.name + ".pending")
         previous: dict[str, Any] = {}
         try:
             loaded = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -303,7 +307,7 @@ def _persist_seen(
         for value in archived:
             active_seen.pop(value, None)
             archived_seen[value] = timestamp
-        _atomic_write_json(path, {
+        _atomic_write_json(target_path, {
             "version": 2,
             "seen_ids": sorted(current),  # compatibility with older readers
             "active_seen": active_seen,
@@ -663,6 +667,15 @@ class GetMatchProvider:
             telegram_filters = dict(filters)
             if filters.get("telegram_state_path"):
                 telegram_filters["state_path"] = filters["telegram_state_path"]
+            configured_details = _bounded_int(
+                filters, ("details_limit", "max_details"), 20, 500, 0,
+            )
+            # Reserve most of each pass for the main catalog: historical
+            # Telegram links can be numerous and already archived.
+            telegram_filters["details_limit"] = (
+                min(configured_details, max(1, min(80, configured_details // 3)))
+                if configured_details else 0
+            )
             budget = _Budget(_request_budget(filters))
             linked_items, linked_segments = self._discover_urls(
                 urls, telegram_filters, budget=budget,
@@ -671,9 +684,6 @@ class GetMatchProvider:
                 return linked_items, linked_segments
             sitemap_filters = dict(filters)
             sitemap_filters["detail_urls"] = []
-            configured_details = _bounded_int(
-                filters, ("details_limit", "max_details"), 20, 500, 0,
-            )
             linked_requests = sum(int(value.requests or 0) for value in linked_segments)
             sitemap_filters["details_limit"] = max(0, configured_details - linked_requests)
             sitemap_filters["seen_ids"] = {
@@ -793,6 +803,10 @@ class GetMatchProvider:
             if processed >= limit:
                 truncated = True
                 truncation_reason = "details limit reached"
+                break
+            if deadline_expired(filters):
+                truncated = True
+                truncation_reason = "pass time budget reached"
                 break
             if path is not None:
                 html = path.read_text(encoding="utf-8")
@@ -935,6 +949,10 @@ class GetMatchProvider:
         requests_used = 0
         truncated = False
         for url in selected[:limit]:
+            if deadline_expired(filters):
+                truncated = True
+                errors.append("pass time budget reached")
+                break
             if not budget.take():
                 truncated = True
                 break

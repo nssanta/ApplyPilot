@@ -22,6 +22,7 @@ from .base import (
     SourceCapabilities,
     canonical_url,
     clean_text,
+    deadline_expired,
     job_group_key,
     make_item,
     parse_iso_datetime,
@@ -493,9 +494,21 @@ class HabrProvider:
         budget_exhausted = False
 
         for slug, phrases in targets.items():
+            if deadline_expired(filters):
+                segments.append(segment(
+                    "pass", status="truncated", error="pass time budget reached",
+                ))
+                break
             label = phrases[0] if len(phrases) == 1 and phrases[0] else (slug or "/vacancies")
             page_window_exhausted = True
             for page in range(start_page, start_page + max_pages):
+                if deadline_expired(filters):
+                    segments.append(segment(
+                        label, status="truncated", error="pass time budget reached",
+                        pages=page - 1,
+                    ))
+                    page_window_exhausted = False
+                    break
                 if fixture_mode:
                     path = _list_fixture(filters, slug, page)
                     if path is None:
@@ -709,6 +722,12 @@ class HabrProvider:
         cached_details = filters.get("known_descriptions") or {}
         for item in _prioritized(collected):
             if attempted >= max_details:
+                break
+            if deadline_expired(filters):
+                segments.append(segment(
+                    "detail", status="truncated", error="pass time budget reached",
+                    requests=0,
+                ))
                 break
             native_id = str(item.get("native_id") or "")
             if not native_id:

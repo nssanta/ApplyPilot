@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
+import time
 import tomllib
 import uuid
 from collections.abc import Iterable, Mapping
@@ -27,6 +29,7 @@ from .config import AppConfig, search_groups
 from .parser import ScanSegment
 from .providers import ProviderRegistry, default_registry
 from .providers.base import SourceCapabilities
+from .queue_actions import next_action
 from .scoring import auto_apply_title_eligible, evaluate_search_filter, score_vacancy
 from .storage import AUTO_APPROVAL_REASON, Store, needs_manual_reapproval
 
@@ -46,6 +49,32 @@ GETMATCH_AI_TITLE_HINT = re.compile(
     r"(?i)(?:\bllm\b|\bai\b|\brag\b|\bgpt\b|\bnlp\b|"
     r"agent|агент|генератив|нейросет|разработчик\s+ии|инженер\s+ии)"
 )
+
+
+class CampaignFatalError(RuntimeError):
+    """A database or contract failure that must stop the whole campaign."""
+
+
+TRANSIENT_ERROR_MARKERS = (
+    "network error", "timeout", "timed out", "connection", "temporarily",
+    "http 500", "http 502", "http 503", "http 504", "http 429",
+    "rate limited", "request budget reached",
+)
+BLOCK_ERROR_MARKERS = (
+    "captcha", "капч", "auth", "login", "unauthorized", "session lost",
+    "session unavailable", "access limited", "blocked", "forbidden",
+    "http 403", "platform block",
+)
+
+
+def classify_source_error(value: object) -> str:
+    """Classifies an error note without turning a block into a retry loop."""
+    text = str(value or "").casefold()
+    if any(marker in text for marker in BLOCK_ERROR_MARKERS):
+        return "blocked"
+    if any(marker in text for marker in TRANSIENT_ERROR_MARKERS):
+        return "transient"
+    return "failed"
 
 
 def source_slug(source: str) -> str:
@@ -135,7 +164,8 @@ def _provider_filters(source: str, *, queries: list[str], pages: int,
                       fixture_dir: str | Path | None = None,
                       fixture_path: str | Path | None = None,
                       detail_fixture_path: str | Path | None = None,
-                      remote: bool | None = None, date_from: str = "") -> dict[str, Any]:
+                      remote: bool | None = None, date_from: str = "",
+                      pass_seconds: float = 0) -> dict[str, Any]:
     filters: dict[str, Any] = {
         "queries": queries,
         "primary_role_terms": list(primary_role_terms),
@@ -148,6 +178,8 @@ def _provider_filters(source: str, *, queries: list[str], pages: int,
         "date_from": date_from,
         "pause_seconds": 1.0,
     }
+    if pass_seconds and pass_seconds > 0:
+        filters["deadline"] = time.monotonic() + float(pass_seconds)
     if fixture_dir:
         root = Path(fixture_dir)
         filters["fixture_dir"] = str(root)
@@ -184,6 +216,25 @@ def _segment_status(segments: Iterable[ScanSegment], item_count: int) -> str:
     if "truncated" in statuses:
         return "truncated"
     return "ok" if item_count else "empty_verified"
+
+
+def _commit_deferred_cursors(filters: Mapping[str, Any]) -> list[str]:
+    """Promotes provider cursors only after cards were committed to SQLite."""
+    committed: list[str] = []
+    for key in ("state_path", "telegram_state_path"):
+        value = str(filters.get(key) or "")
+        if not value:
+            continue
+        path = Path(value)
+        pending = path.with_name(path.name + ".pending")
+        if not pending.is_file():
+            continue
+        try:
+            os.replace(pending, path)
+            committed.append(str(path))
+        except OSError:
+            continue
+    return committed
 
 
 def _stamp_source_first_seen(items: list[dict[str, Any]], path: Path) -> None:
@@ -272,6 +323,20 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
             "archived", "removed", "closed",
         }:
             continue
+        if (item.get("remote_text") and not item.get("is_remote")
+                and str(item.get("remote_confidence") or "unknown") == "unknown"):
+            # Re-evaluate only card/site evidence. A missing badge or plain
+            # city remains unknown; remote is never inferred from the target
+            # search alone.
+            from .providers.base import remote_info
+
+            remote = remote_info(item["remote_text"])
+            item.update({
+                "is_remote": bool(remote["is_remote"]),
+                "remote_confidence": remote["remote_confidence"],
+                "remote_reason": remote["remote_reason"],
+                "work_format": remote["work_format"],
+            })
         scoring_profile = {**profile, "search": search, "rescore": True}
         candidate = score_vacancy(item, scoring_profile)
         item.update(candidate.to_dict())
@@ -354,7 +419,7 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
 def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
                 source: str, *, pages: int | None = None, request_budget: int | None = None,
                 details_limit: int | None = None, limit: int = 100, start_page: int = 1,
-                until_complete: bool = False,
+                until_complete: bool = False, pass_seconds: float = 0,
                 hh_start_pages: dict[str, int | None] | None = None,
                 fixture_dir: str | Path | None = None,
                 fixture_path: str | Path | None = None,
@@ -388,6 +453,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 sort_mode=str(search.get("sort_mode") or "newest"),
                 track_resume=str(profile.get("resume") or ""),
                 start_pages=hh_start_pages,
+                pass_seconds=pass_seconds,
             )
             summary = result.get("summary") or {}
             return {
@@ -406,6 +472,12 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 "candidate_ids": result.get("candidate_ids", []),
                 "legacy_hh": True,
             }
+        except CampaignFatalError:
+            raise
+        except sqlite3.Error as exc:
+            raise CampaignFatalError(
+                f"database failure while scanning hh.ru: {type(exc).__name__}: {exc}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
             return {
                 "source": source, "status": "failed", "account": resolve_source_account(config, profile, source),
@@ -456,6 +528,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             fixture_dir=fixture_dir, fixture_path=fixture_path,
             detail_fixture_path=detail_fixture_path,
             remote=group.get("only_remote"), date_from=cutoff.date().isoformat(),
+            pass_seconds=pass_seconds,
         )
         if source in {"career.habr.com", "getmatch.ru", "geekjob.ru"} and not fixture_mode:
             cached: dict[str, dict[str, Any]] = {}
@@ -492,6 +565,11 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                     / source_slug(account) / f"telegram_seen-{scope_id}.json"
                 )
                 filters["include_sitemap"] = True
+            # The provider may know a URL was read before the normalized card is
+            # committed. Keep the cursor in a pending file and promote it only
+            # after save_campaign_items succeeds. A crash re-reads the page,
+            # which is safe; it must never skip an unsaved card.
+            filters["defer_cursor_persist"] = True
         # The user already owns these messages. Extract public job IDs only:
         # no bot commands are interpreted, no callbacks are executed.
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:
@@ -578,6 +656,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             snapshot_path=str(snapshot), error="\n".join(errors), error_count=len(errors),
             source=source,
         )
+        committed_cursors = _commit_deferred_cursors(filters)
         telegram_linked = 0
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:
             # Re-attach the saved bot message metadata after scanner enrichment.
@@ -595,20 +674,34 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             "items": len(items), "segments": len(segments), "errors": errors,
             "snapshot": str(snapshot), "summary": summary, "top": top,
             "telegram_links": telegram_linked,
+            "cursor_committed": committed_cursors,
             "candidate_ids": [str(item.get("id") or "") for item in items if item.get("id")],
             "start_page": max(1, int(start_page)),
         }
+    except CampaignFatalError:
+        raise
+    except sqlite3.Error as exc:
+        raise CampaignFatalError(
+            f"database failure while scanning {source}: {type(exc).__name__}: {exc}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - source failures are isolated by contract
         message = f"{type(exc).__name__}: {exc}"
-        store.fail_campaign(campaign_id, message)
+        try:
+            store.fail_campaign(campaign_id, message)
+        except sqlite3.Error as db_exc:
+            raise CampaignFatalError(
+                f"database failure while recording {source} scan failure: "
+                f"{type(db_exc).__name__}: {db_exc}"
+            ) from db_exc
         return {"campaign_id": campaign_id, "source": source, "status": "failed",
                 "account": account, "track": track, "items": 0, "errors": [message],
                 "fixture": bool(fixture_dir or fixture_path)}
 
 
-def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
-                 sources: Iterable[str] | None = None, *, until_complete: bool = False,
-                 resume: bool = False, max_passes: int = 30, **kwargs: Any) -> dict[str, Any]:
+def _scan_sources_impl(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
+                       sources: Iterable[str] | None = None, *, until_complete: bool = False,
+                       resume: bool = False, max_passes: int = 30,
+                       pass_seconds: float = 0, **kwargs: Any) -> dict[str, Any]:
     """Scan all configured query groups and continue bounded provider passes."""
     registry = kwargs.pop("registry", None) or default_registry()
     selected = list(dict.fromkeys(str(source) for source in (sources or DEFAULT_SOURCES)))
@@ -616,6 +709,7 @@ def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search:
         raise ValueError("max_passes must be between 1 and 100")
     drain = bool(until_complete or resume)
     base_kwargs = dict(kwargs)
+    base_kwargs["pass_seconds"] = max(0.0, float(pass_seconds or 0))
     groups = search_groups(search) or [dict(search)]
     results = []
     for source in selected:
@@ -918,6 +1012,83 @@ def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search:
     }
 
 
+def scan_sources(config: AppConfig, track: str, profile: dict[str, Any], search: dict[str, Any],
+                 sources: Iterable[str] | None = None, *, until_complete: bool = False,
+                 resume: bool = False, max_passes: int = 30, pass_seconds: float = 0,
+                 source_retries: int = 2, retry_delay: float = 5.0,
+                 **kwargs: Any) -> dict[str, Any]:
+    """Isolates each source, retries only transient failures, and aggregates.
+
+    One provider exception, CAPTCHA or broken page must not erase the results
+    of the other platforms. Database/contract failures still stop the campaign.
+    """
+    registry = kwargs.pop("registry", None)
+    selected = list(dict.fromkeys(str(source) for source in (sources or DEFAULT_SOURCES)))
+    retries = max(0, min(5, int(source_retries)))
+    delay = max(0.0, min(60.0, float(retry_delay)))
+    results: list[dict[str, Any]] = []
+    for source in selected:
+        result: dict[str, Any] | None = None
+        for attempt in range(1, retries + 2):
+            try:
+                one = _scan_sources_impl(
+                    config, track, profile, search, sources=[source],
+                    until_complete=until_complete, resume=resume,
+                    max_passes=max_passes, pass_seconds=pass_seconds,
+                    registry=registry, **kwargs,
+                )
+                rows = list(one.get("sources") or [])
+                result = rows[0] if rows else {
+                    "source": source, "status": "failed", "items": 0,
+                    "errors": ["scanner returned no source result"],
+                }
+            except KeyboardInterrupt:
+                raise
+            except CampaignFatalError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - source boundary isolation
+                message = f"{type(exc).__name__}: {exc}"
+                kind = classify_source_error(message)
+                result = {
+                    "source": source, "status": "blocked" if kind == "blocked" else "failed",
+                    "account": resolve_source_account(config, profile, source),
+                    "track": track, "items": 0, "errors": [message],
+                    "transient_failed": kind == "transient",
+                }
+            status = str(result.get("status") or "failed")
+            error_text = " ".join(str(value) for value in result.get("errors", []))
+            kind = classify_source_error(f"{status} {error_text}")
+            retry = (
+                status == "failed" and kind == "transient" and attempt <= retries
+                and not result.get("blocked")
+            )
+            result["scan_attempts"] = attempt
+            if not retry:
+                break
+            if delay:
+                time.sleep(delay)
+            result = None
+        assert result is not None
+        results.append(result)
+
+    counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status") or "failed")
+        counts[status] = counts.get(status, 0) + 1
+    return {
+        "track": track,
+        "account": str(profile.get("account") or "default"),
+        "accounts": {row["source"]: row.get("account", "") for row in results},
+        "sources": results,
+        "counts": counts,
+        "ok": sum(int(result.get("items") or 0) for result in results),
+        "until_complete": bool(until_complete or resume),
+        "failed_sources": [r["source"] for r in results if r.get("status") in {"failed", "blocked"}],
+        "partial_sources": [r["source"] for r in results
+                             if r.get("status") in {"partial", "truncated", "blocked", "failed"}],
+    }
+
+
 def approve_scanned_fits(
     store: Store, account: str, track: str, source: str, vacancy_ids: Iterable[str],
     *, search: Mapping[str, Any] | None = None,
@@ -1016,7 +1187,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         )
         if not needs_manual_reapproval(row)
         and not row.get("applied_before")
-        and str(row.get("decision") or "").upper() != "BLOCKED"
+        and str(row.get("decision") or "").upper() not in {"REVIEW", "REJECT", "BLOCKED"}
         and row.get("score_decision") == "pass"
         and (row.get("filter_status") in {"pass", "unknown"}
              or str(row.get("decision") or "").upper() == "APPLY")
@@ -1044,6 +1215,7 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
     for row in rows:
         vacancy_id = str(row.get("id") or "")
         channel_key = row.get("channel_key") or f"{source}:{vacancy_id}"
+        action = next_action(row)
         item = {
             "id": vacancy_id, "source": source, "track": track,
             "name": row.get("name", ""), "company": row.get("company", ""),
@@ -1056,6 +1228,8 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
             "score_decision": row.get("score_decision", ""),
             "filter_status": row.get("filter_status", ""),
             "resume": row.get("resume", ""),
+            "next_action": action["next_action"],
+            "action_reason": action["action_reason"],
         }
         # Re-read the live ledger at planning time.  The duplicate flag stored
         # during the scan can be stale after an HH sync or a manual decision.
@@ -1065,6 +1239,10 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
             mirror_native_id=str(row.get("mirror_native_id") or ""),
         )
         reason = ""
+        cross_duplicate = store.cross_source_attempt_conflict(
+            source, vacancy_id, str(row.get("name") or ""),
+            str(row.get("description") or ""),
+        ) if not conflict else None
         if conflict:
             if conflict.get("kind") == "same_run":
                 reason = f"reservation_exists:{conflict.get('run_id', '')}"
@@ -1076,6 +1254,9 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
                           f"{conflict.get('vacancy_id')}")
             else:
                 reason = f"channel_conflict:{conflict.get('kind')}"
+        elif cross_duplicate:
+            reason = (f"cross_source_duplicate:{cross_duplicate['source']}:"
+                      f"{cross_duplicate['vacancy_id']}")
         elif row.get("application_state") in {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}:
             reason = f"application_state:{row.get('application_state')}"
         elif row.get("application_state") in {"NEEDS_FORM", "NEEDS_LETTER", "NEEDS_MANUAL"}:
@@ -1090,9 +1271,13 @@ def queue_plan(store: Store, account: str, track: str, source: str, limit: int =
         elif not capabilities.apply and source != "hh.ru" and not verified_driver:
             reason = "apply_not_available"
         if reason:
-            blocked.append({**item, "action": "blocked", "reason": reason})
+            blocked.append({**item, "action": "blocked", "reason": reason,
+                            "next_action": action["next_action"] if action["next_action"] != "send"
+                            else "review",
+                            "action_reason": action["action_reason"]})
         else:
-            planned.append({**item, "action": "would_apply", "reason": "dry_run"})
+            planned.append({**item, "action": "would_apply", "reason": "dry_run",
+                            "next_action": "send"})
     return {
         "account": account, "track": track, "source": source,
         "mode": "dry_run", "candidate_count": len(rows),

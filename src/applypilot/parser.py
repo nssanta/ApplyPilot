@@ -188,7 +188,8 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
               page_limit: int | None = None, start_page: int = 0,
               pause_seconds: float = 1.0,
               request_budget: int | None = None,
-              order_by: str = "relevance") -> tuple[list[dict[str, Any]], list[ScanSegment]]:
+              order_by: str = "relevance",
+              deadline: float | None = None) -> tuple[list[dict[str, Any]], list[ScanSegment]]:
     """Сканирует ограниченную матрицу запросов, регионов и страниц с диагностикой сегментов.
 
     ``request_budget`` ограничивает реальные поисковые HTTP-запросы, а не число
@@ -213,6 +214,11 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
         for area in areas:
             if aborted:
                 break
+            if deadline is not None and time.monotonic() >= deadline:
+                segments.append(ScanSegment(query, area, 0, "truncated", 0,
+                                            "pass time budget reached", order_by=order_by))
+                aborted = True
+                break
             if remaining_requests is not None and remaining_requests <= 0:
                 segments.append(ScanSegment(query, area, 0, "truncated", 0,
                                             "search request budget reached", order_by=order_by))
@@ -224,6 +230,10 @@ def scan_many(queries: Iterable[str], areas: Iterable[int], max_pages: int = 1,
             pages_used = 0
             requests_used = 0
             for page in range(start_page, start_page + pages):
+                if deadline is not None and time.monotonic() >= deadline:
+                    segment_status = "truncated"
+                    segment_error = "pass time budget reached"
+                    break
                 if remaining_requests is not None and remaining_requests <= 0:
                     segment_status = "truncated"
                     segment_error = "search request budget reached"
@@ -300,12 +310,16 @@ def _get_hh(client: requests.Session, url: str, *, params: dict[str, Any] | None
 
 def enrich_items(items: list[dict[str, Any]], limit: int = 0,
                  session: requests.Session | None = None,
-                 pause_seconds: float = 0.0) -> tuple[list[dict[str, Any]], list[str]]:
+                 pause_seconds: float = 0.0,
+                 deadline: float | None = None) -> tuple[list[dict[str, Any]], list[str]]:
     """Загружает полные описания для ограниченного числа нормализованных вакансий HH."""
     client = session or requests.Session()
     errors: list[str] = []
     selected = items[:max(0, limit)]
     for index, item in enumerate(selected):
+        if deadline is not None and time.monotonic() >= deadline:
+            errors.append("pass time budget reached")
+            break
         url = str(item.get("url") or "")
         if not _is_hh_url(url):
             item["description_status"] = "invalid_url"

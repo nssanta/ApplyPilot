@@ -182,3 +182,39 @@ def test_source_run_cap_counts_active_reservations_and_is_atomic(tmp_path):
             "SELECT COUNT(*) FROM source_reservations WHERE account=? AND source=?",
             ("acc", "getmatch.ru"),
         ).fetchone()[0] == 5
+
+
+def test_stale_running_execution_recovers_submitting_as_unknown(tmp_path):
+    store = _store(tmp_path)
+    store.create_execution("exec-1", {"args": {}, "tracks": ["ai_core"], "sources": ["getmatch.ru"]})
+    store.execution_run("exec-1", "run-1", "getmatch.ru", "ai_core")
+    assert store.reserve_source_application(
+        "acc", "getmatch.ru", "42", "ai_core", "getmatch.ru:42", "run-1",
+    )[0]
+    assert store.record_source_application(
+        "acc", "getmatch.ru", "42", "ai_core", "getmatch.ru:42", "submitting",
+        note="started", run_id="run-1",
+    )
+    recovered = store.recover_abandoned_execution("exec-1")
+    assert recovered["recovered"] is True
+    assert recovered["attempts"][0]["vacancy_id"] == "42"
+    assert store.execution("exec-1")["status"] == "interrupted"
+    attempts = store.source_attempts("acc", "getmatch.ru")
+    assert attempts[0]["status"] == "unknown"
+    with store.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_reservations WHERE account='acc'"
+        ).fetchone()[0] == 0
+
+
+def test_stale_hh_submitting_is_quarantined_not_retried(tmp_path):
+    store = _store(tmp_path)
+    store.create_execution("exec-hh", {"args": {}, "tracks": ["ai_core"], "sources": ["hh.ru"]})
+    store.execution_run("exec-hh", "run-hh", "hh.ru", "ai_core")
+    item = {"id": "hh-1", "name": "AI Engineer"}
+    store.start_run("run-hh", "acc", "apply", Path("input.json"), 1, [item])
+    assert store.reserve(item, "run-hh", 10, 0, "acc")[0]
+    recovered = store.recover_abandoned_execution("exec-hh")
+    assert recovered["recovered"] is True
+    assert store.read_statuses("acc")["hh-1"] == "unknown"
+    assert store.run_summary("run-hh")["run"]["status"] == "interrupted"

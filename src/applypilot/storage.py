@@ -10,6 +10,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS negotiation_statuses (
   account TEXT NOT NULL, vacancy_id TEXT NOT NULL, status TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT '', company TEXT NOT NULL DEFAULT '', resume TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  status_detected_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account, vacancy_id)
 );
 CREATE TABLE IF NOT EXISTS sync_snapshots (
@@ -113,6 +115,7 @@ CREATE TABLE IF NOT EXISTS vacancy_track_scores (
   review_notes TEXT NOT NULL DEFAULT '',
   decision TEXT NOT NULL DEFAULT '', decision_reason TEXT NOT NULL DEFAULT '',
   decision_at TEXT NOT NULL DEFAULT '', next_action_at TEXT NOT NULL DEFAULT '',
+  decision_streak INTEGER NOT NULL DEFAULT 0, decision_signature TEXT NOT NULL DEFAULT '',
   resume TEXT NOT NULL DEFAULT '', campaign_id TEXT NOT NULL DEFAULT '',
   latest_change TEXT NOT NULL DEFAULT 'first_seen', last_seen_at TEXT NOT NULL,
   PRIMARY KEY(account, source, vacancy_id, track),
@@ -234,6 +237,18 @@ def _vacancy_group_key(company: str, title: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
+def _near_duplicate_title(title: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]+", " ", str(title).casefold()).strip()
+
+
+def _description_shingles(description: str) -> set[tuple[str, ...]]:
+    visible = unescape(re.sub(r"<[^>]+>", " ", str(description)))
+    words = re.findall(r"[0-9a-zа-яё]+", visible.casefold())
+    if len(words) < 60:
+        return set()
+    return {tuple(words[index:index + 5]) for index in range(len(words) - 4)}
+
+
 def canonical_channel_key(value: str) -> str:
     """Normalizes an application channel so one destination has one writer lock.
 
@@ -323,6 +338,9 @@ def campaign_application_state(status: str, note: str = "") -> str | None:
             return "NEEDS_LETTER"
         if "form" in reason or "question" in reason or "screening" in reason or "анкет" in reason:
             return "NEEDS_FORM"
+        # A missing button, archived listing or unclassified manual stop is
+        # never implicitly another READY application on the next queue refresh.
+        return "NEEDS_MANUAL"
     return None
 
 
@@ -395,6 +413,10 @@ def effective_track_application_state(
         return state
     approved = str(track_review_state or "UNREVIEWED").upper() == "APPROVED"
     if state == "READY_TO_APPLY":
+        # Relevance resweeps can demote historical auto-approvals. A stale
+        # APPROVED flag must not keep such a role dispatchable.
+        if str(decision or "").upper() in {"REVIEW", "REJECT", "BLOCKED"}:
+            return "NOT_STARTED"
         # An explicit decision=APPLY is a human/engine decision that survives a
         # later scan-window change (for example, an old approved vacancy falling
         # outside ``days``).  It never bypasses a rejected score.
@@ -516,6 +538,153 @@ class Store:
             counts[row["status"]] = counts.get(row["status"], 0) + row["n"]
         return result
 
+    def recover_abandoned_execution(self, execution_id: str) -> dict[str, Any]:
+        """Closes a stale ``running`` campaign after its process/lock is gone.
+
+        The caller must hold the campaign-execution lock.  A previous submit can
+        be genuinely ambiguous, so it becomes UNKNOWN; it is never retried by
+        this recovery.  Verified successes remain untouched.
+        """
+        timestamp = now()
+        recovered_attempts: list[dict[str, str]] = []
+        recovered_runs: list[str] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            execution = conn.execute(
+                "SELECT status FROM execution_campaigns WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if execution is None:
+                return {"execution_id": execution_id, "recovered": False,
+                        "attempts": [], "runs": []}
+            run_rows = conn.execute(
+                "SELECT run_id,source,track FROM execution_runs WHERE execution_id=?",
+                (execution_id,),
+            ).fetchall()
+            run_ids = [str(row["run_id"]) for row in run_rows]
+            if run_ids:
+                marks = ",".join("?" for _ in run_ids)
+                stale_attempts = conn.execute(
+                    f"""SELECT account,source,vacancy_id,track,channel_key,run_id
+                        FROM source_application_attempts
+                        WHERE run_id IN ({marks}) AND status='submitting'""",
+                    run_ids,
+                ).fetchall()
+                for row in stale_attempts:
+                    conn.execute(
+                        """UPDATE source_application_attempts SET status='unknown',
+                           note='interrupted: stale execution recovered; reconcile before retry',
+                           updated_at=? WHERE account=? AND source=? AND vacancy_id=?
+                           AND track=? AND channel_key=? AND status='submitting'""",
+                        (timestamp, row["account"], row["source"], row["vacancy_id"],
+                         row["track"], row["channel_key"]),
+                    )
+                    self._release_source_locks(
+                        conn, str(row["account"]), str(row["source"]),
+                        str(row["vacancy_id"]), str(row["track"]),
+                        str(row["channel_key"]),
+                    )
+                    conn.execute(
+                        "UPDATE vacancies SET application_state='UNKNOWN',"
+                        "application_note='interrupted: reconcile before retry',updated_at=? "
+                        "WHERE account=? AND source=? AND vacancy_id=?",
+                        (timestamp, row["account"], row["source"], row["vacancy_id"]),
+                    )
+                    recovered_attempts.append({
+                        "source": str(row["source"]),
+                        "vacancy_id": str(row["vacancy_id"]),
+                        "run_id": str(row["run_id"]),
+                    })
+                stale_hh = conn.execute(
+                    f"""SELECT run_id,vacancy_id FROM run_items
+                        WHERE run_id IN ({marks}) AND status='submitting'""",
+                    run_ids,
+                ).fetchall()
+                for row in stale_hh:
+                    conn.execute(
+                        """UPDATE run_items SET status='unknown',
+                           note='interrupted: stale execution recovered; reconcile before retry',
+                           updated_at=? WHERE run_id=? AND vacancy_id=? AND status='submitting'""",
+                        (timestamp, row["run_id"], row["vacancy_id"]),
+                    )
+                    account_row = conn.execute(
+                        "SELECT account FROM runs WHERE run_id=?", (row["run_id"],),
+                    ).fetchone()
+                    if account_row:
+                        account_name = str(account_row["account"])
+                        conn.execute(
+                            "DELETE FROM reservations WHERE account=? AND vacancy_id=?",
+                            (account_name, row["vacancy_id"]),
+                        )
+                        conn.execute(
+                            """UPDATE attempts SET status='unknown',
+                               note='interrupted: stale execution recovered; reconcile before retry',
+                               updated_at=? WHERE account=? AND vacancy_id=?
+                               AND status='submitting'""",
+                            (timestamp, account_name, row["vacancy_id"]),
+                        )
+                        conn.execute(
+                            "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (account_name, row["vacancy_id"], "unknown",
+                             "interrupted: stale execution recovered", row["run_id"], timestamp),
+                        )
+                        conn.execute(
+                            "UPDATE vacancies SET application_state='UNKNOWN',"
+                            "application_note='interrupted: reconcile before retry',updated_at=? "
+                            "WHERE account=? AND source='hh.ru' AND vacancy_id=?",
+                            (timestamp, account_name, row["vacancy_id"]),
+                        )
+                    recovered_attempts.append({
+                        "source": "hh.ru", "vacancy_id": str(row["vacancy_id"]),
+                        "run_id": str(row["run_id"]),
+                    })
+                for run_id in run_ids:
+                    cursor = conn.execute(
+                        "UPDATE runs SET status='interrupted',stop_reason=?,finished_at=? "
+                        "WHERE run_id=? AND status='running'",
+                        ("stale execution lock was released", timestamp, run_id),
+                    )
+                    if cursor.rowcount:
+                        recovered_runs.append(run_id)
+            if str(execution["status"]) == "running":
+                conn.execute(
+                    "UPDATE execution_campaigns SET status='interrupted',reason=?,updated_at=? "
+                    "WHERE execution_id=? AND status='running'",
+                    ("stale running campaign recovered; no process holds the campaign lock",
+                     timestamp, execution_id),
+                )
+        return {
+            "execution_id": execution_id,
+            "recovered": bool(recovered_attempts or recovered_runs
+                              or str(execution["status"]) == "running"),
+            "attempts": recovered_attempts,
+            "runs": recovered_runs,
+        }
+
+    def has_sendable_ready(self, account: str, track: str, source: str) -> bool:
+        """Cheap pre-drain check; never reserves or sends."""
+        rows = self.list_campaign_vacancies(account, track, "ready", 500, source=source)
+        for row in rows:
+            if str(row.get("review_state") or "").upper() != "APPROVED":
+                continue
+            if str(row.get("decision") or "").upper() != "APPLY":
+                continue
+            if row.get("applied_before"):
+                continue
+            if source != "hh.ru" and row.get("channel_type") == "external_ats":
+                continue
+            return True
+        return False
+
+    def has_sendable_ready_any_account(self, track: str, source: str) -> bool:
+        with self.connect() as conn:
+            accounts = [str(row["account"]) for row in conn.execute(
+                "SELECT DISTINCT account FROM vacancy_track_scores WHERE track=? AND source=?",
+                (track, source),
+            ).fetchall()]
+        return any(self.has_sendable_ready(account, track, source) for account in accounts)
+
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sync_snapshots)")}
@@ -524,6 +693,10 @@ class Store:
         negotiation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(negotiation_statuses)")}
         if "resume" not in negotiation_columns:
             conn.execute("ALTER TABLE negotiation_statuses ADD COLUMN resume TEXT NOT NULL DEFAULT ''")
+        if "status_detected_at" not in negotiation_columns:
+            conn.execute("ALTER TABLE negotiation_statuses ADD COLUMN status_detected_at "
+                         "TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE negotiation_statuses SET status_detected_at=fetched_at")
         telegram_columns = {row["name"] for row in conn.execute("PRAGMA table_info(telegram_messages)")}
         if "outgoing" not in telegram_columns:
             conn.execute("ALTER TABLE telegram_messages ADD COLUMN outgoing INTEGER NOT NULL DEFAULT -1")
@@ -537,6 +710,8 @@ class Store:
             ("decision_reason", "TEXT NOT NULL DEFAULT ''"),
             ("decision_at", "TEXT NOT NULL DEFAULT ''"),
             ("next_action_at", "TEXT NOT NULL DEFAULT ''"),
+            ("decision_streak", "INTEGER NOT NULL DEFAULT 0"),
+            ("decision_signature", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in score_columns:
                 conn.execute(f"ALTER TABLE vacancy_track_scores ADD COLUMN {column} {definition}")
@@ -687,11 +862,14 @@ class Store:
             return {}
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT vacancy_id,status,resume,updated_at FROM negotiation_statuses WHERE account=?",
+                "SELECT vacancy_id,status,resume,updated_at,fetched_at,status_detected_at "
+                "FROM negotiation_statuses WHERE account=?",
                 (account,),
             ).fetchall()
             return {row["vacancy_id"]: {"status": row["status"], "resume": row["resume"],
-                                        "updated_at": row["updated_at"]} for row in rows}
+                                        "updated_at": row["updated_at"],
+                                        "fetched_at": row["fetched_at"],
+                                        "status_detected_at": row["status_detected_at"]} for row in rows}
 
     def attempt_details(self, account: str = "default") -> dict[str, dict[str, str]]:
         """Читает сохранённые результаты откликов, включая резюме, выбранное при отправке."""
@@ -934,19 +1112,27 @@ class Store:
                 normalized.append((vacancy_id, row))
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            previous_statuses = {str(old["vacancy_id"]): dict(old) for old in conn.execute(
+                "SELECT vacancy_id,status,status_detected_at,fetched_at FROM negotiation_statuses "
+                "WHERE account=?", (account,),
+            ).fetchall()}
             if complete:
                 conn.execute("DELETE FROM negotiation_statuses WHERE account=?", (account,))
             for vacancy_id, row in normalized:
+                old = previous_statuses.get(vacancy_id)
+                status_detected_at = fetched_at
+                if old and old["status"] == str(row.get("status", "")):
+                    status_detected_at = old["status_detected_at"] or old["fetched_at"]
                 conn.execute(
                     """INSERT INTO negotiation_statuses
-                    (account,vacancy_id,status,name,company,resume,updated_at,fetched_at)
-                    VALUES(?,?,?,?,?,?,?,?)
+                    (account,vacancy_id,status,name,company,resume,updated_at,fetched_at,status_detected_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(account,vacancy_id) DO UPDATE SET status=excluded.status,
                     name=excluded.name,company=excluded.company,resume=excluded.resume,updated_at=excluded.updated_at,
-                    fetched_at=excluded.fetched_at""",
+                    fetched_at=excluded.fetched_at,status_detected_at=excluded.status_detected_at""",
                     (account, vacancy_id, str(row.get("status", "")), row.get("name", ""),
                      row.get("company", ""), str(row.get("resume", "")),
-                     str(row.get("updated_at", "")), fetched_at),
+                     str(row.get("updated_at", "")), fetched_at, status_detected_at),
                 )
                 conn.execute(
                     """UPDATE vacancies SET application_state='APPLIED_CONFIRMED',
@@ -1427,6 +1613,14 @@ class Store:
                 )
                 if normalized in RELEASABLE_AFTER:
                     self._release_source_locks(conn, account, source, vacancy_id, track, channel)
+                application_state = campaign_application_state(normalized, note)
+                if application_state:
+                    conn.execute(
+                        "UPDATE vacancies SET application_state=?,application_note=?,last_checked_at=?,updated_at=? "
+                        "WHERE account=? AND source=? AND vacancy_id=?",
+                        (application_state, str(note)[:500], timestamp, timestamp,
+                         account, source, str(vacancy_id)),
+                    )
                 return True
             allowed = APPLICATION_TRANSITIONS.get(prior_status, set())
             if normalized not in allowed:
@@ -1740,7 +1934,16 @@ class Store:
                         "SELECT 1 FROM negotiation_statuses WHERE account=? AND vacancy_id=?",
                         (account, vacancy_id),
                     ).fetchone()
-                    if attempt:
+                    # A source-native HH negotiation proves an application.
+                    # Earlier needs_form/unknown attempts must not downgrade it
+                    # when a subsequent scan refreshes the same vacancy.
+                    if negotiation:
+                        conn.execute(
+                            "UPDATE vacancies SET application_state='APPLIED_CONFIRMED' "
+                            "WHERE account=? AND source=? AND vacancy_id=?",
+                            (account, source, vacancy_id),
+                        )
+                    elif attempt:
                         app_state = campaign_application_state(attempt["status"], attempt["note"])
                         if app_state:
                             conn.execute(
@@ -1748,12 +1951,6 @@ class Store:
                                 "WHERE account=? AND source=? AND vacancy_id=?",
                                 (app_state, account, source, vacancy_id),
                             )
-                    elif negotiation:
-                        conn.execute(
-                            "UPDATE vacancies SET application_state='APPLIED_CONFIRMED' "
-                            "WHERE account=? AND source=? AND vacancy_id=?",
-                            (account, source, vacancy_id),
-                        )
                     if negotiation or (attempt and attempt["status"] in BLOCKED_STATUSES):
                         applied_count += 1
                 else:
@@ -1830,7 +2027,8 @@ class Store:
                           s.review_state AS track_review_state,s.review_reason AS track_review_reason,
                           s.review_notes AS track_review_notes,
                           s.decision AS track_decision,s.decision_reason AS track_decision_reason,
-                          s.decision_at AS track_decision_at,s.next_action_at AS track_next_action_at,
+                          s.decision_at AS track_decision_at,s.decision_streak AS track_decision_streak,
+                          s.next_action_at AS track_next_action_at,
                           s.latest_change,s.last_seen_at AS track_last_seen_at,
                           l.group_key AS link_group_key,l.channel_key AS link_channel_key,
                           l.channel_type AS link_channel_type,l.application_url AS link_application_url,
@@ -1914,6 +2112,7 @@ class Store:
                     "decision": row["track_decision"] or "",
                     "decision_reason": row["track_decision_reason"] or "",
                     "decision_at": row["track_decision_at"] or "",
+                    "decision_streak": int(row["track_decision_streak"] or 0),
                     "next_action_at": row["track_next_action_at"] or "",
                     "conversation_state": row["conversation_state"], "next_action": row["next_action"],
                     "owner": row["owner"], "first_seen_at": row["first_seen_at"],
@@ -2024,15 +2223,57 @@ class Store:
         normalized = str(decision or "").strip().upper()
         if normalized not in {"APPLY", "REVIEW", "REJECT", "APPLIED", "BLOCKED"}:
             raise ValueError("decision must be APPLY, REVIEW, REJECT, APPLIED or BLOCKED")
+        reason_text = str(reason or "")[:500]
         with self.connect() as conn:
+            prior = conn.execute(
+                """SELECT s.decision,s.decision_reason,s.decision_signature,s.decision_streak,
+                          s.review_state,v.application_state
+                   FROM vacancy_track_scores s
+                   JOIN vacancies v ON v.account=s.account AND v.source=s.source
+                     AND v.vacancy_id=s.vacancy_id
+                   WHERE s.account=? AND s.source=? AND s.vacancy_id=? AND s.track=?""",
+                (account, source, str(vacancy_id), track),
+            ).fetchone()
+            if prior is None:
+                raise ValueError(f"vacancy {vacancy_id} is not present in track {track}")
+            signature = "|".join((
+                normalized, reason_text, str(prior["review_state"] or ""),
+                str(prior["application_state"] or ""),
+            ))
+            streak = int(prior["decision_streak"] or 0)
+            if signature == str(prior["decision_signature"] or ""):
+                streak += 1
+            else:
+                streak = 0
             cursor = conn.execute(
                 """UPDATE vacancy_track_scores SET decision=?,decision_reason=?,decision_at=?,
-                   next_action_at=? WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
-                (normalized, str(reason or "")[:500], now(), str(next_action_at or ""),
-                 account, source, str(vacancy_id), track),
+                   next_action_at=?,decision_streak=?,decision_signature=?
+                   WHERE account=? AND source=? AND vacancy_id=? AND track=?""",
+                (normalized, reason_text, now(), str(next_action_at or ""),
+                 streak, signature, account, source, str(vacancy_id), track),
             )
             if cursor.rowcount == 0:
                 raise ValueError(f"vacancy {vacancy_id} is not present in track {track}")
+
+    def stagnant_vacancies(self, account: str, track: str, source: str | None = None,
+                           min_streak: int = 2, limit: int = 100) -> list[dict[str, Any]]:
+        """Rows re-evaluated with no change; useful for queue troubleshooting."""
+        query = """SELECT s.source,s.vacancy_id,s.score,s.decision,s.decision_reason,
+                          s.decision_streak,s.review_state,v.application_state,v.title,v.url
+                   FROM vacancy_track_scores s
+                   JOIN vacancies v ON v.account=s.account AND v.source=s.source
+                     AND v.vacancy_id=s.vacancy_id
+                   WHERE s.account=? AND s.track=? AND s.decision_streak>=?
+                     AND v.application_state NOT IN
+                       ('APPLIED_CONFIRMED','ALREADY_APPLIED','UNKNOWN')"""
+        params: list[Any] = [account, track, max(1, int(min_streak))]
+        if source:
+            query += " AND s.source=?"
+            params.append(source)
+        query += " ORDER BY s.decision_streak DESC,s.score DESC LIMIT ?"
+        params.append(max(1, min(1000, int(limit))))
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
 
     def set_review_state(self, account: str, source: str, vacancy_id: str, state: str,
                          *, reason: str, notes: str | None = None, track: str | None = None) -> None:
@@ -2302,6 +2543,60 @@ class Store:
                 result.append(group)
         return result[:max(1, int(limit))]
 
+    def cross_source_attempt_conflict(
+        self, source: str, vacancy_id: str, title: str, description: str,
+    ) -> dict[str, Any] | None:
+        """Block a near-identical role already attempted, even with a different ID.
+
+        Reposted roles on HH and employer aliases across boards are not reliable
+        identifiers. Only sufficiently long, nearly identical *full descriptions* plus the same
+        normalized role title can trigger this additional conservative guard.
+        """
+        wanted_title = _near_duplicate_title(title)
+        shingles = _description_shingles(description)
+        if not shingles and vacancy_id:
+            # Dispatch plans omit the description to keep driver payloads small.
+            with self.connect() as conn:
+                current = conn.execute(
+                    "SELECT title,payload_json FROM vacancies WHERE source=? AND vacancy_id=?",
+                    (source, vacancy_id),
+                ).fetchone()
+            if current:
+                wanted_title = wanted_title or _near_duplicate_title(str(current["title"] or ""))
+                try:
+                    payload = json.loads(current["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+                shingles = _description_shingles(str(payload.get("description") or ""))
+        if not wanted_title or not shingles:
+            return None
+        with self.connect() as conn:
+            candidates = conn.execute(
+                """SELECT source,vacancy_id,title,payload_json,application_state
+                   FROM vacancies
+                   WHERE NOT (source=? AND vacancy_id=?) AND application_state IN
+                     ('APPLIED_CONFIRMED','ALREADY_APPLIED','UNKNOWN')""",
+                (source, vacancy_id),
+            ).fetchall()
+        for other in candidates:
+            if _near_duplicate_title(str(other["title"] or "")) != wanted_title:
+                continue
+            try:
+                payload = json.loads(other["payload_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            other_shingles = _description_shingles(str(payload.get("description") or ""))
+            if not other_shingles:
+                continue
+            overlap = len(shingles & other_shingles) / min(len(shingles), len(other_shingles))
+            if overlap >= 0.88:
+                return {
+                    "source": str(other["source"]), "vacancy_id": str(other["vacancy_id"]),
+                    "status": str(other["application_state"]),
+                    "description_overlap": round(overlap, 3),
+                }
+        return None
+
     def approved_campaign_items(self, account: str, track: str, limit: int = 10,
                                 source: str = "hh.ru") -> list[dict[str, Any]]:
         rows = self.list_campaign_vacancies(account, track, "approved", limit=1000, source=source)
@@ -2310,7 +2605,7 @@ class Store:
             for row in rows:
                 if needs_manual_reapproval(row):
                     continue
-                if str(row.get("decision") or "").upper() == "BLOCKED":
+                if str(row.get("decision") or "").upper() in {"REVIEW", "REJECT", "BLOCKED"}:
                     continue
                 # APPROVED is a track-scoped human override for reviewable unknown
                 # filters (for example, unpublished salary), never for an
@@ -2320,6 +2615,11 @@ class Store:
                 if (row.get("applied_before") or row.get("score_decision") != "pass"
                         or (row.get("filter_status") not in {"pass", "unknown"}
                             and decision != "APPLY")):
+                    continue
+                if self.cross_source_attempt_conflict(
+                    source, str(row.get("id") or ""),
+                    str(row.get("name") or ""), str(row.get("description") or ""),
+                ):
                     continue
                 if row.get("application_state") == "READY_TO_APPLY":
                     task_id = hashlib.sha256(

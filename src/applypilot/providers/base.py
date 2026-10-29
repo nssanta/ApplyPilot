@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -93,6 +94,17 @@ class ProviderScan:
 def clean_text(value: Any) -> str:
     """Collapses whitespace without trusting or interpreting page text."""
     return " ".join(str(value or "").replace("\u00a0", " ").replace("\u202f", " ").split())
+
+
+def deadline_expired(filters: Mapping[str, Any]) -> bool:
+    """Checks a pass deadline between operations; requests keep own timeouts."""
+    value = filters.get("deadline")
+    if value is None:
+        return False
+    try:
+        return time.monotonic() >= float(value)
+    except (TypeError, ValueError):
+        return False
 
 
 def canonical_url(base_url: str, href: str) -> str:
@@ -312,6 +324,7 @@ def make_item(*, source: str, native_id: str, name: str, company: str, url: str,
         "salary_provenance": "published" if salary else "unknown",
         "experience": clean_text(experience),
         "area": clean_text(area),
+        "remote_text": clean_text(remote_text),
         "is_remote": bool(remote["is_remote"]),
         "remote_confidence": remote["remote_confidence"],
         "remote_reason": remote["remote_reason"],

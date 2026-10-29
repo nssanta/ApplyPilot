@@ -33,6 +33,9 @@
 | `presets.py` | публичные поисковые пресеты |
 | `parser.py` | публичный поиск HH, нормализация, enrichment, snapshots, `first_seen` |
 | `campaigns.py` | bounded ручной запуск, exact-time фильтр, score, snapshot и сохранение постоянной очереди |
+| `execution.py` | сохранённые кампании `go`, короткие проходы по источникам, READY-first, продолжение и счётчик подтверждений |
+| `queue_actions.py` | следующее действие по вакансии и диагностика повторных решений без прогресса |
+| `reporting.py` | управленческая сводка, раздельный учёт текущих отправок, статусов и охвата входящих |
 | `decision.py` | единое решение по вакансии/треку: `APPLY/REVIEW/REJECT/APPLIED/BLOCKED`, auto-approval только для разрешённых soft unknowns, повторный sweep старых строк |
 | `forms.py` | чтение text/textarea/number/select/radio/checkbox анкет, ответы только из явных фактов профиля, остальное — в manual queue |
 | `bundles.py` | сводка треков, точные счётчики новизны SQLite/публикаций, дедуп компании+роли, ранжирование зарплаты/AI-native, отдельная review-очередь неопределённых |

@@ -55,6 +55,8 @@ class ApplyOutcome:
             marker in text for marker in (
                 "success rejected:", "persistence failed", "outcome persistence",
                 "captcha", "auth_lost", "platform block", "session lost",
+                "session unavailable", "browser has been closed", "context has been closed",
+                "target closed", "target page, context or browser has been closed",
             )
         )
 
@@ -227,11 +229,18 @@ def dispatch_apply(
     run_id = str(run_id or uuid.uuid4().hex[:12])
     preflight_results: dict[int, dict[str, Any]] = {}
     ready_rows: list[tuple[int, Mapping[str, Any], ApplyDriver, ApplyOutcome]] = []
+    preflight_paused: set[str] = set()
     # Validate the complete prepared pool before the first external submit.
     # This catches expired sessions, changed forms, and missing Getmatch
     # callbacks without leaving a partially sent queue due to late preflight.
     for index, row in enumerate(plan["planned"]):
         source = str(row.get("source") or "")
+        if source in preflight_paused:
+            preflight_results[index] = {
+                **row, "action": "skipped", "status": "wait_source",
+                "reason": "source preflight failed; reconcile or re-authenticate first",
+            }
+            continue
         driver = drivers.get(source)
         if driver is None:
             preflight_results[index] = {
@@ -245,21 +254,30 @@ def dispatch_apply(
                 else ApplyOutcome("ready")
             )
         except Exception as exc:  # noqa: BLE001 - isolate a failing candidate or source
+            outcome = ApplyOutcome("unknown", f"{type(exc).__name__}: {str(exc)[:200]}")
+            if outcome.blocks_source:
+                preflight_paused.add(source)
             preflight_results[index] = {
                 **row, "action": "skipped", "status": "preflight_failed",
                 "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "note": f"{type(exc).__name__}: {str(exc)[:200]}",
             }
             continue
         if preflight.status != "ready":
+            if preflight.blocks_source or preflight.status in {
+                "captcha", "auth_lost", "platform_block",
+            }:
+                preflight_paused.add(source)
             preflight_results[index] = {
                 **row, "action": "skipped", "status": preflight.status,
                 "reason": preflight.note or preflight.evidence or "preflight blocked",
+                "note": preflight.note or preflight.evidence or "preflight blocked",
             }
             continue
         ready_rows.append((index, row, driver, preflight))
 
     live_results: dict[int, dict[str, Any]] = {}
-    paused_sources: set[str] = set()
+    paused_sources: set[str] = set(preflight_paused)
     limited_sources: set[str] = set()
     unknown_counts: Counter[str] = Counter()
     pause_after = max(0, int(unknown_before_pause))
@@ -287,6 +305,19 @@ def dispatch_apply(
             per_day = int(source_budget.get("per_day", 0))
         except (TypeError, ValueError):
             per_run = per_day = 0
+        # A different board may have confirmed the same role since planning.
+        cross_duplicate = store.cross_source_attempt_conflict(
+            source, vacancy_id, str(row.get("name") or ""),
+            str(row.get("description") or ""),
+        )
+        if cross_duplicate:
+            live_results[index] = {
+                **row, "action": "skipped", "status": "cross_source_duplicate",
+                "reason": (f"already attempted via {cross_duplicate['source']}:"
+                           f"{cross_duplicate['vacancy_id']}"),
+            }
+            continue
+
         reserved, reservation_note = store.reserve_source_application(
             source_account, source, vacancy_id, track, channel_key, run_id,
             per_run=per_run, per_day=per_day,
@@ -348,6 +379,14 @@ def dispatch_apply(
             paused_sources.add(source)
             outcome = ApplyOutcome("unknown", "outcome persistence failed; reconcile submitting attempt")
             ledger_status = "submitting"
+        if (recorded and source == "getmatch.ru" and outcome.status == "needs_manual"
+                and "vacancy is archived" in str(outcome.note).casefold()):
+            # This is a verified permanent listing state, not a form needing
+            # the owner's input. Leave it out of future automatic batches.
+            store.set_review_state(
+                source_account, source, vacancy_id, "SKIP",
+                reason="Getmatch live preflight: vacancy is archived", track=track,
+            )
         live_results[index] = {
             **row, "action": "applied" if outcome.status == "success" else "attempted",
             "status": outcome.status, "ledger_status": ledger_status,
