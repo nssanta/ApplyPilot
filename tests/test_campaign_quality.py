@@ -73,6 +73,35 @@ def test_rescore_recovers_old_rejects_and_preserves_owner_and_attempts(tmp_path)
     assert rows["3"]["global_application_state"] == "APPLIED_CONFIRMED"
 
 
+def test_daily_pass_rescores_only_new_ids_and_keeps_old_queue(tmp_path):
+    cfg = AppConfig.discover(tmp_path)
+    store = Store(cfg.db_path)
+    search = effective_search({}, "ai-llm")
+    profile = {"resume": "Example", "resumes": {"default": "Example"}}
+    items = multisource._prepare_scored_items(
+        [vacancy("AI Engineer", "fresh"), vacancy("AI Engineer", "old")],
+        source="hh.ru", profile=profile, search=search,
+        cutoff=datetime.now(UTC) - timedelta(days=1), track_resume="Example",
+    )
+    store.start_campaign("initial", "default", "default", {})
+    store.save_campaign_items("initial", "default", "default", items,
+                              status="ok", snapshot_path="x")
+    result = multisource.refresh_queue(
+        cfg, "default", profile, search, "hh.ru",
+        details_limit=0, vacancy_ids=["fresh"],
+    )
+    decision = sweep_track_decisions(
+        store, "default", "default", "hh.ru",
+        search=search, profile=profile, vacancy_ids=["fresh"],
+    )
+    assert result["rescored"] == 1
+    assert decision["scanned"] == 1
+    rows = {r["id"]: r for r in store.list_campaign_vacancies(
+        "default", "default", "all", None, source="hh.ru",
+    )}
+    assert rows["old"]["review_state"] == "UNREVIEWED"
+
+
 def test_cli_salary_remote_and_region_overrides_reach_scanner_and_rescore(tmp_path, monkeypatch):
     cfg = AppConfig.discover(tmp_path)
     cfg.profile_path.parent.mkdir(parents=True)

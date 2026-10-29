@@ -1311,7 +1311,8 @@ def source_status(config: AppConfig, track: str, account: str | None = None,
 
 def refresh_queue(config: AppConfig, track: str, profile: dict[str, Any],
                   search: dict[str, Any], source: str, *, details_limit: int = 0,
-                  persist: bool = True) -> dict[str, Any]:
+                  persist: bool = True,
+                  vacancy_ids: Iterable[str] | None = None) -> dict[str, Any]:
     """Rescore cached cards using current criteria; optionally drain missing descriptions.
 
     save_campaign_items preserves review decisions and application ledgers. A refresh
@@ -1323,6 +1324,9 @@ def refresh_queue(config: AppConfig, track: str, profile: dict[str, Any],
     store = Store(config.db_path)
     account = resolve_source_account(config, profile, source)
     rows = store.list_campaign_vacancies(account, track, "all", None, source=source)
+    if vacancy_ids is not None:
+        wanted = {str(value) for value in vacancy_ids}
+        rows = [row for row in rows if str(row.get("id")) in wanted]
     terminal = {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN"}
     rows = [row for row in rows if row.get("global_application_state") not in terminal
             and row.get("review_state") not in {"SKIP", "DEFERRED", "MAYBE"}]

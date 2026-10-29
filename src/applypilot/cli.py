@@ -189,7 +189,8 @@ def build_parser() -> argparse.ArgumentParser:
     go.add_argument("--sources", default="all",
                     help="all или список источников через запятую")
     go.add_argument("--source", action="append", help="источник; можно повторить")
-    go.add_argument("--days", type=int, default=30)
+    go.add_argument("--days", type=int, default=None,
+                    help="окно поиска в днях; при продолжении меняет только окно поиска, не счётчик откликов")
     go.add_argument("--limit", type=int, default=100)
     go.add_argument("--target", type=int, default=0,
                     help="желаемое число подтверждённых откликов; shortfall печатается")
@@ -2440,6 +2441,10 @@ def main(argv: list[str] | None = None) -> int:
                     source = row["source"]
                     account = resolve_source_account(selected_config, profile, source)
                     print(f"campaign phase: rescore/enrich; source={source}", flush=True)
+                    # Daily discovery must not rescore/enrich thousands of old
+                    # vacancies on every small scan. Historical manual tasks
+                    # remain in SQLite for separate operator review.
+                    daily_ids = row.get("candidate_ids", []) if args.days == 1 else None
                     if args.queue_only:
                         # A frozen approved shortlist must not spend minutes
                         # enriching the entire historical queue or promote new
@@ -2451,6 +2456,7 @@ def main(argv: list[str] | None = None) -> int:
                             selected_config, args.track, profile, search, source,
                             details_limit=(args.details_limit if args.details_limit is not None else
                                            int(search.get("details_limit", 100))),
+                            vacancy_ids=daily_ids,
                         )
                     if operating_policy.get("auto_approve", True):
                         approvals[source] = approve_scanned_fits(
@@ -2474,6 +2480,7 @@ def main(argv: list[str] | None = None) -> int:
                         if args.queue_only else sweep_track_decisions(
                             store, account, args.track, source,
                             search=search, profile=profile, policy=operating_policy,
+                            vacancy_ids=daily_ids,
                         )
                     )
 

@@ -472,6 +472,13 @@ class Store:
                          "(execution_id,spec_json,status,created_at,updated_at) VALUES(?,?,?,?,?)",
                          (execution_id, json.dumps(spec, ensure_ascii=False), "running", now(), now()))
 
+    def update_execution_spec(self, execution_id: str, spec: dict[str, Any]) -> None:
+        """Persist an explicitly changed scan window without resetting campaign receipts."""
+        with self.connect() as conn:
+            conn.execute("UPDATE execution_campaigns SET spec_json=?, updated_at=? "
+                         "WHERE execution_id=?",
+                         (json.dumps(spec, ensure_ascii=False), now(), execution_id))
+
     def update_execution(self, execution_id: str, status: str, reason: str,
                          progress: dict[str, Any]) -> None:
         with self.connect() as conn:

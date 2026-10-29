@@ -99,6 +99,27 @@ def test_target_smaller_than_batch_never_overshoots(tmp_path):
     assert len(sent) == 7 and calls[0].limit == 7 and len(calls) == 1
 
 
+def test_resume_can_change_daily_scan_window_without_resetting_receipts(tmp_path):
+    cfg = config(tmp_path)
+    main, calls, sent = fake_runner(cfg, first_empty=True)
+    # The first technical slice is incomplete and deliberately uses the old
+    # long discovery window; resuming for today's vacancies must preserve the ID.
+    assert run_go(cfg, args("--track", "first", "--sources", "hh.ru",
+                            "--target", "2", "--target-scope", "total",
+                            "--max-cycles", "1"), main) == 2
+    store = Store(cfg.db_path)
+    with store.connect() as conn:
+        execution_id = conn.execute(
+            "SELECT execution_id FROM execution_campaigns"
+        ).fetchone()[0]
+    assert calls[0].days == 30
+    assert run_go(cfg, args("--campaign-id", execution_id, "--days", "1"), main) == 0
+    assert calls[-1].days == 1
+    assert len(sent) == 2
+    assert store.execution(execution_id)["spec"]["args"]["days"] == 1
+    assert store.execution_counts(execution_id)["hh.ru"]["success"] == 2
+
+
 def test_resume_after_receipts_before_report_keeps_exact_remaining_target(tmp_path):
     cfg = config(tmp_path)
     main, calls, sent = fake_runner(cfg, interrupted=True)

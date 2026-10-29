@@ -143,12 +143,22 @@ def _run_locked(config, args, main, store, registry, roster) -> int:
             raise ValueError("campaign already has saved tracks")
         if args.sources != "all" and args.sources != values.get("sources"):
             raise ValueError("campaign already has saved sources")
+        if args.days is not None and not 1 <= args.days <= 365:
+            raise ValueError("days must be 1..365")
+        # Daily freshness is an operator-controlled scan window, not a new
+        # application campaign. Keep the target, receipts and source roster.
+        changed_days = args.days is not None and args.days != values.get("days")
         values.update(campaign_id=execution_id, max_cycles=args.max_cycles,
+                      days=(args.days if args.days is not None else values.get("days", 30)),
                       queue_only=bool(getattr(args, "queue_only", False) or values.get("queue_only", False)),
                       visible=(args.visible if args.visible or args.headless else values.get("visible", False)))
+        if changed_days:
+            store.update_execution_spec(execution_id, {**saved, "args": values})
         args = Namespace(**values)
         tracks, sources = saved["tracks"], saved["sources"]
     else:
+        if args.days is None:
+            args.days = 30
         active = list(policy.get("active_tracks", []))
         tracks = active if not args.track or args.track == "all" else [args.track]
         sources = ([*registry.sources()] if args.sources == "all" else

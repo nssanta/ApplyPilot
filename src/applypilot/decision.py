@@ -411,14 +411,18 @@ def sweep_track_decisions(
     policy: Mapping[str, Any] | None = None,
     limit: int | None = None,
     persist: bool = True,
+    vacancy_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate every non-terminal row in one track and auto-approve clean FITs.
+    """Evaluate selected or all non-terminal rows and auto-approve clean FITs.
 
     This is deliberately broader than ``approve_scanned_fits``: it revisits
     historical ``NOT_STARTED``/``READY`` rows that fell out of the latest scan
     window.  Human decisions are never overwritten.
     """
     rows = store.list_campaign_vacancies(account, track, "all", limit, source=source)
+    if vacancy_ids is not None:
+        wanted = {str(value) for value in vacancy_ids}
+        rows = [row for row in rows if str(row.get("id")) in wanted]
     counts: Counter[str] = Counter()
     approved: list[str] = []
     blocked: dict[str, str] = {}
