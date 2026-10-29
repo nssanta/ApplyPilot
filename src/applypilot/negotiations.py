@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -80,13 +81,23 @@ def _parse_topics(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def sync_statuses(state_path: Path, store: Store, account: str = "default",
-                  max_pages: int | None = None, timeout: float = 20.0) -> list[dict[str, Any]]:
-    """Читает только статусы откликов; сообщения и chat-endpoints не используются."""
+                  max_pages: int | None = None, timeout: float = 20.0,
+                  proxy_url: str | None = None) -> list[dict[str, Any]]:
+    """Read HH application statuses without reading or posting chat messages."""
+    if proxy_url is None and os.getenv("APPLYPILOT_HH_INTERFACE", "").strip():
+        from .direct_network import hh_proxy
+        with hh_proxy() as active_proxy:
+            return sync_statuses(
+                state_path, store, account, max_pages, timeout, proxy_url=active_proxy,
+            )
     client: requests.Session | None = None
     try:
         if max_pages is not None and max_pages < 1:
             raise SyncError("max_pages must be positive")
         client = requests.Session()
+        if proxy_url:
+            client.trust_env = False
+            client.proxies.update({"http": proxy_url, "https": proxy_url})
         for cookie in _cookies(state_path):
             client.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ".hh.ru"),
                               path=cookie.get("path", "/"))

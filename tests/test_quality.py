@@ -25,5 +25,6 @@ def test_benchmark_has_calibration_control_and_all_public_presets():
     assert result["precision"] >= 0.9
     assert result["recall"] >= 0.85
     assert set(result["by_preset"]) == {
-        "ai-llm", "ai-agents-llmops", "ml-engineering", "python-backend", "go-backend", "software-general"
+        "ai-llm", "ai-agents-llmops", "ml-engineering", "python-backend", "go-backend",
+        "go-ai-backend", "software-general"
     }

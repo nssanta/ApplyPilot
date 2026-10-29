@@ -26,6 +26,7 @@ import requests
 
 from .campaigns import _review_problems, _salary_confidence
 from .config import AppConfig, search_groups
+from .direct_network import hh_proxy
 from .parser import ScanSegment
 from .providers import ProviderRegistry, default_registry
 from .providers.base import SourceCapabilities
@@ -598,7 +599,16 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
                 # Keep state_path on the independent sitemap cursor so the
                 # two discovery channels cannot advance or suppress each other.
         scan_session = None
-        if not fixture_mode and source in {"career.habr.com", "getmatch.ru", "geekjob.ru"}:
+        proxy_context = None
+        if not fixture_mode and source == "hh.ru":
+            proxy_context = hh_proxy()
+            proxy_url = proxy_context.__enter__()
+            scan_session = requests.Session()
+            if proxy_url:
+                scan_session.trust_env = False
+                scan_session.proxies.update({"http": proxy_url, "https": proxy_url})
+            filters["session"] = scan_session
+        elif not fixture_mode and source in {"career.habr.com", "getmatch.ru", "geekjob.ru"}:
             # A provider pass can make hundreds of list/detail GETs. Reuse its
             # connection pool instead of paying a new TCP/TLS setup per URL.
             scan_session = requests.Session()
@@ -614,6 +624,8 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
         finally:
             if scan_session is not None:
                 scan_session.close()
+            if proxy_context is not None:
+                proxy_context.__exit__(None, None, None)
         if hasattr(discovered, "items"):
             raw_items = list(discovered.items)
             segments = list(discovered.segments)
@@ -1383,7 +1395,13 @@ def refresh_queue(config: AppConfig, track: str, profile: dict[str, Any],
     errors = []
     if persist and selected:
         if source == "hh.ru":
-            enriched, errors = enrich_items(selected, len(selected), pause_seconds=1.0)
+            with hh_proxy() as proxy_url, requests.Session() as http:
+                if proxy_url:
+                    http.trust_env = False
+                    http.proxies.update({"http": proxy_url, "https": proxy_url})
+                enriched, errors = enrich_items(
+                    selected, len(selected), session=http, pause_seconds=1.0,
+                )
             updates = {row["id"]: row for row in enriched}
         else:
             provider = default_registry().get(source)

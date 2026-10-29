@@ -67,7 +67,12 @@ def save_state(path: Path, data: dict) -> None:
             os.unlink(temp_name)
 
 
-def login(path: Path, *, data_dir: Path | None = None, profile: dict | None = None) -> None:
+def login(path: Path, *, data_dir: Path | None = None, profile: dict | None = None,
+          proxy_url: str | None = None) -> None:
+    if proxy_url is None and os.getenv("APPLYPILOT_HH_INTERFACE", "").strip():
+        from .direct_network import hh_proxy
+        with hh_proxy() as active_proxy:
+            return login(path, data_dir=data_dir, profile=profile, proxy_url=active_proxy)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -82,6 +87,7 @@ def login(path: Path, *, data_dir: Path | None = None, profile: dict | None = No
             state_path=path,
             profile=profile,
             headless=False,
+            proxy_url=proxy_url,
         )
         try:
             page = session.context.new_page()
@@ -93,8 +99,15 @@ def login(path: Path, *, data_dir: Path | None = None, profile: dict | None = No
 
 
 def check_session(path: Path, *, data_dir: Path | None = None,
-                  profile: dict | None = None) -> SessionCheck:
+                  profile: dict | None = None,
+                  proxy_url: str | None = None) -> SessionCheck:
     """Проверяет реальную HH-сессию в том же persistent Chrome-профиле, что и apply."""
+    if proxy_url is None and os.getenv("APPLYPILOT_HH_INTERFACE", "").strip():
+        from .direct_network import hh_proxy
+        with hh_proxy() as active_proxy:
+            return check_session(
+                path, data_dir=data_dir, profile=profile, proxy_url=active_proxy,
+            )
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -116,6 +129,7 @@ def check_session(path: Path, *, data_dir: Path | None = None,
                 state_path=path,
                 profile=profile,
                 headless=True,
+                proxy_url=proxy_url,
             )
             page = session.context.new_page()
             page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=45000)

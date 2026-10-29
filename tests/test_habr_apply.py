@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from applypilot.habr_apply import HabrPageDriver, apply_habr_page, inspect_habr_page
 
 ROW = {
@@ -390,3 +392,34 @@ def test_remote_signal_must_be_in_target_header_not_recommended_jobs() -> None:
     outcome = apply_habr_page(page, ROW)
     assert outcome.status == "needs_manual"
     assert page.click_count == 0
+
+
+@pytest.mark.parametrize("patch", [
+    {"approved_cover_letter": "Индивидуальное согласованное письмо"},
+    {"cover_letter": "Письмо, которое нельзя молча потерять"},
+    {"cover_letter_required": True},
+])
+def test_habr_letter_request_never_falls_back_to_profile_only(patch) -> None:
+    page = StubHabrPage()
+    result = apply_habr_page(page, {**ROW, **patch})
+    assert result.status == "needs_manual"
+    assert "profile-only" in result.note
+    assert page.click_count == 0
+    assert page.visited == []
+
+
+def test_habr_driver_letter_policy_blocks_preflight_and_apply_before_browser() -> None:
+    def unexpected_page():
+        raise AssertionError("A letter-required response must stop before browser actions")
+
+    driver = HabrPageDriver(unexpected_page, require_cover_letter=True)
+    assert driver.preflight(ROW).status == "needs_manual"
+    assert driver.apply(ROW).status == "needs_manual"
+
+
+def test_habr_direct_letter_policy_cannot_be_bypassed_by_empty_row_letter() -> None:
+    page = StubHabrPage()
+    result = apply_habr_page(page, ROW, require_cover_letter=True)
+    assert result.status == "needs_manual"
+    assert page.click_count == 0
+    assert page.visited == []

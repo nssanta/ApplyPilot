@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -37,11 +38,18 @@ _UA_RE = re.compile(r"Chrome/(\d+)\.")
 def _chrome_binary() -> str | None:
     explicit = os.getenv("APPLYPILOT_CHROME_EXECUTABLE", "").strip()
     if explicit:
-        return explicit
+        return str(Path(explicit).expanduser().resolve())
     for name in _CHROME_CANDIDATES:
         path = shutil.which(name)
         if path:
-            return path
+            return str(Path(path).resolve())
+    if platform.system() == "Darwin":
+        for path in (
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ):
+            if path.is_file():
+                return str(path.resolve())
     return None
 
 
@@ -58,11 +66,16 @@ def chrome_version() -> str:
 
 
 def real_user_agent() -> str:
-    """Returns the installed Chrome's genuine Linux User-Agent string."""
+    """Return a Chrome User-Agent matching the host OS and installed version."""
     version = chrome_version()
     major = version.split(".", 1)[0] if version else "156"
+    system = platform.system()
+    platform_token = {
+        "Darwin": "Macintosh; Intel Mac OS X 10_15_7",
+        "Windows": "Windows NT 10.0; Win64; x64",
+    }.get(system, "X11; Linux x86_64")
     return (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
         f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
     )
 
@@ -186,6 +199,7 @@ def launch_context(
     state_path: Path | None = None,
     profile: dict[str, Any] | None = None,
     headless: bool | None = None,
+    proxy_url: str | None = None,
 ) -> BrowserSession:
     """Launches real Chrome with a persistent profile and a coherent fingerprint.
 
@@ -228,6 +242,8 @@ def launch_context(
         "locale": settings["locale"],
         "timezone_id": settings["timezone"],
     }
+    if proxy_url is not None:
+        kwargs["proxy"] = {"server": proxy_url}
     if headless_mode:
         # New headless Chrome advertises HeadlessChrome in the UA and defaults
         # to an 800x600 screen. Keep the installed Chrome identity and the same
@@ -258,7 +274,10 @@ def launch_context(
         return BrowserSession(context=context, persistent=True, profile_dir=profile_dir)
     # Compatibility path for test doubles and installations without persistent
     # context support. Real production runs always take the branch above.
-    browser = chromium.launch(headless=bool(settings["headless"]))
+    fallback_kwargs: dict[str, Any] = {"headless": bool(settings["headless"])}
+    if proxy_url is not None:
+        fallback_kwargs["proxy"] = {"server": proxy_url}
+    browser = chromium.launch(**fallback_kwargs)
     context_kwargs: dict[str, Any] = {
         "viewport": dict(DEFAULT_WINDOW),
         "locale": settings["locale"],

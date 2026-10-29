@@ -4,6 +4,9 @@ The signed-in one-click response contract was observed on a real Habr vacancy:
 POST /api/frontend/vacancies/{id}/responses -> HTTP 200, then an exact
 /vacancies/{id} link appears in the authenticated /responses history.
 
+Cover-letter submissions are not verified by this one-click driver. Requests
+containing an approved letter or requiring one must stop before browser actions.
+
 Only an explicitly approved and ready vacancy can be submitted. Browser
 contexts and credentials are owned by the caller; this module never opens
 a Telegram session, accesses a password or bypasses a challenge.
@@ -22,6 +25,20 @@ from .dispatch import ApplyOutcome
 HABR_HOST = "career.habr.com"
 HABR_HISTORY = "https://career.habr.com/responses"
 RESPONSE_PATTERN = re.compile(r"^/vacancies/([0-9]+)/?$")
+
+
+def _letter_required(row: Mapping[str, Any], required: bool = False) -> bool:
+    return bool(required or row.get("cover_letter_required") or any(
+        str(row.get(key) or "").strip()
+        for key in ("approved_cover_letter", "cover_letter")
+    ))
+
+
+def _unverified_letter() -> ApplyOutcome:
+    return ApplyOutcome(
+        "needs_manual",
+        "Habr cover-letter submission is unverified; refusing a profile-only response",
+    )
 
 
 def _vacancy_id(url: str) -> str:
@@ -132,9 +149,12 @@ def apply_habr_page(
     row: Mapping[str, Any],
     *,
     require_remote: bool = True,
+    require_cover_letter: bool = False,
     timeout_ms: int = 25_000,
 ) -> ApplyOutcome:
     """Submit one Habr vacancy only when its on-site receipt can be checked."""
+    if _letter_required(row, require_cover_letter):
+        return _unverified_letter()
     url = str(row.get("url") or "")
     vacancy_id = str(row.get("id") or "")
     if not vacancy_id or _vacancy_id(url) != vacancy_id:
@@ -208,9 +228,17 @@ def apply_habr_page(
 
         clicked = True
         submit.first.click(timeout=12_000)
-        page.wait_for_timeout(1000)
-        after_text = page.locator("body").inner_text(timeout=7000)
-        confirmed_notice = "отклик отправлен" in after_text.casefold()
+        confirmed_notice = False
+        for _ in range(10):
+            page.wait_for_timeout(500)
+            if 200 in responses:
+                after_text = page.locator("body").inner_text(timeout=2000)
+                if "отклик отправлен" in after_text.casefold():
+                    confirmed_notice = True
+                    break
+        if not confirmed_notice:
+            after_text = page.locator("body").inner_text(timeout=2000)
+            confirmed_notice = "отклик отправлен" in after_text.casefold()
 
         if not (200 in responses and confirmed_notice):
             if not writes and not responses:
@@ -265,6 +293,7 @@ class HabrPageDriver:
         page_factory: Callable[[], Any],
         *,
         require_remote: bool = True,
+        require_cover_letter: bool = False,
         timeout_ms: int = 25_000,
         min_interval_seconds: float = 2.0,
     ) -> None:
@@ -272,6 +301,7 @@ class HabrPageDriver:
             raise ValueError("Habr live interval must be between 0 and 30 seconds")
         self.page_factory = page_factory
         self.require_remote = require_remote
+        self.require_cover_letter = require_cover_letter
         self.timeout_ms = timeout_ms
         self.min_interval_seconds = float(min_interval_seconds)
         self._last_apply_started: float | None = None
@@ -279,6 +309,8 @@ class HabrPageDriver:
         self._quarantined_ids: set[str] = set()
 
     def preflight(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if _letter_required(row, self.require_cover_letter):
+            return _unverified_letter()
         if str(row.get("id") or "") in self._quarantined_ids:
             return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         if self._paused_after_unknown:
@@ -320,6 +352,8 @@ class HabrPageDriver:
         return ApplyOutcome("ready")
 
     def apply(self, row: Mapping[str, Any]) -> ApplyOutcome:
+        if _letter_required(row, self.require_cover_letter):
+            return _unverified_letter()
         if str(row.get("id") or "") in self._quarantined_ids:
             return ApplyOutcome("needs_manual", "vacancy quarantined after UNKNOWN")
         if self._paused_after_unknown:
@@ -334,6 +368,7 @@ class HabrPageDriver:
             page = self.page_factory()
             outcome = apply_habr_page(
                 page, row, require_remote=self.require_remote,
+                require_cover_letter=self.require_cover_letter,
                 timeout_ms=self.timeout_ms,
             )
             if outcome.status == "unknown":

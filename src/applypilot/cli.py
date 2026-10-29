@@ -4863,6 +4863,22 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                target_success: int | None = None,
                headless_override: bool | None = None,
                search_override: dict[str, Any] | None = None) -> int:
+    """Keep the optional macOS interface proxy active for the whole HH run."""
+    from .direct_network import hh_proxy
+
+    with hh_proxy() as proxy_url:
+        return _run_apply_impl(
+            config, store, selected, run_id, account, input_path, requested_limit,
+            target_success, headless_override, search_override, proxy_url=proxy_url,
+        )
+
+
+def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_id: str,
+                    account: str, input_path: Path, requested_limit: int,
+                    target_success: int | None = None,
+                    headless_override: bool | None = None,
+                    search_override: dict[str, Any] | None = None,
+                    proxy_url: str | None = None) -> int:
     """Выполняет явно запрошенные браузерные отклики с аудируемыми условиями остановки."""
     try:
         profile = _profile(config, search_override or effective_search(config.load_search(), None))
@@ -4878,7 +4894,9 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
         print("profile account changed after candidate selection; rerun dry-run", file=sys.stderr)
         return 2
     state_path = config.data_dir / "hh_session.json"
-    session = check_session(state_path, data_dir=config.data_dir, profile=profile)
+    session = check_session(
+        state_path, data_dir=config.data_dir, profile=profile, proxy_url=proxy_url,
+    )
     if session.status != "confirmed":
         print(f"session unavailable: {session.status} ({session.detail}); run `applypilot login` first",
               file=sys.stderr)
@@ -4945,6 +4963,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                 state_path=state_path,
                 profile=profile,
                 headless=run_headless,
+                proxy_url=proxy_url,
             )
             context = browser_session.context
             page = context.new_page()
@@ -5048,7 +5067,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
                         )
                     try:
                         save_state(state_path, context.storage_state())
-                        sync_statuses(state_path, store, account=account)
+                        sync_statuses(state_path, store, account=account, proxy_url=proxy_url)
                         reconciled = store.reconcile_unknowns_from_negotiations(account)
                     except SyncError as exc:
                         LOGGER.warning("Could not confirm vacancy %s through sync: %s", item.get("id"), exc)
@@ -5100,7 +5119,7 @@ def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: st
             if confirmed_successes and any(item.get("track") for item in selected):
                 try:
                     save_state(state_path, context.storage_state())
-                    synced = sync_statuses(state_path, store, account=account)
+                    synced = sync_statuses(state_path, store, account=account, proxy_url=proxy_url)
                     selected_ids = {str(item.get("id") or "") for item in selected}
                     negotiation_ids = {
                         str(row.get("vacancy_id") or row.get("id") or "") for row in synced

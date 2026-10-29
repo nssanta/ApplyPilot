@@ -70,6 +70,7 @@ class HhSearchAdapter:
             "only_remote": remote, "date_from": date_from,
             "pause_seconds": pause, "order_by": order,
             "deadline": filters.get("deadline"),
+            "session": filters.get("session"),
         }
         remaining = budget
         unique: dict[str, dict[str, Any]] = {}

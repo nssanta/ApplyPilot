@@ -90,6 +90,43 @@ ROLE_PRESETS: dict[str, dict[str, Any]] = {
         "required_role_terms": ["developer", "разработчик", "engineer", "инженер", "backend", "программист"],
         "title_role_terms": ["go", "golang"],
     },
+    "go-ai-backend": {
+        "allow_description_role_match": True,
+        "description_role_terms": ["go", "golang", "ai", "ии", "llm", "rag", "agent", "агент", "mcp"],
+        "resume_key": "go",
+        "queries": [
+            "Go Developer", "Golang Developer", "Go Backend", "Go Engineer",
+            "Golang", "Go разработчик", "Разработчик Go", "Backend Go",
+            "AI Agent Engineer", "LLM Engineer", "AI-разработчик", "RAG Engineer",
+        ],
+        "include_terms": [
+            "go", "golang", "backend", "grpc", "microservices", "postgresql", "docker",
+            "llm", "rag", "agent", "mcp", "qdrant", "vector", "fastapi", "python",
+        ],
+        "exclude_titles": [
+            "продаж", "ассистент", "тренер", "маркетолог", "рекрутер", "support", "qa",
+            "тестиров", "quality assurance", "sdet", "security", "кибербез", "иб",
+            "training", "обучению", "наставник", "ментор", "mentor", "devops",
+            "site reliability", "sre", "java", ".net", "php", "1с", "fullstack", "фулстек",
+            "frontend", "фронтенд", "react", "vue", "angular", "ios", "android", "flutter",
+            "blockchain", "блокчейн", "кастоди", "computer vision",
+        ],
+        "role_terms": [
+            "go", "golang", "backend", "го-разработчик", "разработчик",
+            "ai", "ии", "llm", "agent", "агент", "rag", "genai", "mcp",
+        ],
+        "primary_role_terms": [
+            "go", "golang", "го-разработчик", "backend", "бэкенд",
+            "ai", "ии", "llm", "agent", "агент", "rag", "genai", "mcp",
+        ],
+        "incompatible_title_terms": ["php", "symfony", "java", "c#", ".net", "1с", "frontend", "react", "angular", "rust", "c++", "cpp"],
+        "required_role_terms": [
+            "developer", "инженер", "разработчик", "engineer", "программист", "backend", "бэкенд", "software",
+        ],
+        "title_role_terms": [
+            "go", "golang", "backend", "бэкенд", "ai", "ии", "llm", "agent", "агент", "rag", "genai", "mcp",
+        ],
+    },
     "software-general": {
         "resume_key": "default",
         "queries": ["Software Engineer", "Backend Developer", "Python Developer", "Go Developer"],
