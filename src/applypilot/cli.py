@@ -135,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--max-passes", type=int, default=1)
     scan_cmd.add_argument("--limit", type=int, default=100)
     scan_cmd.add_argument("--json", action="store_true")
-    scan_cmd.add_argument("--query")
+    scan_cmd.add_argument("--query", action="append",
+                          help="поисковая фраза; можно повторить, заменяет запросы пресета")
     scan_cmd.add_argument("--add-query", action="append",
                           help="добавить запрос, не заменяя запросы пресета")
     scan_cmd.add_argument("--area", type=int, action="append")
@@ -4372,7 +4373,7 @@ def main(argv: list[str] | None = None) -> int:
         page = args.page if args.page is not None else 0
         group_specs = []
         for group in groups:
-            queries = [args.query] if args.query else list(group.get("queries", []))
+            queries = list(dict.fromkeys(args.query)) if args.query else list(group.get("queries", []))
             if args.add_query and not args.query:
                 queries = list(dict.fromkeys([*queries, *search["additional_queries"]]))
             group_queries.extend(queries)
