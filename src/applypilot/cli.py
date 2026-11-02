@@ -1703,10 +1703,11 @@ def _run_unified_scan(config: AppConfig, args: argparse.Namespace) -> int:
                  or item.get("description_status") in {"missing", "provisional", "network_error",
                                                        "parse_error"})
         ]
+        enrichment = {}
         if wanted:
             # Rescore the whole selected scan with the current private guard
             # configuration; only missing descriptions spend network budget.
-            refresh_queue(
+            enrichment = refresh_queue(
                 selected_config, args.track, profile, search, source,
                 details_limit=(min(int(detail_limit), len(missing))
                                if missing and int(detail_limit or 0) > 0 else 0),
@@ -1734,6 +1735,9 @@ def _run_unified_scan(config: AppConfig, args: argparse.Namespace) -> int:
             "status": row.get("status"),
             "found": len(rows),
             "new_now": len(candidate_ids),
+            "enrichment": enrichment,
+            "descriptions_ready": sum(bool(item.get("description")) and item.get("description_status") == "ok" for item in rows),
+            "descriptions_pending": sum(not item.get("description") or item.get("description_status") != "ok" for item in rows),
             "passes": int(row.get("passes", 1) or 1),
             "query_count": int(row.get("query_count", 0) or 0),
             "covered_query_count": int(row.get("covered_query_count", 0) or 0),

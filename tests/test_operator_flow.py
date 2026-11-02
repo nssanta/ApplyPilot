@@ -225,6 +225,9 @@ def test_scan_command_records_scan_id_and_coverage(
     assert result["scan_id"] == "scan-live-1"
     assert result["status"] == "scan_complete"
     assert result["sources"]["hh.ru"]["coverage_complete"] is True
+    assert result["sources"]["hh.ru"]["descriptions_ready"] == 1
+    assert result["sources"]["hh.ru"]["descriptions_pending"] == 0
+    assert result["sources"]["hh.ru"]["enrichment"]["errors"] == []
     execution = Store(config.db_path).execution("scan-live-1")
     assert execution is not None and execution["status"] == "scan_complete"
     assert cli.main([
