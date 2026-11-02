@@ -266,3 +266,17 @@ def test_repeated_unchanged_decision_is_reported_as_stagnant(tmp_path: Path) -> 
     assert rows[0]["decision_streak"] == 2
     stagnant = store.stagnant_vacancies("account", "ai_core", min_streak=2)
     assert [row["vacancy_id"] for row in stagnant] == ["stuck"]
+
+
+def test_experience_shortfall_needs_exact_review_and_has_a_bound():
+    from applypilot.decision import resolve_problem, owner_hard_blockers
+    row = _item('stretch', description='Required experience: 5 years in Python.',
+                experience='between3And6', problems=['grade:seniority_check'])
+    profile = {'experience_years': 3}
+    assert resolve_problem('grade:seniority_check', row, profile=profile)[0] == 'block'
+    search = {'decision': {'allow_stretch_grade': True, 'stretch_max_required_years': 6.01}}
+    assert resolve_problem('grade:seniority_check', row, profile=profile, search=search)[0] == 'review'
+    assert owner_hard_blockers(row, profile=profile, search=search) == []
+    row['description'] = 'Required experience: 8 years in Python.'
+    assert resolve_problem('grade:seniority_check', row, profile=profile, search=search)[0] == 'block'
+    assert profile['experience_years'] == 3

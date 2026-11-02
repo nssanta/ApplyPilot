@@ -208,6 +208,10 @@ def resolve_problem(
         if years_value > 0 and minimum is not None:
             if years_value >= minimum:
                 return "resolved", "experience meets the listing's explicit minimum"
+            stretch = search.get("decision") or {}
+            if (stretch.get("allow_stretch_grade") is True
+                    and minimum <= float(stretch.get("stretch_max_required_years", 0))):
+                return "review", "owner permits experience shortfall; verify exact role before approval"
             return "block", "experience is below the listing's explicit minimum"
         if years_value >= 5:
             return "review", "seniority title has no verified minimum requirement"
