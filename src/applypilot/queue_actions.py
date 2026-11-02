@@ -85,16 +85,6 @@ def next_action(row: Mapping[str, Any], source_state: str = "") -> dict[str, Any
             "action_reason": "channel already has an application or reservation",
             "requires_owner": False,
         }
-    if streak >= 2:
-        return {
-            "next_action": "no_progress",
-            "action_reason": (
-                f"unchanged for {streak} decision passes ({decision or 'UNDECIDED'}: "
-                f"{reason_code or 'no reason'}); inspect the gate or change the input"
-            ),
-            "requires_owner": False,
-            "stagnant": True,
-        }
     if decision == "APPLY" and app_state == "READY_TO_APPLY" and review_state == "APPROVED":
         return {
             "next_action": "send",
@@ -119,6 +109,16 @@ def next_action(row: Mapping[str, Any], source_state: str = "") -> dict[str, Any
             "next_action": "reject",
             "action_reason": reason_code or "rejected by the current criteria",
             "requires_owner": False,
+        }
+    if streak >= 2:
+        return {
+            "next_action": "no_progress",
+            "action_reason": (
+                f"unchanged for {streak} decision passes ({decision or 'UNDECIDED'}: "
+                f"{reason_code or 'no reason'}); inspect the gate or change the input"
+            ),
+            "requires_owner": False,
+            "stagnant": True,
         }
     if decision == "REVIEW":
         if any(marker in low_reason for marker in _OWNER_MARKERS):

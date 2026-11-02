@@ -12,7 +12,7 @@ ApplyPilot — локальный инструмент для поиска ва�
 - Чтение сложных анкет (text, textarea, number, select, radio, checkbox) с ответами только из подтверждённых приватных фактов.
 - SQLite-журнал, канонические каналы отправки и защита от дублей.
 - Безопасные `scan`, `form-audit`, `dispatch-plan`, `queue sweep` и `dry-run`.
-- Одна команда `go` для цикла `scan → decide → apply → verify` по всем источникам, с `--visible` и `--headless`.
+- Раздельный рабочий цикл `scan → review → apply → status`; legacy `go` доступен для явно выбранных объединённых кампаний.
 - Браузерные и Telegram-драйверы откликов, требующие явного разрешения и проверки результата; один `UNKNOWN` карантинится без остановки независимых вакансий.
 - Опциональная веб-панель и экспериментальная Debian-сборка.
 
@@ -45,16 +45,14 @@ cp examples/sources.toml private/config/sources.toml
 .venv/bin/python -m applypilot sources scan \
   --track default --fixture-dir tests/fixtures/public --json
 
-# Только поиск и решения, без отправок
-.venv/bin/python -m applypilot go --track default --scan-only
-
-# Полный цикл; live-отправки разрешены operating-policy.toml
-.venv/bin/python -m applypilot go --track default --visible
-.venv/bin/python -m applypilot go --track default --headless
-
-# Ad-hoc поиск и целевое число подтверждённых откликов
-.venv/bin/python -m applypilot go --track default \
-  --query "Example Role" --salary-from 100000 --sources all --target 10 --target-scope total --headless
+# Поиск без отправок → проверка и одобрение точных ID → предварительный план
+.venv/bin/python -m applypilot scan --track default --days 7 --json
+.venv/bin/python -m applypilot review --track default --view top --full-description --json
+.venv/bin/python -m applypilot review --track default --approve ID1,ID2 --reason "Verified full listing and requirements" --json
+.venv/bin/python -m applypilot apply --track default --id ID1,ID2 --dry-run --json
+# Перед HH live: успешная полная синхронизация, затем тот же пакет
+.venv/bin/python -m applypilot sync --track default
+.venv/bin/python -m applypilot apply --track default --id ID1,ID2 --run --headless --json
 
 # Одна логическая вакансия: HH, DreamJob-зеркало, отклик и ответ
 .venv/bin/python -m applypilot queue links --track default --source dreamjob.ru

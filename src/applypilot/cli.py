@@ -135,7 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan_cmd.add_argument("--max-passes", type=int, default=1)
     scan_cmd.add_argument("--limit", type=int, default=100)
     scan_cmd.add_argument("--json", action="store_true")
-    scan_cmd.add_argument("--query")
+    scan_cmd.add_argument("--query", action="append",
+                          help="поисковая фраза; можно повторить, заменяет запросы пресета")
     scan_cmd.add_argument("--add-query", action="append",
                           help="добавить запрос, не заменяя запросы пресета")
     scan_cmd.add_argument("--area", type=int, action="append")
@@ -2066,7 +2067,7 @@ def _run_apply_package(config: AppConfig, args: argparse.Namespace) -> int:
                 store, accounts[source], args.track, source,
                 max(1, len(package_ids) or int(args.limit)),
                 scan_id=args.scan,
-                vacancy_ids=package_ids or requested_ids or None,
+                vacancy_ids=package_ids,
                 verified_driver=source in {
                     "career.habr.com", "getmatch.ru", "geekjob.ru", "yandex.ru/jobs",
                 },
@@ -2074,6 +2075,10 @@ def _run_apply_package(config: AppConfig, args: argparse.Namespace) -> int:
             plans[source] = plan
         result = {
             "mode": "dry_run", "track": args.track, "scan": args.scan or "",
+            "excluded_ids": [
+                {"id": vacancy_id, "reason": "not in approved package for the selected track, source and scan, or beyond limit"}
+                for vacancy_id in sorted(requested_ids - {str(row.get("id") or "") for row in package})
+            ],
             "package_count": len(package), "sources": {
                 source: {
                     "package": [
@@ -4372,7 +4377,7 @@ def main(argv: list[str] | None = None) -> int:
         page = args.page if args.page is not None else 0
         group_specs = []
         for group in groups:
-            queries = [args.query] if args.query else list(group.get("queries", []))
+            queries = list(dict.fromkeys(args.query)) if args.query else list(group.get("queries", []))
             if args.add_query and not args.query:
                 queries = list(dict.fromkeys([*queries, *search["additional_queries"]]))
             group_queries.extend(queries)
@@ -4858,6 +4863,12 @@ def _browser_context_lost(note: str) -> bool:
     ))
 
 
+def _allow_manual_captcha(*, run_headless: bool, visible_requested: bool,
+                          has_tty: bool, env_interactive: bool) -> bool:
+    """Explicit visible background jobs must not lose the manual CAPTCHA wait."""
+    return not run_headless and (visible_requested or has_tty or env_interactive)
+
+
 def _run_apply(config: AppConfig, store: Store, selected: list[dict], run_id: str,
                account: str, input_path: Path, requested_limit: int,
                target_success: int | None = None,
@@ -4938,9 +4949,12 @@ def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_i
         browser_options["headless"] = headless_override
     run_headless = bool(browser_options["headless"])
     manual_captcha_timeout = float(browser_options["manual_captcha_timeout_seconds"])
-    interactive_captcha = (
-        not run_headless
-        and (sys.stdin.isatty() or os.getenv("APPLYPILOT_INTERACTIVE", "") == "1")
+    # A visible job launched through the command executor has no stdin TTY.
+    # The explicit --visible flag itself grants time for the owner to solve CAPTCHA.
+    interactive_captcha = _allow_manual_captcha(
+        run_headless=run_headless, visible_requested=(headless_override is False),
+        has_tty=sys.stdin.isatty(),
+        env_interactive=(os.getenv("APPLYPILOT_INTERACTIVE", "") == "1"),
     )
     run_status = "completed"
     stop_reason = ""

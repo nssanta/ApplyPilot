@@ -278,3 +278,23 @@ def test_auto_approval_reason_is_not_treated_as_owner_override() -> None:
     }
     decision = decide_row(row, search={"days": 3})
     assert decision.action != "APPLY"
+
+
+def test_empty_apply_package_never_plans_other_approved_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path)
+    store = _seed(config, [_vacancy('101')])
+    store.set_review_state('default', 'hh.ru', '101', 'APPROVED',
+                           reason='operator checked full listing', track='ai')
+    monkeypatch.setattr(cli, '_config', lambda _args: config)
+    monkeypatch.setattr(cli, '_track_config', lambda *a, **kw: (config, {'resume': 'AI Engineer'}))
+    # The package selector can be stricter than queue_plan (e.g. cross-source
+    # conflicts). An empty package must remain empty rather than mean all rows.
+    monkeypatch.setattr(cli, '_approved_package', lambda *a, **kw: [])
+    assert cli.main(['apply', '--track', 'ai', '--source', 'hh.ru',
+                     '--id', '101', '--dry-run', '--json']) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['package_count'] == 0
+    assert result['sources']['hh.ru']['planned_rows'] == []
+    assert result['excluded_ids'][0]['id'] == '101'

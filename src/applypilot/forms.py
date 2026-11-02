@@ -21,13 +21,14 @@ YES_WORDS = {"yes", "да", "true", "есть", "имею", "готов", "го�
 NO_WORDS = {"no", "нет", "false", "не имею", "не готов", "не готова", "не согласен", "не согласна"}
 
 ANSWER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("salary", ("зарплат", "доход", "оклад", "compensation", "salary")),
+    ("salary", ("зарплат", "доход", "оклад", "compensation", "salary", "от какой суммы", "ожидаемая сумма")),
     ("english", ("english", "английск", "уровень владения языком")),
     ("motivation", ("почему", "мотивац", "why", "заинтерес", "interest")),
     ("citizenship", ("гражданств", "citizenship")),
     ("work_authorization", ("разрешение на работу", "work authorization", "право на работу")),
     ("relocation", ("релокац", "переезд", "relocation")),
     ("start_date", ("когда можете начать", "start date", "дата выхода", "notice period")),
+    ("office_hybrid", ("офисному или гибридному", "офисному формату", "гибридному формату", "работать в офисе", "hybrid or office")),
     ("remote", ("удален", "удалён", "remote")),
     ("experience_years", ("сколько лет", "years of experience", "опыт работы", "стаж")),
     ("education", ("образование", "degree", "education")),
@@ -44,7 +45,7 @@ TECH_TERMS = {
 }
 
 FACT_KEYS = {
-    "salary", "english", "english_level", "motivation", "citizenship",
+    "salary", "english", "english_level", "motivation", "citizenship", "office_hybrid",
     "work_authorization", "relocation", "start_date", "remote",
     "experience_years", "education", "current_location", "skills",
 }

@@ -23,6 +23,20 @@ def _contains_captcha(text: str) -> bool:
     return "captcha" in lowered or "капч" in lowered or "подтвердите, что вы не робот" in lowered
 
 
+def _is_archived_vacancy(text: str) -> bool:
+    """Detect explicit HH archive notices, not incidental archive mentions."""
+    normalized = " ".join(str(text).casefold().split())
+    return any(marker in normalized for marker in (
+        "вакансия в архиве",
+        "вакансия уже в архиве",
+        "вакансия архивирована",
+        "вакансия закрыта",
+        "вакансия больше не актуальна",
+        "vacancy is archived",
+        "vacancy is closed",
+    ))
+
+
 def _normalize_resume_title(value: str) -> str:
     return " ".join(str(value).split()).casefold()
 
@@ -330,6 +344,12 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         body = page.locator("body").inner_text().lower()
         if "вы откликнулись" in body or "отклик отправлен" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
+        # HH leaves closed vacancy pages online; reject before attempting to click.
+        # Browser fixtures may lack title(); real Playwright pages always expose it.
+        title_reader = getattr(page, "title", None)
+        page_title = title_reader() if callable(title_reader) else ""
+        if _is_archived_vacancy(page_title) or _is_archived_vacancy(body[:2000]):
+            return ApplyResult("needs_manual", "HH vacancy is archived or closed; no submit attempted")
         if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
             if not _manual_captcha(page, manual_captcha_timeout, interactive):
                 return ApplyResult("needs_manual",
