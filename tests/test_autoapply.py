@@ -847,3 +847,9 @@ def test_resume_dropdown_refuses_missing_or_unconfirmed_choice():
     unconfirmed = _SelectPage(["AI/LLM Engineer", "Backend Developer"], picked_shows="AI/LLM Engineer")
     assert not _choose_from_resume_dropdown(unconfirmed, unconfirmed.locator('[data-qa="resume-title"]'),
                                             "Backend Developer")
+
+
+def test_hidden_vacancy_notice_counts_as_closed():
+    from applypilot.autoapply import _is_archived_vacancy
+
+    assert _is_archived_vacancy("Вам недоступна эта вакансия. Войдите как пользователь, у которого есть доступ")

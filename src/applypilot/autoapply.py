@@ -34,6 +34,8 @@ def _is_archived_vacancy(text: str) -> bool:
         "вакансия больше не актуальна",
         "vacancy is archived",
         "vacancy is closed",
+        # Employer hid the listing; the page offers only a login form.
+        "вам недоступна эта вакансия",
     ))
 
 
