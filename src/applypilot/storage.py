@@ -2917,6 +2917,13 @@ class Store:
                 (timestamp, account, vacancy_id),
             ).rowcount
             if updated:
+                # ``prepared`` maps to no campaign state, so a later scan cannot
+                # rebuild NEEDS_FORM from the old screening note.
+                conn.execute(
+                    "UPDATE attempts SET status='prepared',note=?,updated_at=? "
+                    "WHERE account=? AND vacancy_id=?",
+                    ("screening answers prepared by operator", timestamp, account, vacancy_id),
+                )
                 conn.execute(
                     "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) VALUES(?,?,?,?,?,?)",
                     (account, vacancy_id, "form_reopened", "screening answers prepared", "", timestamp),

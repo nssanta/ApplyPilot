@@ -162,6 +162,8 @@ def test_reopen_form_only_for_never_submitted_needs_form(tmp_path):
     assert [form["questions"] for form in forms] == [["Город? [textarea]", "Формат? [textarea]"]]
     assert store.reopen_form("acc", "7") is True
     assert store.pending_forms("acc") == []
+    with store.connect() as conn:
+        assert conn.execute("SELECT status FROM attempts WHERE vacancy_id='7'").fetchone()[0] == "prepared"
     assert store.reopen_form("acc", "7") is False
 
 
