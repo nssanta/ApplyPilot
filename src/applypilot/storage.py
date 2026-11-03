@@ -2863,6 +2863,50 @@ class Store:
             result["payload"] = {}
         return result
 
+    def pending_forms(self, account: str = "default", limit: int = 100) -> list[dict[str, Any]]:
+        """HH vacancies stopped on screening questions that were never submitted."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT v.vacancy_id, v.title, v.company, v.url, a.note, a.resume, a.updated_at
+                FROM vacancies v JOIN attempts a ON a.account=v.account AND a.vacancy_id=v.vacancy_id
+                WHERE v.account=? AND v.source='hh.ru' AND v.application_state='NEEDS_FORM'
+                  AND a.status='needs_manual'
+                ORDER BY a.updated_at DESC LIMIT ?""",
+                (account, int(limit)),
+            ).fetchall()
+        prefix = "unanswered screening questions: "
+        result = []
+        for row in rows:
+            note = str(row["note"] or "")
+            questions = [part.strip() for part in note.removeprefix(prefix).split("; ") if part.strip()] \
+                if note.startswith(prefix) else []
+            result.append({"id": row["vacancy_id"], "title": row["title"], "company": row["company"],
+                           "url": row["url"], "resume": row["resume"], "questions": questions,
+                           "note": "" if questions else note, "stopped_at": row["updated_at"]})
+        return result
+
+    def reopen_form(self, account: str, vacancy_id: str) -> bool:
+        """Return a never-submitted NEEDS_FORM vacancy to the send queue after answers exist."""
+        timestamp = now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            attempt = conn.execute(
+                "SELECT status FROM attempts WHERE account=? AND vacancy_id=?", (account, vacancy_id),
+            ).fetchone()
+            if attempt is None or attempt["status"] != "needs_manual":
+                return False
+            updated = conn.execute(
+                "UPDATE vacancies SET application_state='NOT_STARTED',updated_at=? "
+                "WHERE account=? AND source='hh.ru' AND vacancy_id=? AND application_state='NEEDS_FORM'",
+                (timestamp, account, vacancy_id),
+            ).rowcount
+            if updated:
+                conn.execute(
+                    "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) VALUES(?,?,?,?,?,?)",
+                    (account, vacancy_id, "form_reopened", "screening answers prepared", "", timestamp),
+                )
+            return bool(updated)
+
     def workflow_tasks(self, account: str = "default", task_type: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM workflow_tasks WHERE account=?"
         params: list[Any] = [account]

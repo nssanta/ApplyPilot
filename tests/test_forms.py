@@ -130,3 +130,36 @@ def test_text_field_is_filled_from_fact_and_unknown_is_reported():
     result = fill_screening_form(root, {}, {"experience_years": 3})
     assert result.resolved
     assert root.task.field.value == "3"
+
+
+def test_operator_answers_for_one_vacancy_win_and_pick_radio_options(tmp_path):
+    from applypilot.forms import load_screening_answers
+
+    (tmp_path / "screening-answers.json").write_text(
+        '{"42": {"находитесь в РФ": "Да, нахожусь в РФ", "Почему вы": "Своими словами."}}',
+        encoding="utf-8",
+    )
+    per_vacancy = load_screening_answers(tmp_path)
+    answers = {"motivation": "generic", "_by_question": per_vacancy["42"]}
+    options = ["Да, нахожусь в РФ и собираюсь оставаться здесь", "Нет, нахожусь зарубежом"]
+    assert answer_question("Скажите, вы сейчас находитесь в РФ?", "radio", options, answers, {}) == options[0]
+    assert answer_question("Почему вы выбрали нас?", "textarea", (), answers, {}) == "Своими словами."
+    assert load_screening_answers(tmp_path / "missing") == {}
+
+
+def test_reopen_form_only_for_never_submitted_needs_form(tmp_path):
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("c", "acc", "ai", {"query": "AI"})
+    store.save_campaign_items("c", "acc", "ai", [{"id": "7", "name": "Python", "company": "X",
+                                                      "url": "https://hh.ru/vacancy/7"}],
+                              status="ok", snapshot_path="")
+    item = {"id": "7", "name": "Python", "company": "X", "url": "https://hh.ru/vacancy/7", "score": 50}
+    store.record(item, "needs_manual", "unanswered screening questions: Город? [textarea]; Формат? [textarea]",
+                 "run", "acc")
+    forms = store.pending_forms("acc")
+    assert [form["questions"] for form in forms] == [["Город? [textarea]", "Формат? [textarea]"]]
+    assert store.reopen_form("acc", "7") is True
+    assert store.pending_forms("acc") == []
+    assert store.reopen_form("acc", "7") is False

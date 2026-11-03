@@ -520,6 +520,10 @@ def evaluate_search_filter(raw: dict[str, Any], search: dict[str, Any]) -> Filte
                 if upper is None and lower is not None and int(lower) < minimum:
                     # "from 100k" has no ceiling: it may still overlap a 120k
                     # target, but cannot be advertised as verified salary.
+                    # ``open_range_min`` is the owner's accepted open floor.
+                    open_min = int(salary_cfg.get("open_range_min", 0) or 0)
+                    if open_min and int(lower) >= open_min:
+                        return FilterDecision("pass", ("salary:open_range_accepted",), tuple(fields))
                     return FilterDecision("unknown", ("salary:open_range_below_target",), tuple(fields))
                 if max(int(lower or 0), int(upper or 0)) < minimum:
                     return FilterDecision("reject", ("salary:possible_below_threshold",), tuple(fields))

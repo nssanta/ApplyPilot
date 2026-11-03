@@ -127,9 +127,25 @@ def _salary_can_overlap(row: Mapping[str, Any], search: Mapping[str, Any] | None
         return True
     try:
         upper = int(salary.get("to")) if salary.get("to") is not None else None
+        lower = int(salary.get("from")) if salary.get("from") is not None else None
     except (TypeError, ValueError):
         return False
-    return upper is not None and upper >= floor
+    if upper is not None:
+        return upper >= floor
+    # An open "from X" range can reach the target when X is close enough;
+    # ``open_range_min`` is the owner's lowest acceptable open floor.
+    try:
+        open_min = int(((search or {}).get("salary") or {}).get("open_range_min", 0) or 0)
+    except (TypeError, ValueError):
+        open_min = 0
+    return lower is not None and open_min > 0 and lower >= open_min
+
+
+_LEAD_TITLE = re.compile(
+    r"(?:\blead\b|\bhead\b|principal|architect|director|\bcto\b|"
+    r"руководител|тимлид|лидер|архитектор|директор)",
+    re.IGNORECASE,
+)
 
 
 def resolve_problem(
@@ -211,11 +227,16 @@ def resolve_problem(
             stretch = search.get("decision") or {}
             if (stretch.get("allow_stretch_grade") is True
                     and minimum <= float(stretch.get("stretch_max_required_years", 0))):
+                if stretch.get("stretch_auto_approve") is True and not _LEAD_TITLE.search(title):
+                    return "resolved", "owner auto-approves this experience shortfall"
                 return "review", "owner permits experience shortfall; verify exact role before approval"
             return "block", "experience is below the listing's explicit minimum"
         if years_value >= 5:
             return "review", "seniority title has no verified minimum requirement"
-        if bool((search.get("decision") or {}).get("allow_stretch_grade", False)):
+        stretch = search.get("decision") or {}
+        if bool(stretch.get("allow_stretch_grade", False)):
+            if stretch.get("stretch_auto_approve") is True and not _LEAD_TITLE.search(title):
+                return "resolved", "owner auto-approves a stretch grade without explicit minimum"
             return "review", "stretch grade is allowed but needs an explicit confirmation"
         return "review", "seniority needs an explicit owner decision"
     if code.startswith(("role:", "hard:", "preset_noise:", "stack:title_incompatible")):
@@ -242,6 +263,18 @@ def _minimum_experience(row: Mapping[str, Any]) -> float | None:
     values = ([floor] if floor is not None else []) + required
     return max(values) if values else None
 
+
+# Title-level verdicts the scanner reaches from the search card alone.  They
+# do not need a full description, so a provisional card can be rejected now
+# instead of lingering in the enrichment queue.
+_TITLE_REJECT_CODES = (
+    "preset_noise:",
+    "role:title_not_technical",
+    "role:title_not_target",
+    "role:configured_title_exclusion",
+    "stack:title_incompatible",
+    "hard:",
+)
 
 _OWNER_SOFT_PROBLEMS = {"role:title_not_target", "role:no_match"}
 _OWNER_SOFT_FILTER_PREFIXES = (
@@ -339,6 +372,8 @@ def _soft_unknown_reasons(
         allowed.discard("salary:unpublished_not_verified")
     if not policy.get("allow_unknown_publication", True):
         allowed.discard("publication:time_not_verified")
+    if _salary_can_overlap(row, search):
+        allowed |= {"salary:open_range_below_target", "salary:open_range_accepted"}
     unknown = sorted(reason for reason in reasons if reason not in allowed and not reason.endswith(":matching"))
     return not unknown, unknown
 
@@ -397,6 +432,17 @@ def decide_row(
                             "operator approved this exact vacancy after review")
         return Decision("REVIEW", "approved_without_ready",
                         f"approved vacancy is in {state}; re-check preflight")
+    description_status_value = str(row.get("description_status") or "")
+    description_missing = description_status_value != "telegram" and (
+        description_status_value in {"missing", "provisional"}
+        or not str(row.get("description") or "").strip()
+    )
+    if description_missing:
+        codes = [str(value) for value in (*row.get("problems", []), *row.get("filter_reasons", []))]
+        title_codes = [code for code in codes if code.startswith(_TITLE_REJECT_CODES)]
+        if title_codes:
+            return Decision("REJECT", "title_excluded",
+                            "title alone rules the role out: " + ", ".join(title_codes[:3]))
     if score_decision == "maybe" and str(row.get("description_status") or "") in {
         "telegram", "missing", "provisional",
     }:

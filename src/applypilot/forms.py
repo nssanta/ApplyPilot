@@ -262,6 +262,15 @@ def answer_question(question: str, field_type: str, options: Iterable[str],
     facts = facts or {}
     text = normalize(question)
 
+    # Answers an operator wrote for this exact vacancy win over generic facts.
+    by_question = answers.get("_by_question") or {}
+    if isinstance(by_question, Mapping):
+        for fragment, value in by_question.items():
+            if normalize(fragment) and normalize(fragment) in text and str(value).strip():
+                if field_type in {"radio", "select"}:
+                    return _pick_option(str(value), options)
+                return str(value).strip()
+
     skills = facts.get("skills") or answers.get("skills") or []
     if isinstance(skills, str):
         skills = [value.strip() for value in re.split(r"[,;/]", skills) if value.strip()]
@@ -380,3 +389,26 @@ def fill_screening_form(root: Any, answers: Mapping[str, Any] | None,
         filled=tuple(filled),
         fields=tuple(fields),
     )
+
+
+SCREENING_ANSWERS_FILE = "screening-answers.json"
+
+
+def load_screening_answers(data_dir: Any) -> dict[str, dict[str, str]]:
+    """Private ``{vacancy_id: {question fragment: answer}}`` written by the operator."""
+    import json
+    from pathlib import Path
+
+    path = Path(data_dir) / SCREENING_ANSWERS_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{path} must map vacancy IDs to question/answer objects")  # noqa: TRY004
+    return {
+        str(vacancy_id): {str(question): str(answer) for question, answer in answers.items()}
+        for vacancy_id, answers in raw.items() if isinstance(answers, Mapping)
+    }

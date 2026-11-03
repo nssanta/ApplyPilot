@@ -768,3 +768,82 @@ def test_delayed_popup_submit_is_waited_for_before_unknown():
     assert result.status == "success"
     assert page.waited_for_submit
     assert sum("submit-popup" in selector for selector in page.clicks) == 1
+
+
+class _SelectPage:
+    """Minimal HH resume select: one visible card, options after opening it."""
+
+    def __init__(self, options, picked_shows=None):
+        self.options = options
+        self.opened = False
+        self.selected = "AI/LLM Engineer"
+        self.picked_shows = picked_shows
+        self.keyboard = self
+        self.pressed = []
+
+    def press(self, key):
+        self.pressed.append(key)
+        self.opened = False
+
+    def wait_for_timeout(self, _ms):
+        return None
+
+    def locator(self, selector):
+        return _SelectLocator(self, selector)
+
+
+class _SelectLocator:
+    def __init__(self, page, selector, index=0):
+        self.page, self.selector, self.index = page, selector, index
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, index):
+        return _SelectLocator(self.page, self.selector, index)
+
+    def _is_option(self):
+        return "magritte-select-option-list" in self.selector
+
+    def count(self):
+        if self._is_option():
+            return len(self.page.options) if self.page.opened else 0
+        return 1
+
+    def wait_for(self, state=None, timeout=None):
+        assert self.page.opened
+
+    def is_visible(self, timeout=None):
+        return True
+
+    def inner_text(self, timeout=None):
+        if self._is_option():
+            return self.page.options[self.index] + "\nобновлено вчера"
+        return self.page.selected
+
+    def click(self, timeout=None):
+        if self._is_option():
+            self.page.selected = self.page.picked_shows or self.page.options[self.index]
+            self.page.opened = False
+        else:
+            self.page.opened = True
+
+
+def test_resume_dropdown_selects_the_exact_configured_resume():
+    from applypilot.autoapply import _choose_from_resume_dropdown
+
+    page = _SelectPage(["AI/LLM Engineer", "Backend Developer", "ML Engineer"])
+    assert _choose_from_resume_dropdown(page, page.locator('[data-qa="resume-title"]'), "backend developer")
+    assert page.selected == "Backend Developer"
+
+
+def test_resume_dropdown_refuses_missing_or_unconfirmed_choice():
+    from applypilot.autoapply import _choose_from_resume_dropdown
+
+    missing = _SelectPage(["AI/LLM Engineer", "ML Engineer"])
+    assert not _choose_from_resume_dropdown(missing, missing.locator('[data-qa="resume-title"]'), "Backend Developer")
+    assert missing.pressed == ["Escape"]
+    unconfirmed = _SelectPage(["AI/LLM Engineer", "Backend Developer"], picked_shows="AI/LLM Engineer")
+    assert not _choose_from_resume_dropdown(unconfirmed, unconfirmed.locator('[data-qa="resume-title"]'),
+                                            "Backend Developer")

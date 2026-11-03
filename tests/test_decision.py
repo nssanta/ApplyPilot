@@ -269,7 +269,7 @@ def test_repeated_unchanged_decision_is_reported_as_stagnant(tmp_path: Path) -> 
 
 
 def test_experience_shortfall_needs_exact_review_and_has_a_bound():
-    from applypilot.decision import resolve_problem, owner_hard_blockers
+    from applypilot.decision import owner_hard_blockers, resolve_problem
     row = _item('stretch', description='Required experience: 5 years in Python.',
                 experience='between3And6', problems=['grade:seniority_check'])
     profile = {'experience_years': 3}
@@ -280,3 +280,42 @@ def test_experience_shortfall_needs_exact_review_and_has_a_bound():
     row['description'] = 'Required experience: 8 years in Python.'
     assert resolve_problem('grade:seniority_check', row, profile=profile, search=search)[0] == 'block'
     assert profile['experience_years'] == 3
+
+
+def test_owner_stretch_auto_approve_resolves_up_to_six_years_except_lead_titles():
+    from applypilot.decision import resolve_problem
+    search = {'decision': {'allow_stretch_grade': True, 'stretch_max_required_years': 6.01,
+                           'stretch_auto_approve': True}}
+    profile = {'experience_years': 3}
+    row = _item('senior', name='Senior Python Developer', experience='moreThan6',
+                description='Опыт коммерческой разработки на Python от 5 лет.',
+                problems=['grade:seniority_check'])
+    assert resolve_problem('grade:seniority_check', row, profile=profile, search=search)[0] == 'resolved'
+    assert decide_row(row, search=search, profile=profile).action == 'APPLY'
+    lead = {**row, 'name': 'Руководитель группы разработки (Python)'}
+    assert resolve_problem('grade:seniority_check', lead, profile=profile, search=search)[0] == 'review'
+    explicit = {**row, 'description': 'Опыт коммерческой разработки на Python от 8 лет.'}
+    assert resolve_problem('grade:seniority_check', explicit, profile=profile, search=search)[0] == 'block'
+
+
+def test_open_salary_range_is_accepted_from_the_owner_floor():
+    from applypilot.decision import resolve_problem
+    search = {'salary': {'from': 120000, 'open_range_min': 100000, 'policy': 'possible'}}
+    open_ok = _item('open', salary={'currency': 'RUR', 'from': 110000, 'to': None},
+                    problems=['salary:below_or_unverified'], filter_status='unknown',
+                    filter_reasons=['salary:open_range_below_target'])
+    assert resolve_problem('salary:below_or_unverified', open_ok, search=search)[0] == 'resolved'
+    assert decide_row(open_ok, search=search).action == 'APPLY'
+    low = {**open_ok, 'salary': {'currency': 'RUR', 'from': 80000, 'to': None}}
+    assert resolve_problem('salary:below_or_unverified', low, search=search)[0] == 'review'
+    assert decide_row(low, search=search).action == 'REVIEW'
+
+
+def test_provisional_card_with_title_verdict_is_rejected_without_enrichment():
+    junk = _item('sales', name='Менеджер по продажам', description='', description_status='provisional',
+                 score=0, score_decision='reject', filter_status='unknown',
+                 problems=['role:title_not_technical', 'preset_noise:продаж'])
+    decision = decide_row(junk)
+    assert (decision.action, decision.reason_code) == ('REJECT', 'title_excluded')
+    relevant = {**junk, 'name': 'Python developer', 'problems': ['role:no_match']}
+    assert decide_row(relevant).reason_code == 'needs_description'

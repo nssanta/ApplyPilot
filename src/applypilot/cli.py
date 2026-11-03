@@ -30,6 +30,7 @@ from .config import (
     validate_search,
 )
 from .cover_letters import letter_mode, load_letter_profile, render_template
+from .forms import SCREENING_ANSWERS_FILE, load_screening_answers
 from .llm import generate
 from .pacing import next_delay
 from .parser import (
@@ -289,7 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     queue_shortlist.add_argument("--source", action="append", help="источник; можно повторить")
     queue_shortlist.add_argument("--limit", type=int, default=100)
     queue_shortlist.add_argument("--min-score", type=int, default=45)
-    queue_shortlist.add_argument("--description-chars", type=int, default=3500)
+    queue_shortlist.add_argument("--description-chars", type=int, default=0,
+                                 help="0 — только выдержка требований; >0 — полный текст до N символов")
+    queue_shortlist.add_argument("--id", action="append", help="только эти ID; можно повторить")
     queue_shortlist.add_argument("--json", action="store_true")
     queue_set = queue_sub.add_parser("set", help="сохранить решение владельца по вакансии")
     queue_set.add_argument("--track", required=True)
@@ -335,6 +338,14 @@ def build_parser() -> argparse.ArgumentParser:
     queue_sweep.add_argument("--dry-run", action="store_true",
                              help="только показать решения, не менять review/application state")
     queue_sweep.add_argument("--json", action="store_true")
+    queue_forms = queue_sub.add_parser(
+        "forms", help="анкеты HH, на которых остановился кликер; возврат в очередь после ответов",
+    )
+    queue_forms.add_argument("--track", default="ai")
+    queue_forms.add_argument("--limit", type=int, default=100)
+    queue_forms.add_argument("--reopen", action="append", default=[],
+                             help="ID с готовыми ответами в private/data/screening-answers.json")
+    queue_forms.add_argument("--json", action="store_true")
     queue_history = queue_sub.add_parser("history", help="история запусков поиска")
     queue_history.add_argument("--track")
     queue_history.add_argument("--limit", type=int, default=20)
@@ -3908,6 +3919,40 @@ def main(argv: list[str] | None = None) -> int:
                     if stagnant:
                         print(f"  stagnant={len(stagnant)} (same decision for >= {args.min_streak} passes)")
                 return 0
+            if args.queue_action == "forms":
+                selected_config, _ = _track_config(
+                    config, args.track, profile_override=bool(args.profile),
+                    search_override=bool(args.search),
+                )
+                profile = _profile(selected_config, effective_search(selected_config.load_search()))
+                account = _account(profile)
+                store = Store(selected_config.db_path)
+                answers = load_screening_answers(selected_config.data_dir)
+                reopened: dict[str, str] = {}
+                for vacancy_id in _split_action_ids(args.reopen):
+                    if not answers.get(vacancy_id):
+                        reopened[vacancy_id] = f"no answers in {SCREENING_ANSWERS_FILE}"
+                    elif store.reopen_form(account, vacancy_id):
+                        reopened[vacancy_id] = "reopened"
+                    else:
+                        reopened[vacancy_id] = "not a never-submitted NEEDS_FORM vacancy"
+                forms = store.pending_forms(account, args.limit)
+                for form in forms:
+                    form["answers_ready"] = bool(answers.get(str(form["id"])))
+                payload = {"answers_file": str(selected_config.data_dir / SCREENING_ANSWERS_FILE),
+                           "pending": forms, "reopened": reopened}
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=1))
+                else:
+                    for vacancy_id, outcome in reopened.items():
+                        print(f"reopen {vacancy_id}: {outcome}")
+                    print(f"pending forms: {len(forms)} · answers file: {payload['answers_file']}")
+                    for form in forms:
+                        print(f"  {form['id']} · {form['title'][:60]} — {form['company'][:30]}"
+                              f" · answers={'yes' if form['answers_ready'] else 'no'}")
+                        for question in form["questions"] or [form["note"]]:
+                            print(f"      ? {question[:200]}")
+                return 0
             if args.queue_action == "shortlist":
                 from .multisource import resolve_source_account
                 from .providers import default_registry
@@ -3931,9 +3976,12 @@ def main(argv: list[str] | None = None) -> int:
                 payload = build_review_shortlist(
                     review_rows, limit=args.limit, min_score=args.min_score,
                     description_chars=args.description_chars,
+                    vacancy_ids=[part for value in (args.id or []) for part in str(value).split(",") if part],
                 )
                 if args.json:
-                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                    # One card per line keeps a 100-card review pass small for an agent.
+                    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                          .replace('},{"source"', '},\n{"source"'))
                 else:
                     print(f"shortlist: reviewable={payload['counts']['unique_reviewable']} "
                           f"returned={payload['counts']['returned']} "
@@ -5016,6 +5064,7 @@ def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_i
     unknown_ids: list[str] = []
     letter_failures = 0
     manual_questions: list[dict[str, str]] = []
+    vacancy_answers = load_screening_answers(config.data_dir)
     with store.run_lock():
         store.recover_interrupted_runs(account)
         store.start_run(run_id, account, "apply", input_path, requested_limit, selected)
@@ -5106,7 +5155,10 @@ def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_i
                     visibility_verified=visibility_verified,
                     manual_captcha_timeout=manual_captcha_timeout,
                     interactive=interactive_captcha,
-                    screening_answers=profile.get("answers", {}),
+                    screening_answers={
+                        **profile.get("answers", {}),
+                        "_by_question": vacancy_answers.get(vacancy_id, {}),
+                    },
                     screening_facts=profile.get("facts", {}),
                 )
                 if (result.status == "needs_manual"

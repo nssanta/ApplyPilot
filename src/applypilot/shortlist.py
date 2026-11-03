@@ -6,12 +6,37 @@ owner decisions remain authoritative.
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Mapping
-
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 _CLOSED = {"APPLIED_CONFIRMED", "ALREADY_APPLIED", "UNKNOWN", "SUBMITTING"}
 _WORKFLOW = {"NEEDS_FORM", "NEEDS_LETTER", "NEEDS_MANUAL", "EXTERNAL_ATS"}
 _VETO = {"SKIP", "DEFERRED", "MAYBE"}
+_REQUIREMENT_HINT = re.compile(
+    r"опыт|знани|владени|обязательн|требован|english|английск|образован|"
+    r"experience|required|must|лет|years|офис|office|гибрид|hybrid",
+    re.IGNORECASE,
+)
+
+
+def requirement_lines(description: str, *, limit_chars: int = 400) -> list[str]:
+    """Pick the few sentences an agent must judge, instead of the whole posting."""
+    text = re.sub(r"<(?:li|p|br|/li|/p|ul|/ul)[^>]*>", "\n", str(description or ""), flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    parts = [re.sub(r"\s+", " ", part).strip(" ;.-—•") for part in re.split(r"[\n;]|(?<=[.!?])\s", text)]
+    picked: list[str] = []
+    used = 0
+    for part in parts:
+        if len(part) < 12 or not _REQUIREMENT_HINT.search(part):
+            continue
+        part = part[:160]
+        if used + len(part) > limit_chars:
+            break
+        picked.append(part)
+        used += len(part)
+        if len(picked) >= 5:
+            break
+    return picked
 
 
 def build_review_shortlist(
@@ -19,7 +44,8 @@ def build_review_shortlist(
     *,
     limit: int = 100,
     min_score: int = 45,
-    description_chars: int = 3500,
+    description_chars: int = 0,
+    vacancy_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Return reviewable *complete* cards, without mutating state or granting approval."""
     if not 1 <= limit <= 500 or not 0 <= min_score <= 100:
@@ -28,11 +54,12 @@ def build_review_shortlist(
     ready_to_check: dict[tuple[str, str], dict[str, Any]] = {}
     counts = {"total_rows": 0, "missing_description": 0, "awaiting_review": 0,
               "already_ready": 0, "closed_or_vetoed": 0}
+    wanted = {str(value) for value in vacancy_ids} if vacancy_ids else None
     for row in rows:
         counts["total_rows"] += 1
         source = str(row.get("source") or "")
         vacancy_id = str(row.get("id") or "")
-        if not (source and vacancy_id):
+        if not (source and vacancy_id) or (wanted is not None and vacancy_id not in wanted):
             continue
         global_state = str(row.get("global_application_state") or "NOT_STARTED").upper()
         app_state = str(row.get("application_state") or "NOT_STARTED").upper()
@@ -69,9 +96,11 @@ def build_review_shortlist(
             "salary": row.get("salary") or {},
             "experience": row.get("experience") or "",
             "remote": row.get("is_remote"),
-            "description": description[:description_chars],
-            "description_truncated": len(description) > description_chars,
+            "requirements": requirement_lines(str(row.get("description") or "")),
         }
+        if description_chars > 0:
+            item["description"] = description[:description_chars]
+            item["description_truncated"] = len(description) > description_chars
         key = source, vacancy_id
         target = ready_to_check if ready else selected
         previous = target.get(key)
@@ -82,7 +111,9 @@ def build_review_shortlist(
     items = sorted(selected.values(), key=lambda i: (-i["score"], i["source"], i["id"]))[:limit]
     ready_items = sorted(ready_to_check.values(), key=lambda i: (-i["score"], i["source"], i["id"]))[:limit]
     return {"kind": "review_shortlist", "approved": False, "sendable": False,
-            "note": "Agent must read full requirements and explicitly approve exact IDs before dispatch.",
+            "note": ("Clean vacancies are approved by code and sent by `queue apply`. These cards need "
+                     "a judgement on `reason`; read the full text only for doubtful cards "
+                     "(--id ID --description-chars 4000)."),
             "counts": {**counts, "unique_reviewable": len(selected), "returned": len(items),
                        "unique_pre_send_recheck": len(ready_to_check)},
             "ready_items": ready_items, "items": items}

@@ -153,6 +153,12 @@ def test_salary_soft_threshold_keeps_open_ended_and_other_currency_for_review():
     )
     assert open_low.status == "unknown"
     assert "salary:open_range_below_target" in open_low.reasons
+    owner_floor = evaluate_search_filter(
+        {"id": "open", "salary": {"from": 100000, "to": None, "currency": "RUR"}},
+        {"salary": {**search["salary"], "open_range_min": 100000}},
+    )
+    assert owner_floor.status == "pass"
+    assert "salary:open_range_accepted" in owner_floor.reasons
 
     usd = evaluate_search_filter(
         {"id": "usd", "salary": {"from": 3000, "to": 5000, "currency": "USD"}},

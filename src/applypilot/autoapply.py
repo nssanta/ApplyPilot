@@ -251,6 +251,44 @@ def _screening_manual_note(unresolved: list[str], answers: dict | None) -> str:
     return "unanswered screening questions: " + "; ".join(unresolved)
 
 
+RESUME_OPTION_SELECTOR = (
+    '[data-qa="magritte-select-option-list"] [data-qa="resume-title"]'
+)
+
+
+def _choose_from_resume_dropdown(page, card, resume: str) -> bool:
+    """Open HH's resume select and pick the exact title; verify the card after."""
+    wanted = _normalize_resume_title(resume)
+    try:
+        card.click(timeout=8000)
+        options = page.locator(RESUME_OPTION_SELECTOR)
+        options.first.wait_for(state="visible", timeout=5000)
+        matches = []
+        for index in range(options.count()):
+            option = options.nth(index)
+            lines = [" ".join(line.split()) for line in option.inner_text(timeout=1000).splitlines()
+                     if line.strip()]
+            if lines and _normalize_resume_title(lines[0]) == wanted and option.is_visible(timeout=1000):
+                matches.append(option)
+        if len(matches) != 1:
+            page.keyboard.press("Escape")
+            return False
+        matches[0].click(timeout=8000)
+        page.wait_for_timeout(800)
+        # The select must now show the configured resume; anything else is a failure.
+        cards = page.locator(RESUME_SELECTOR)
+        chosen = []
+        for index in range(cards.count()):
+            item = cards.nth(index)
+            if item.is_visible(timeout=1000):
+                lines = [line for line in item.inner_text(timeout=1000).splitlines() if line.strip()]
+                chosen.append(lines[0] if lines else "")
+        return len(chosen) == 1 and _normalize_resume_title(chosen[0]) == wanted
+    except Exception:
+        LOGGER.debug("Could not choose a resume from the HH select", exc_info=True)
+        return False
+
+
 def _select_resume(page, dialog, resume: str) -> str:
     """Выбирает точное резюме; единственное видимое резюме принимает только при совпадении."""
     root = dialog or page
@@ -278,9 +316,13 @@ def _select_resume(page, dialog, resume: str) -> str:
     if len(visible) == 1:
         # HH may preselect the only applicable resume. Accept it only when the
         # title is the configured one; never silently send with another resume.
-        return "" if _normalize_resume_title(titles[0]) == _normalize_resume_title(resume) else (
-            f"HH preselected a different resume: {titles[0]!r}"
-        )
+        if _normalize_resume_title(titles[0]) == _normalize_resume_title(resume):
+            return ""
+        # Current HH renders the preselected resume as a select card; the
+        # other resumes appear only after it is opened.
+        if _choose_from_resume_dropdown(page, visible[0], resume):
+            return ""
+        return f"HH preselected a different resume: {titles[0]!r}"
     if not visible:
         return "resume selection is missing"
     return f"configured resume is not available in HH popup: {titles!r}"
