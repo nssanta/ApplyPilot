@@ -2863,6 +2863,22 @@ class Store:
             result["payload"] = {}
         return result
 
+    def day_outcomes(self, day: str) -> dict[str, dict[str, int]]:
+        """Unique vacancies per final outcome for one UTC day, HH and other sources."""
+        result: dict[str, dict[str, int]] = {}
+        with self.connect() as conn:
+            for row in conn.execute(
+                "SELECT status, COUNT(DISTINCT vacancy_id) AS n FROM attempts "
+                "WHERE updated_at LIKE ? GROUP BY status", (f"{day}%",),
+            ):
+                result.setdefault("hh.ru", {})[str(row["status"])] = int(row["n"])
+            for row in conn.execute(
+                "SELECT source, status, COUNT(DISTINCT vacancy_id) AS n FROM source_application_attempts "
+                "WHERE updated_at LIKE ? GROUP BY source, status", (f"{day}%",),
+            ):
+                result.setdefault(str(row["source"]), {})[str(row["status"])] = int(row["n"])
+        return result
+
     def pending_forms(self, account: str = "default", limit: int = 100) -> list[dict[str, Any]]:
         """HH vacancies stopped on screening questions that were never submitted."""
         with self.connect() as conn:

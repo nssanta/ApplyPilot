@@ -163,3 +163,15 @@ def test_reopen_form_only_for_never_submitted_needs_form(tmp_path):
     assert store.reopen_form("acc", "7") is True
     assert store.pending_forms("acc") == []
     assert store.reopen_form("acc", "7") is False
+
+
+def test_day_outcomes_count_unique_vacancies_per_status(tmp_path):
+    from applypilot.storage import Store, now
+
+    store = Store(tmp_path / "state.sqlite3")
+    for vacancy_id, status in (("1", "success"), ("2", "success"), ("3", "unknown")):
+        store.record({"id": vacancy_id, "name": "Python", "url": f"https://hh.ru/vacancy/{vacancy_id}"},
+                     status, "", "run", "acc")
+    day = now()[:10]
+    assert store.day_outcomes(day) == {"hh.ru": {"success": 2, "unknown": 1}}
+    assert store.day_outcomes("2000-01-01") == {}

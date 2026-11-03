@@ -338,6 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
     queue_sweep.add_argument("--dry-run", action="store_true",
                              help="только показать решения, не менять review/application state")
     queue_sweep.add_argument("--json", action="store_true")
+    queue_today = queue_sub.add_parser("today", help="итог дня: уникальные исходы откликов по площадкам")
+    queue_today.add_argument("--day", help="YYYY-MM-DD (UTC); по умолчанию сегодня")
+    queue_today.add_argument("--json", action="store_true")
     queue_forms = queue_sub.add_parser(
         "forms", help="анкеты HH, на которых остановился кликер; возврат в очередь после ответов",
     )
@@ -3918,6 +3921,18 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     if stagnant:
                         print(f"  stagnant={len(stagnant)} (same decision for >= {args.min_streak} passes)")
+                return 0
+            if args.queue_action == "today":
+                day = args.day or datetime.now(UTC).date().isoformat()
+                outcomes = Store(config.db_path).day_outcomes(day)
+                confirmed = sum(values.get("success", 0) for values in outcomes.values())
+                payload = {"day_utc": day, "confirmed_success": confirmed, "by_source": outcomes}
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=1))
+                else:
+                    print(f"{day} UTC: confirmed success = {confirmed}")
+                    for source, values in outcomes.items():
+                        print(f"  {source}: " + ", ".join(f"{k}={v}" for k, v in sorted(values.items())))
                 return 0
             if args.queue_action == "forms":
                 selected_config, _ = _track_config(
