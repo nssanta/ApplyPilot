@@ -177,3 +177,12 @@ def test_day_outcomes_count_unique_vacancies_per_status(tmp_path):
     day = now()[:10]
     assert store.day_outcomes(day) == {"hh.ru": {"success": 2, "unknown": 1}}
     assert store.day_outcomes("2000-01-01") == {}
+
+
+def test_contact_accreditation_and_employment_questions_use_private_answers():
+    answers = {"telegram": "@handle", "it_accreditation": "Нет, не критична.",
+               "employment_type": "Подходит оформление по ТК РФ."}
+    assert answer_question("Укажите, пожалуйста, ваш ник в TG", "textarea", (), answers, {}) == "@handle"
+    assert answer_question("Критична ли для вас IT-аккредитация?", "radio", ["Да", "Нет"], answers, {}) == "Нет"
+    assert answer_question("Подходит ли вам оформление по ТК РФ?", "textarea", (), answers, {}) == (
+        "Подходит оформление по ТК РФ.")
