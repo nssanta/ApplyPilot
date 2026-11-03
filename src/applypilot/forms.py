@@ -86,14 +86,37 @@ def _mentions(term: str, text: str) -> bool:
     return value in text
 
 
+def _label_of(locator: Any) -> Any:
+    """HH wraps each radio/checkbox input in its visible ``<label>`` cell."""
+    try:
+        label = locator.locator("xpath=ancestor::label[1]")
+        return label.first if label.count() else None
+    except Exception:
+        return None
+
+
 def _option_text(locator: Any) -> str:
-    for attribute in ("aria-label", "value"):
+    try:
+        value = locator.get_attribute("aria-label")
+    except Exception:
+        value = None
+    if value and str(value).strip():
+        return str(value).strip()
+    label = _label_of(locator)
+    if label is not None:
         try:
-            value = locator.get_attribute(attribute)
+            text = " ".join(label.inner_text(timeout=1000).split())
+            if text:
+                return text
         except Exception:
-            value = None
-        if value and str(value).strip():
-            return str(value).strip()
+            pass
+    try:
+        value = locator.get_attribute("value")
+    except Exception:
+        value = None
+    # HH radio values are numeric option IDs, never the visible answer text.
+    if value and str(value).strip() and not str(value).strip().isdigit():
+        return str(value).strip()
     try:
         parent = locator.locator("xpath=..")
         if parent.count():
@@ -146,9 +169,14 @@ def extract_fields(root: Any) -> list[FormField]:
     for index in range(task_count):
         task = tasks.nth(index)
         try:
-            question = " ".join(task.inner_text(timeout=1000).split())
+            heading = task.locator("[data-qa='task-question']")
+            source = heading.first if heading.count() else task
+            question = " ".join(source.inner_text(timeout=1000).split())
         except Exception:
-            question = f"question {index + 1}"
+            try:
+                question = " ".join(task.inner_text(timeout=1000).split())
+            except Exception:
+                question = f"question {index + 1}"
         seen_names: set[str] = set()
         for field_type, selector in (
             ("radio", "input[type='radio']"),
@@ -176,7 +204,8 @@ def extract_fields(root: Any) -> list[FormField]:
                     name = str(locator.get_attribute("name") or "")
                 except Exception:
                     pass
-                if name and name in seen_names:
+                # Radio/checkbox options share one group name; keep them all.
+                if name and name in seen_names and field_type not in {"radio", "checkbox"}:
                     continue
                 if name:
                     seen_names.add(name)
@@ -349,7 +378,8 @@ def _fill_field(field: FormField, answer: str) -> bool:
             locators = locator if isinstance(locator, (list, tuple)) else [locator]
             for candidate in locators:
                 if normalize(_option_text(candidate)) == normalize(option):
-                    candidate.click(timeout=8000)
+                    label = _label_of(candidate)
+                    (label if label is not None else candidate).click(timeout=8000)
                     return True
             return False
         if field.field_type == "select":

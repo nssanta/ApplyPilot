@@ -186,3 +186,87 @@ def test_contact_accreditation_and_employment_questions_use_private_answers():
     assert answer_question("Критична ли для вас IT-аккредитация?", "radio", ["Да", "Нет"], answers, {}) == "Нет"
     assert answer_question("Подходит ли вам оформление по ТК РФ?", "textarea", (), answers, {}) == (
         "Подходит оформление по ТК РФ.")
+
+
+def test_hh_radio_group_shares_name_and_reads_label_text():
+    """Live HH markup: <label data-qa=cell><input type=radio name=task_1 value=307900452>…Да</label>."""
+
+    class Many:
+        def __init__(self, values):
+            self.values = values
+
+        @property
+        def first(self):
+            return self.values[0]
+
+        def count(self):
+            return len(self.values)
+
+        def nth(self, index):
+            return self.values[index]
+
+    class Label:
+        def __init__(self, text):
+            self.text, self.clicks = text, 0
+
+        def inner_text(self, timeout=None):
+            return self.text
+
+        def click(self, timeout=None):
+            self.clicks += 1
+
+    class Radio:
+        def __init__(self, value, text):
+            self.value, self.label = value, Label(text)
+
+        def get_attribute(self, name):
+            return {"name": "task_1", "value": self.value}.get(name)
+
+        def is_visible(self, timeout=None):
+            return True
+
+        def locator(self, selector):
+            assert selector == "xpath=ancestor::label[1]"
+            return Many([self.label])
+
+    class Task:
+        radios = (Radio("307900452", "Да"), Radio("307900453", "Нет"), Radio("open", "Свой вариант"))
+
+        def inner_text(self, timeout=None):
+            return "Критична ли для вас IT-аккредитация? Да Нет Свой вариант"
+
+        def locator(self, selector):
+            if selector == "[data-qa='task-question']":
+                return Many([type("Q", (), {"inner_text": lambda self, timeout=None:
+                                            "Критична ли для вас IT-аккредитация?"})()])
+            return Many(self.radios if selector == "input[type='radio']" else [])
+
+    class Root:
+        def locator(self, selector):
+            assert selector == "[data-qa='task-body']"
+            return Many([Task()])
+
+    root = Root()
+    result = fill_screening_form(root, {"it_accreditation": "Нет, не критична."}, {})
+    assert result.resolved
+    assert result.fields[0].question == "Критична ли для вас IT-аккредитация?"
+    assert result.fields[0].options == ("Да", "Нет", "Свой вариант")
+    assert [radio.label.clicks for radio in Task.radios] == [0, 1, 0]
+
+
+def test_reopen_form_restores_ready_for_an_already_approved_vacancy(tmp_path):
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("c", "acc", "ai", {"query": "AI"})
+    store.save_campaign_items("c", "acc", "ai", [{"id": "8", "name": "Python", "company": "X",
+                                                 "url": "https://hh.ru/vacancy/8"}],
+                              status="ok", snapshot_path="")
+    with store.connect() as conn:
+        conn.execute("UPDATE vacancy_track_scores SET review_state='APPROVED' WHERE vacancy_id='8'")
+    store.record({"id": "8", "name": "Python", "url": "https://hh.ru/vacancy/8"}, "needs_manual",
+                 "unanswered screening questions: Город? [textarea]", "run", "acc")
+    assert store.reopen_form("acc", "8") is True
+    with store.connect() as conn:
+        state = conn.execute("SELECT application_state FROM vacancies WHERE vacancy_id='8'").fetchone()[0]
+    assert state == "READY_TO_APPLY"

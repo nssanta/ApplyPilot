@@ -2911,10 +2911,17 @@ class Store:
             ).fetchone()
             if attempt is None or attempt["status"] != "needs_manual":
                 return False
+            # READY is normally set at approval time; an earlier approval must
+            # make the answered form sendable again without a second approval.
+            approved = conn.execute(
+                "SELECT 1 FROM vacancy_track_scores WHERE account=? AND source='hh.ru' "
+                "AND vacancy_id=? AND review_state='APPROVED' LIMIT 1",
+                (account, vacancy_id),
+            ).fetchone()
             updated = conn.execute(
-                "UPDATE vacancies SET application_state='NOT_STARTED',updated_at=? "
+                "UPDATE vacancies SET application_state=?,updated_at=? "
                 "WHERE account=? AND source='hh.ru' AND vacancy_id=? AND application_state='NEEDS_FORM'",
-                (timestamp, account, vacancy_id),
+                ("READY_TO_APPLY" if approved else "NOT_STARTED", timestamp, account, vacancy_id),
             ).rowcount
             if updated:
                 # ``prepared`` maps to no campaign state, so a later scan cannot
