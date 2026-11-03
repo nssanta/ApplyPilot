@@ -23,6 +23,7 @@ NO_WORDS = {"no", "нет", "false", "не имею", "не готов", "не �
 ANSWER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("telegram", ("telegram", "телеграм", "ник в tg", "ник в тг", "ваш tg", "ваш тг")),
     ("it_accreditation", ("аккредитац", "accreditation")),
+    ("military_id", ("военный билет", "приписн")),
     ("employment_type", ("оформлени", "оформит", "тк рф", "трудовому договору")),
     ("salary", ("зарплат", "доход", "оклад", "compensation", "salary", "от какой суммы", "ожидаемая сумма")),
     ("english", ("english", "английск", "уровень владения языком")),
@@ -48,7 +49,7 @@ TECH_TERMS = {
 }
 
 FACT_KEYS = {
-    "telegram", "it_accreditation", "employment_type",
+    "telegram", "it_accreditation", "employment_type", "military_id",
     "salary", "english", "english_level", "motivation", "citizenship", "office_hybrid",
     "work_authorization", "relocation", "start_date", "remote",
     "experience_years", "education", "current_location", "skills",
