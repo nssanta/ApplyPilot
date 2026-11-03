@@ -281,6 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
     ), default="all")
     queue_list.add_argument("--limit", type=int, default=100)
     queue_list.add_argument("--json", action="store_true")
+    queue_shortlist = queue_sub.add_parser(
+        "shortlist", help="компактный read-only пакет полных вакансий для проверки агентом",
+    )
+    queue_shortlist.add_argument("--track", action="append", choices=("ai", "backend", "ai_core"),
+                                 help="можно повторить; по умолчанию ai и backend")
+    queue_shortlist.add_argument("--source", action="append", help="источник; можно повторить")
+    queue_shortlist.add_argument("--limit", type=int, default=100)
+    queue_shortlist.add_argument("--min-score", type=int, default=45)
+    queue_shortlist.add_argument("--description-chars", type=int, default=3500)
+    queue_shortlist.add_argument("--json", action="store_true")
     queue_set = queue_sub.add_parser("set", help="сохранить решение владельца по вакансии")
     queue_set.add_argument("--track", required=True)
     queue_set.add_argument("--source", default="hh.ru", help="источник вакансии")
@@ -3068,7 +3078,7 @@ def main(argv: list[str] | None = None) -> int:
                         allow_live=bool(args.allow_live), drivers=drivers,
                         accounts=accounts, source_limits=source_limits, registry=registry,
                         scan_id=getattr(args, "scan", None),
-                        vacancy_ids=_split_action_ids(getattr(args, "id", [])),
+                        vacancy_ids=(_split_action_ids(getattr(args, "id", [])) or None),
                     )
             if args.json:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -3897,6 +3907,45 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     if stagnant:
                         print(f"  stagnant={len(stagnant)} (same decision for >= {args.min_streak} passes)")
+                return 0
+            if args.queue_action == "shortlist":
+                from .multisource import resolve_source_account
+                from .providers import default_registry
+                from .shortlist import build_review_shortlist
+
+                chosen_tracks = list(dict.fromkeys(args.track or ["ai", "backend"]))
+                chosen_sources = list(dict.fromkeys(args.source or default_registry().sources()))
+                store = Store(config.db_path)
+                review_rows = []
+                for chosen_track in chosen_tracks:
+                    selected_config, _ = _track_config(
+                        config, chosen_track, profile_override=bool(args.profile),
+                        search_override=bool(args.search),
+                    )
+                    profile = _profile(selected_config, effective_search(selected_config.load_search()))
+                    for source in chosen_sources:
+                        account = resolve_source_account(selected_config, profile, source)
+                        review_rows.extend(store.list_campaign_vacancies(
+                            account, chosen_track, "all", None, source=source,
+                        ))
+                payload = build_review_shortlist(
+                    review_rows, limit=args.limit, min_score=args.min_score,
+                    description_chars=args.description_chars,
+                )
+                if args.json:
+                    print(json.dumps(payload, ensure_ascii=False, indent=2))
+                else:
+                    print(f"shortlist: reviewable={payload['counts']['unique_reviewable']} "
+                          f"returned={payload['counts']['returned']} "
+                          f"ready_to_recheck={payload['counts']['unique_pre_send_recheck']}")
+                    for row in payload["ready_items"]:
+                        print(f"  RECHECK {row['track']}:{row['source']}:{row['id']} "
+                              f"score={row['score']} {row['title'][:80]} "
+                              f"— {row['company'][:35]}")
+                    for row in payload["items"]:
+                        print(f"  {row['track']}:{row['source']}:{row['id']} "
+                              f"score={row['score']} {row['title'][:80]} "
+                              f"— {row['company'][:35]} · {row['reason'][:125]}")
                 return 0
             if args.queue_action == "stats":
                 from collections import Counter
