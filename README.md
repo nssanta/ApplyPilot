@@ -57,6 +57,10 @@ cp examples/sources.toml private/config/sources.toml
 # Одна логическая вакансия: HH, DreamJob-зеркало, отклик и ответ
 .venv/bin/python -m applypilot queue links --track default --source dreamjob.ru
 
+# Один запуск: sync, возврат ложных UNKNOWN, sweep, отправка, итог
+.venv/bin/python -m applypilot cycle --limit 50
+.venv/bin/python -m applypilot queue board
+
 # Без отправки заявок
 .venv/bin/python -m applypilot sources dispatch-plan \
   --track default --limit 10 --json

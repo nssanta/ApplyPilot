@@ -601,3 +601,19 @@ def test_release_refuses_stale_sync(tmp_path):
 
     with pytest.raises(ValueError):
         store.release_unknowns_absent_from_history("a", max_sync_age_seconds=-1)
+
+
+def test_release_clears_cached_channel_owner(tmp_path):
+    store = _unknown_store(tmp_path, in_history=False)
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO vacancy_links(account,source,vacancy_id,group_key,channel_key,channel_type,"
+            "duplicate_of_source,duplicate_of_vacancy_id,updated_at) "
+            "VALUES('a','hh.ru','1','g','hh.ru:1','native_form','hh.ru','1','t')"
+        )
+
+    store.release_unknowns_absent_from_history("a")
+
+    with store.connect() as conn:
+        row = conn.execute("SELECT duplicate_of_source FROM vacancy_links").fetchone()
+    assert row[0] == ""

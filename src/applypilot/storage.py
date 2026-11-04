@@ -1211,6 +1211,7 @@ class Store:
 
     def release_unknowns_absent_from_history(
         self, account: str = "default", *, max_sync_age_seconds: int = 3600,
+        vacancy_ids: set[str] | None = None,
     ) -> list[str]:
         """Returns UNKNOWN to the queue only after a fresh sync shows no application.
 
@@ -1225,11 +1226,14 @@ class Store:
         if age > max_sync_age_seconds:
             raise ValueError("HH sync is stale; run `sync` first")
         released = [item["vacancy_id"] for item in review["items"]
-                    if item["verdict"] == "absent_from_history"]
+                    if item["verdict"] == "absent_from_history"
+                    and (vacancy_ids is None or item["vacancy_id"] in vacancy_ids)]
         timestamp = now()
-        note = f"released: absent from HH history at {synced_at}"
         with self.connect() as conn:
             for vacancy_id in released:
+                reason = next(str(item["note"]) for item in review["items"]
+                              if item["vacancy_id"] == vacancy_id)
+                note = f"released: absent from HH history at {synced_at}; was: {reason[:120]}"
                 conn.execute(
                     """UPDATE attempts SET status='failed_before_submit',note=?,updated_at=?
                     WHERE account=? AND vacancy_id=? AND status='unknown'""",
@@ -1240,12 +1244,24 @@ class Store:
                     VALUES(?,?,?,?,?,?)""",
                     (account, vacancy_id, "failed_before_submit", note, "", timestamp),
                 )
+                approved = conn.execute(
+                    """SELECT 1 FROM vacancy_track_scores WHERE account=? AND source='hh.ru'
+                    AND vacancy_id=? AND review_state='APPROVED' LIMIT 1""",
+                    (account, vacancy_id),
+                ).fetchone()
                 conn.execute(
-                    """UPDATE vacancies SET application_state='NOT_STARTED',application_note=?,
+                    """UPDATE vacancies SET application_state=?,application_note=?,
                         last_checked_at=?,updated_at=?
                     WHERE account=? AND source='hh.ru' AND vacancy_id=?
                       AND application_state='UNKNOWN'""",
-                    (note, timestamp, timestamp, account, vacancy_id),
+                    ("READY_TO_APPLY" if approved else "NOT_STARTED", note,
+                     timestamp, timestamp, account, vacancy_id),
+                )
+                # Links cached this attempt as the channel owner at scan time.
+                conn.execute(
+                    """UPDATE vacancy_links SET duplicate_of_source='',duplicate_of_vacancy_id=''
+                    WHERE account=? AND duplicate_of_source='hh.ru' AND duplicate_of_vacancy_id=?""",
+                    (account, vacancy_id),
                 )
                 conn.execute(
                     """UPDATE source_application_attempts SET status='failed_before_submit',updated_at=?

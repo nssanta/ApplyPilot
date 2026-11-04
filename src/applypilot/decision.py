@@ -20,6 +20,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .scoring import auto_apply_title_eligible
@@ -41,6 +42,9 @@ DEFAULT_DECISION_POLICY: dict[str, Any] = {
         "publication:time_not_verified",
         "publication:outside_requested_window",
     ),
+    # A listing older than the scan window is still open while search keeps
+    # returning it.  Only rows unseen for longer than this stay rejected.
+    "window_reject_max_unseen_days": 14,
 }
 
 
@@ -378,6 +382,20 @@ def _soft_unknown_reasons(
     return not unknown, unknown
 
 
+def _only_aged_out(row: Mapping[str, Any], policy: Mapping[str, Any]) -> bool:
+    """True when the window is the reject reason and search still returns the row."""
+    if "publication:outside_requested_window" not in row.get("filter_reasons", []):
+        return False
+    try:
+        seen = datetime.fromisoformat(str(row.get("last_seen_at") or ""))
+    except ValueError:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=UTC)
+    max_days = float(policy.get("window_reject_max_unseen_days", 14))
+    return datetime.now(UTC) - seen <= timedelta(days=max_days)
+
+
 def decide_row(
     row: Mapping[str, Any],
     *,
@@ -459,16 +477,17 @@ def decide_row(
         return Decision("REJECT", "score_or_filter_reject",
                         "vacancy did not pass scoring/search rules")
     if filter_status == "reject":
-        # A later scan window must not erase an existing human approval when
-        # the only new reject reason is a permitted soft unknown (for example,
-        # an old listing outside the current ``days`` window).  Unapproved
-        # rows still follow the ordinary reject path.
+        # The scan window limits what search looks for, it does not close a
+        # vacancy: age alone must not reject a listing that is still being
+        # seen.  Any other reject reason keeps the ordinary reject path.
         soft_ok, _unknown = _soft_unknown_reasons(
             row, search=search, policy=merged_policy,
         )
-        if review_state != "APPROVED" or not soft_ok:
+        if not soft_ok or (review_state != "APPROVED"
+                           and not _only_aged_out(row, merged_policy)):
             return Decision("REJECT", "score_or_filter_reject",
                             "vacancy did not pass scoring/search rules")
+        filter_status = "unknown"
     description_status = str(row.get("description_status") or "")
     if description_status in {"missing", "provisional"} or not str(row.get("description") or "").strip():
         return Decision("REVIEW", "needs_description", "full description is missing")

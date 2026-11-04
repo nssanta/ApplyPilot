@@ -462,6 +462,9 @@ apply. `chat_safety.py` принимает ответ только при сов
 | MCP `scan` / `review_decide` | как одноимённый CLI | как CLI | нет |
 | MCP `apply` | как `apply --run` | как CLI | **да, при opt-in** |
 | MCP `chat_send` | HH chat | да | **да, только сообщение** |
+| `queue board`, `cycle --dry-run` | нет | нет | нет |
+| `queue unknowns --release` | нет | да | нет |
+| `cycle` | HH и площадки | да | **да** |
 | `queue apply --dry-run` | нет | нет | нет |
 | `queue apply --run` | HH через Playwright | да | **да** |
 | `run campaign --apply --allow-live` | Выбранные источники | по драйверу | **да** |

@@ -341,6 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
     queue_today = queue_sub.add_parser("today", help="итог дня: уникальные исходы откликов по площадкам")
     queue_today.add_argument("--day", help="YYYY-MM-DD (UTC); по умолчанию сегодня")
     queue_today.add_argument("--json", action="store_true")
+    queue_board = queue_sub.add_parser(
+        "board", help="сводка: новое, старое, скоры, готово и что требует внимания",
+    )
+    queue_board.add_argument("--track", action="append", default=[])
+    queue_board.add_argument("--days", type=int, default=1, help="что считать новым")
+    queue_board.add_argument("--json", action="store_true")
     queue_unknowns = queue_sub.add_parser(
         "unknowns", help="сверить UNKNOWN с последним sync истории HH",
     )
@@ -771,6 +777,16 @@ def build_parser() -> argparse.ArgumentParser:
     imp = history_sub.add_parser("import")
     imp.add_argument("--source", required=True, type=Path)
     history_sub.add_parser("reconcile").add_argument("--input", required=True, type=Path)
+    run_cmd = sub.add_parser(
+        "cycle", help="один запуск: sync, возврат ложных UNKNOWN, sweep, отправка, итог",
+    )
+    run_cmd.add_argument("--limit", type=int, required=True, help="сколько откликов отправить")
+    run_cmd.add_argument("--track", action="append", default=[],
+                         help="по умолчанию active_tracks из operating-policy, backend первым")
+    run_cmd.add_argument("--source", action="append", default=[],
+                         help="по умолчанию все площадки")
+    run_cmd.add_argument("--scan", action="store_true", help="сначала просканировать")
+    run_cmd.add_argument("--dry-run", action="store_true", help="только sweep и сводка")
     sync_cmd = sub.add_parser("sync", help="прочитать статусы откликов без сообщений")
     sync_cmd.add_argument("--track", help="использовать профиль и SQLite-контекст трека")
     sync_cmd.add_argument("--pages", type=int,
@@ -2404,6 +2420,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     config = _config(args)
 
+    if args.command == "cycle":
+        from .daily_run import run_cycle
+
+        return run_cycle(config, args, main)
     if args.command == "go":
         try:
             from .execution import run_go
@@ -3950,6 +3970,10 @@ def main(argv: list[str] | None = None) -> int:
                     for source, values in outcomes.items():
                         print(f"  {source}: " + ", ".join(f"{k}={v}" for k, v in sorted(values.items())))
                 return 0
+            if args.queue_action == "board":
+                from .daily_run import active_tracks, print_board
+
+                return print_board(config, args.track or active_tracks(config), args.days, args.json)
             if args.queue_action == "unknowns":
                 store = Store(config.db_path)
                 account = _account(_profile(config))
@@ -4317,10 +4341,18 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
                 mismatches = [str(item.get("id")) for item in selected
                               if str(item.get("resume") or "").strip() not in permitted_resumes]
-                if mismatches:
+                if mismatches and requested_ids:
                     print(f"resume mismatch; allowed {sorted(permitted_resumes)!r}; blocked IDs: {', '.join(mismatches)}",
                           file=sys.stderr)
                     return 2
+                if mismatches:
+                    # One foreign-resume row must not stop the batch; the track
+                    # that owns that resume sends it.
+                    print(f"skipped, resume of another track: {', '.join(mismatches)}", file=sys.stderr)
+                    selected = [item for item in selected if str(item.get("id")) not in set(mismatches)]
+                    if not selected:
+                        print("approved queue is empty or every approved vacancy is blocked", file=sys.stderr)
+                        return 2
                 run_id = uuid.uuid4().hex
                 if args.dry_run:
                     print(f"approved items: {len(selected)}; sync_status="
@@ -5025,6 +5057,17 @@ def _browser_context_lost(note: str) -> bool:
     ))
 
 
+def _requeue_captcha_vacancy(store: Store, account: str, vacancy_id: str) -> bool:
+    """Returns a CAPTCHA-interrupted vacancy to the queue when HH has no record of it."""
+    try:
+        return bool(store.release_unknowns_absent_from_history(
+            account, vacancy_ids={vacancy_id},
+        ))
+    except ValueError as exc:
+        LOGGER.warning("CAPTCHA vacancy %s stays UNKNOWN: %s", vacancy_id, exc)
+        return False
+
+
 def _allow_manual_captcha(*, run_headless: bool, visible_requested: bool,
                           has_tty: bool, env_interactive: bool) -> bool:
     """Explicit visible background jobs must not lose the manual CAPTCHA wait."""
@@ -5077,7 +5120,12 @@ def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_i
     try:
         from playwright.sync_api import sync_playwright
 
-        from .autoapply import CAPTCHA_NOTE_PREFIX, apply_one, verify_resume_visibility
+        from .autoapply import (
+            CAPTCHA_NOTE_PREFIX,
+            _captcha_page,
+            apply_one,
+            verify_resume_visibility,
+        )
         from .browser import browser_settings, launch_context
         from .negotiations import SyncError, sync_statuses
     except ImportError:
@@ -5257,13 +5305,26 @@ def _run_apply_impl(config: AppConfig, store: Store, selected: list[dict], run_i
                         print(f"{vacancy_id}: success — confirmed by HH negotiations")
                         confirmed_successes += 1
                     else:
-                        print(f"{vacancy_id}: unknown — {result.note}")
-                        unknown_ids.append(vacancy_id)
+                        is_captcha = "CAPTCHA" in result.note.upper() or "КАПЧ" in result.note.upper()
+                        # A challenge usually interrupts the request. A fresh
+                        # history without this vacancy returns it to the queue;
+                        # a repeat is safe, HH reports the existing application.
+                        requeued = is_captcha and _requeue_captcha_vacancy(
+                            store, account, vacancy_id,
+                        )
+                        if requeued:
+                            print(f"{vacancy_id}: captcha_requeued — {result.note}; "
+                                  "absent from HH history")
+                        else:
+                            print(f"{vacancy_id}: unknown — {result.note}")
+                            unknown_ids.append(vacancy_id)
                         # A CAPTCHA can invalidate the whole browser session, so
                         # stop the source until it is solved.  An ambiguous
                         # submit without CAPTCHA is quarantined per vacancy and
                         # the rest of the independent batch continues.
-                        if "CAPTCHA" in result.note.upper() or "КАПЧ" in result.note.upper():
+                        if requeued and not run_headless and not _captcha_page(page):
+                            continue
+                        if is_captcha:
                             run_status = "stopped_captcha"
                             stop_reason = f"CAPTCHA while submitting vacancy {vacancy_id}"
                             exit_code = 5
