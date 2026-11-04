@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -159,6 +160,52 @@ def _normalize_hh_zoom(profile_dir: Path) -> None:
         LOGGER.debug("Could not normalize HH profile zoom", exc_info=True)
 
 
+def _merge_missing_cookies(context: Any, state_path: Path) -> bool:
+    """Restores only cookies absent from the persistent profile.
+
+    Chrome does not keep session cookies when it exits without session restore.
+    Re-adding them from the CLI-saved state keeps the authenticated profile
+    usable, while never overwriting a fresher cookie that is already present.
+    A profile without the HH auth cookie is logged out: stale cookies must not
+    be mixed into it, so nothing is restored and a new login stays visible.
+    """
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("HH storage state is unavailable; persistent profile is used as-is")
+        return False
+    cookies = data.get("cookies")
+    if not isinstance(cookies, list) or not cookies:
+        return False
+    try:
+        existing = {
+            (str(item.get("name") or ""), str(item.get("domain") or ""),
+             str(item.get("path") or "/"))
+            for item in context.cookies()
+            if isinstance(item, dict)
+        }
+        if not any(name == "hhtoken" for name, _domain, _path in existing):
+            return False
+    except Exception:
+        LOGGER.warning("Could not read existing browser cookies", exc_info=True)
+        return False
+    missing = [
+        item for item in cookies
+        if isinstance(item, dict)
+        and not 0 < float(item.get("expires") or -1) < time.time()
+        and (str(item.get("name") or ""), str(item.get("domain") or ""),
+             str(item.get("path") or "/")) not in existing
+    ]
+    if not missing:
+        return False
+    try:
+        context.add_cookies(missing)
+    except Exception:
+        LOGGER.warning("Could not restore missing HH cookies", exc_info=True)
+        return False
+    return True
+
+
 def _import_storage_state(context: Any, state_path: Path) -> bool:
     """Seeds a new profile from the portable HH state, including localStorage."""
     try:
@@ -267,10 +314,16 @@ def launch_context(
                 raise
             LOGGER.warning("Chrome channel %r is unavailable; falling back to Playwright Chromium", channel)
             context = chromium.launch_persistent_context(str(profile_dir), **kwargs)
-        if (state_path is not None and state_path.exists() and not _looks_seeded(profile_dir)
-                and _import_storage_state(context, state_path)):
-            (profile_dir / ".applypilot_seeded").write_text("1", encoding="utf-8")
-            profile_dir.chmod(0o700)
+        if state_path is not None and state_path.exists():
+            if not _looks_seeded(profile_dir):
+                if _import_storage_state(context, state_path):
+                    (profile_dir / ".applypilot_seeded").write_text("1", encoding="utf-8")
+                    profile_dir.chmod(0o700)
+            else:
+                # The profile already has its identity; restore only session
+                # cookies that Chrome dropped on exit, without replacing fresher
+                # cookies that are still present.
+                _merge_missing_cookies(context, state_path)
         return BrowserSession(context=context, persistent=True, profile_dir=profile_dir)
     # Compatibility path for test doubles and installations without persistent
     # context support. Real production runs always take the branch above.

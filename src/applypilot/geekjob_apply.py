@@ -181,9 +181,11 @@ class GeekJobPageDriver:
     submit_verified = True
 
     def __init__(self, page_factory: Callable[[], Any], letter_dir: Path, *,
-                 min_interval_seconds: float = 2.0):
+                 min_interval_seconds: float = 2.0,
+                 letter_factory: Callable[[Mapping[str, Any]], str] | None = None):
         if not 0 <= min_interval_seconds <= 30:
             raise ValueError("invalid GeekJob interval")
+        self.letter_factory = letter_factory
         self.page_factory = page_factory
         self.letter_dir = Path(letter_dir)
         self.min_interval_seconds = float(min_interval_seconds)
@@ -202,6 +204,11 @@ class GeekJobPageDriver:
                 or row.get("application_state") != "READY_TO_APPLY"):
             return ApplyOutcome("needs_manual", "GeekJob vacancy not approved/ready")
         letter = self.letter_dir / f"{vid}.txt"
+        if not letter.exists() and not letter.is_symlink() and self.letter_factory is not None:
+            text = self.letter_factory(row).strip()
+            if text:
+                self.letter_dir.mkdir(parents=True, exist_ok=True)
+                letter.write_text(text, encoding="utf-8")
         if not letter.is_file() or letter.is_symlink():
             return ApplyOutcome("needs_manual", "vacancy-specific GeekJob letter is not ready")
         return ApplyOutcome("ready")

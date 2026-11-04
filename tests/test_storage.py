@@ -552,3 +552,52 @@ def test_hh_reconciliation_updates_persistent_campaign_card(tmp_path):
     assert [x["id"] for x in after] == ["hh-confirmed"]
     assert after[0]["application_state"] == "APPLIED_CONFIRMED"
     assert store.list_campaign_vacancies("account", "ai", "unknown", 10) == []
+
+
+def _unknown_store(tmp_path, *, in_history: bool):
+    from datetime import UTC, datetime, timedelta
+
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "unknowns.sqlite3")
+    old = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    fresh = datetime.now(UTC).isoformat()
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO attempts(account,vacancy_id,status,note,created_at,updated_at) "
+            "VALUES('a','1','unknown','CAPTCHA',?,?)", (old, old),
+        )
+        conn.execute(
+            "INSERT INTO sync_snapshots(account,source,status,item_count,error,created_at) "
+            "VALUES('a','hh.ru','ok',1,'',?)", (fresh,),
+        )
+        if in_history:
+            conn.execute(
+                "INSERT INTO negotiation_statuses(account,vacancy_id,status,updated_at,fetched_at) "
+                "VALUES('a','1','response',?,?)", (fresh, fresh),
+            )
+    return store
+
+
+def test_release_returns_only_unknowns_absent_from_fresh_history(tmp_path):
+    store = _unknown_store(tmp_path, in_history=False)
+
+    assert store.unknown_review("a")["items"][0]["verdict"] == "absent_from_history"
+    assert store.release_unknowns_absent_from_history("a") == ["1"]
+    assert store.unknown_review("a")["items"] == []
+
+
+def test_release_keeps_unknowns_present_in_history(tmp_path):
+    store = _unknown_store(tmp_path, in_history=True)
+
+    assert store.release_unknowns_absent_from_history("a") == []
+    assert store.unknown_review("a")["items"][0]["verdict"] == "in_history"
+
+
+def test_release_refuses_stale_sync(tmp_path):
+    import pytest
+
+    store = _unknown_store(tmp_path, in_history=False)
+
+    with pytest.raises(ValueError):
+        store.release_unknowns_absent_from_history("a", max_sync_age_seconds=-1)

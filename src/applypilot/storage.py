@@ -1180,6 +1180,80 @@ class Store:
                     (account, snapshot_source, snapshot_status, len(normalized), snapshot_error, now()),
                 )
 
+    def unknown_review(self, account: str = "default") -> dict[str, Any]:
+        """Splits HH UNKNOWN attempts by evidence from the latest HH history sync."""
+        with self.connect() as conn:
+            sync = conn.execute(
+                """SELECT status,created_at FROM sync_snapshots
+                WHERE account=? AND source='hh.ru' ORDER BY id DESC LIMIT 1""",
+                (account,),
+            ).fetchone()
+            rows = conn.execute(
+                """SELECT a.vacancy_id,a.name,a.company,a.note,a.updated_at,
+                          n.status AS negotiation_status
+                FROM attempts a LEFT JOIN negotiation_statuses n
+                  ON n.account=a.account AND n.vacancy_id=a.vacancy_id
+                WHERE a.account=? AND a.status='unknown' ORDER BY a.updated_at""",
+                (account,),
+            ).fetchall()
+        synced_at = str(sync["created_at"]) if sync and sync["status"] == "ok" else ""
+        items = []
+        for row in rows:
+            item = dict(row)
+            if row["negotiation_status"]:
+                item["verdict"] = "in_history"
+            elif synced_at and str(row["updated_at"]) < synced_at:
+                item["verdict"] = "absent_from_history"
+            else:
+                item["verdict"] = "needs_sync"
+            items.append(item)
+        return {"synced_at": synced_at, "items": items}
+
+    def release_unknowns_absent_from_history(
+        self, account: str = "default", *, max_sync_age_seconds: int = 3600,
+    ) -> list[str]:
+        """Returns UNKNOWN to the queue only after a fresh sync shows no application.
+
+        A complete sync is strong but not absolute evidence.  A repeat is safe:
+        HH shows an existing application and the clicker records already_applied.
+        """
+        review = self.unknown_review(account)
+        synced_at = review["synced_at"]
+        if not synced_at:
+            raise ValueError("no successful HH sync; run `sync` first")
+        age = (datetime.now(UTC) - datetime.fromisoformat(synced_at)).total_seconds()
+        if age > max_sync_age_seconds:
+            raise ValueError("HH sync is stale; run `sync` first")
+        released = [item["vacancy_id"] for item in review["items"]
+                    if item["verdict"] == "absent_from_history"]
+        timestamp = now()
+        note = f"released: absent from HH history at {synced_at}"
+        with self.connect() as conn:
+            for vacancy_id in released:
+                conn.execute(
+                    """UPDATE attempts SET status='failed_before_submit',note=?,updated_at=?
+                    WHERE account=? AND vacancy_id=? AND status='unknown'""",
+                    (note, timestamp, account, vacancy_id),
+                )
+                conn.execute(
+                    """INSERT INTO events(account,vacancy_id,status,note,run_id,created_at)
+                    VALUES(?,?,?,?,?,?)""",
+                    (account, vacancy_id, "failed_before_submit", note, "", timestamp),
+                )
+                conn.execute(
+                    """UPDATE vacancies SET application_state='NOT_STARTED',application_note=?,
+                        last_checked_at=?,updated_at=?
+                    WHERE account=? AND source='hh.ru' AND vacancy_id=?
+                      AND application_state='UNKNOWN'""",
+                    (note, timestamp, timestamp, account, vacancy_id),
+                )
+                conn.execute(
+                    """UPDATE source_application_attempts SET status='failed_before_submit',updated_at=?
+                    WHERE account=? AND source='hh.ru' AND vacancy_id=? AND status='unknown'""",
+                    (timestamp, account, vacancy_id),
+                )
+        return released
+
     def reconcile_unknowns_from_negotiations(self, account: str = "default") -> list[str]:
         """Переводит неоднозначные отправки в подтверждённые по журналу HH negotiations."""
         timestamp = now()

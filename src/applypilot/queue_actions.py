@@ -23,6 +23,7 @@ ACTIONS = {
     "wait_source",
     "review",
     "no_progress",
+    "blocked_duplicate",
 }
 
 _OWNER_MARKERS = (
@@ -95,6 +96,12 @@ def next_action(row: Mapping[str, Any], source_state: str = "") -> dict[str, Any
         return {
             "next_action": "review",
             "action_reason": f"ready but review_state is {review_state}",
+            "requires_owner": False,
+        }
+    if decision == "REJECT" and "needs_description" not in low_reason:
+        return {
+            "next_action": "reject",
+            "action_reason": reason_code or "rejected by the current criteria",
             "requires_owner": False,
         }
     if description_status in {"missing", "provisional", "telegram", "network_error", "parse_error"} \

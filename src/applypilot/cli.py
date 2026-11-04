@@ -341,6 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
     queue_today = queue_sub.add_parser("today", help="итог дня: уникальные исходы откликов по площадкам")
     queue_today.add_argument("--day", help="YYYY-MM-DD (UTC); по умолчанию сегодня")
     queue_today.add_argument("--json", action="store_true")
+    queue_unknowns = queue_sub.add_parser(
+        "unknowns", help="сверить UNKNOWN с последним sync истории HH",
+    )
+    queue_unknowns.add_argument("--release", action="store_true",
+                                help="вернуть в очередь те, которых нет в свежей истории HH")
+    queue_unknowns.add_argument("--json", action="store_true")
     queue_forms = queue_sub.add_parser(
         "forms", help="анкеты HH, на которых остановился кликер; возврат в очередь после ответов",
     )
@@ -3020,11 +3026,21 @@ def main(argv: list[str] | None = None) -> int:
                                     playwright, profile_dir, not args.visible,
                                 )
                                 cleanup.callback(context.close)
+                                def _geekjob_letter(row: Any) -> str:
+                                    approved = str(row.get("approved_cover_letter") or "").strip()
+                                    if approved:
+                                        return approved
+                                    try:
+                                        return render_template(dict(row), profile)
+                                    except (ConfigError, ValueError, KeyError):
+                                        return ""
+
                                 drivers["geekjob.ru"] = GeekJobPageDriver(
                                     context.new_page,
                                     selected_config.data_dir / "providers" / "geekjob"
                                     / geekjob_account / "letters",
                                     min_interval_seconds=args.geekjob_min_interval,
+                                    letter_factory=_geekjob_letter,
                                 )
                             else:
                                 print(
@@ -3934,6 +3950,29 @@ def main(argv: list[str] | None = None) -> int:
                     for source, values in outcomes.items():
                         print(f"  {source}: " + ", ".join(f"{k}={v}" for k, v in sorted(values.items())))
                 return 0
+            if args.queue_action == "unknowns":
+                store = Store(config.db_path)
+                account = _account(_profile(config))
+                released: list[str] = []
+                if args.release:
+                    try:
+                        released = store.release_unknowns_absent_from_history(account)
+                    except ValueError as exc:
+                        print(f"unknowns: {exc}", file=sys.stderr)
+                        return 2
+                review = store.unknown_review(account)
+                if args.json:
+                    print(json.dumps({**review, "released": released}, ensure_ascii=False, indent=2))
+                    return 0
+                from collections import Counter
+
+                verdicts = Counter(item["verdict"] for item in review["items"])
+                print(f"unknowns: {dict(verdicts)} synced_at={review['synced_at'] or 'never'} "
+                      f"released={len(released)}")
+                for item in review["items"]:
+                    print(f"  {item['vacancy_id']} · {item['verdict']} · {item['name']} — "
+                          f"{item['company']} · {str(item['note'])[:60]}")
+                return 0
             if args.queue_action == "forms":
                 selected_config, _ = _track_config(
                     config, args.track, profile_override=bool(args.profile),
@@ -4034,7 +4073,14 @@ def main(argv: list[str] | None = None) -> int:
                     decisions: dict[str, int] = {}
                     reviews: dict[str, int] = {}
                     applications: dict[str, int] = {}
-                    ready = review = 0
+                    review = 0
+                    # The same selector the clicker uses: mirrors of sent or
+                    # UNKNOWN vacancies are not sendable and must not look ready.
+                    sendable = {str(item.get("id")) for item in store.approved_campaign_items(
+                        account, args.track, 100, source=source,
+                    )}
+                    ready = len(sendable)
+                    actions: Counter[str] = Counter()
                     for row in rows:
                         decision = str(row.get("decision") or "UNDECIDED").upper()
                         decisions[decision] = decisions.get(decision, 0) + 1
@@ -4042,10 +4088,12 @@ def main(argv: list[str] | None = None) -> int:
                         reviews[state] = reviews.get(state, 0) + 1
                         app_state = str(row.get("application_state") or "NOT_STARTED").upper()
                         applications[app_state] = applications.get(app_state, 0) + 1
-                        if app_state == "READY_TO_APPLY" and decision != "BLOCKED":
-                            ready += 1
                         if decision == "REVIEW":
                             review += 1
+                        action = next_action(row)["next_action"]
+                        if action == "send" and str(row.get("id")) not in sendable:
+                            action = "blocked_duplicate"
+                        actions[action] += 1
                     report["sources"][source] = {
                         "account": account,
                         "total": len(rows),
@@ -4054,9 +4102,7 @@ def main(argv: list[str] | None = None) -> int:
                         "application_states": applications,
                         "ready": ready,
                         "review": review,
-                        "next_actions": dict(Counter(
-                            next_action(row)["next_action"] for row in rows
-                        )),
+                        "next_actions": dict(actions),
                         "stagnant": sum(
                             int(row.get("decision_streak") or 0) >= 2 for row in rows
                         ),

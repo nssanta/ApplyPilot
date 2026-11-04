@@ -118,3 +118,16 @@ def test_apply_with_clicker_is_explicitly_blocked() -> None:
     outcome = apply_with_clicker("career.habr.com", {"id": "1"})
     assert outcome.status == "needs_live_validation"
     assert "dispatch-apply --allow-live --enable-habr" in outcome.note
+
+
+def test_geekjob_driver_creates_missing_letter_from_factory(tmp_path):
+    from applypilot.geekjob_apply import SOURCE, GeekJobPageDriver
+
+    text = "Здравствуйте, это письмо из шаблона профиля для проверки отклика."
+    driver = GeekJobPageDriver(lambda: None, tmp_path / "letters",
+                               letter_factory=lambda row: text)
+    row = {"source": SOURCE, "id": "abcdef012345678901234567", "url": "https://geekjob.ru/vacancy/abcdef012345678901234567",
+           "review_state": "APPROVED", "application_state": "READY_TO_APPLY"}
+
+    assert driver.preflight(row).status == "ready"
+    assert (tmp_path / "letters" / "abcdef012345678901234567.txt").read_text(encoding="utf-8") == text
