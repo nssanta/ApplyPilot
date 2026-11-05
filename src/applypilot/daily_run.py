@@ -77,12 +77,6 @@ def board(config: AppConfig, tracks: Iterable[str], days: int = 1) -> dict[str, 
                 "ready": len(ready),
                 "review": sum(str(row.get("decision") or "") == "REVIEW" for row in rows),
                 "unknown": actions.get("verify_unknown", 0),
-                "top_ready": sorted(
-                    ({"id": str(row.get("id")), "score": int(row.get("score") or 0),
-                      "title": str(row.get("name") or "")[:70]}
-                     for row in rows if str(row.get("id")) in ready),
-                    key=lambda item: -item["score"],
-                )[:5],
             }
     return report
 
@@ -98,8 +92,6 @@ def print_board(config: AppConfig, tracks: Iterable[str], days: int = 1, as_json
             scores = " ".join(f"{label}={count}" for label, count in row["new_scores"].items())
             print(f"  {source}: new={row['new']} ({scores}) old={row['old']} "
                   f"ready={row['ready']} review={row['review']} unknown={row['unknown']}")
-            for item in row["top_ready"]:
-                print(f"    {item['score']:>3} {item['id']} {item['title']}")
     return 0
 
 
@@ -129,6 +121,53 @@ def _send_hh(call: Callable[[list[str]], int], config: AppConfig, track: str, bu
     return "max_passes"
 
 
+def send_plan(config: AppConfig, tracks: Iterable[str], sources: Iterable[str]) -> list[dict[str, Any]]:
+    """The exact rows a live cycle would send, through the clickers' own selectors."""
+    from .campaigns import write_approved_input
+    from .cli import _account, _permitted_hh_resumes, _profile, _track_config, effective_search
+    from .multisource import queue_plan, resolve_source_account
+
+    plan: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for track in tracks:
+        selected, info = _track_config(config, track, profile_override=False, search_override=False)
+        profile = _profile(selected, effective_search(selected.load_search()))
+        store = Store(selected.db_path)
+        for source in sources:
+            if source == HH:
+                permitted = _permitted_hh_resumes(profile, str(info.get("resume") or ""))
+                _path, rows = write_approved_input(selected, track, _account(profile), 100)
+                rows = [row for row in rows if str(row.get("resume") or "").strip() in permitted]
+            else:
+                account = resolve_source_account(selected, profile, source)
+                rows = queue_plan(store, account, track, source, 100,
+                                  verified_driver=source in ENABLE_FLAGS)["planned"]
+            for row in rows:
+                key = (source, str(row.get("id")))
+                if key not in seen:
+                    seen.add(key)
+                    plan.append({"source": source, "track": track, "id": key[1],
+                                 "score": int(row.get("score") or 0),
+                                 "title": str(row.get("name") or ""),
+                                 "company": str(row.get("company") or "")})
+    return plan
+
+
+def print_plan(plan: list[dict[str, Any]], limit: int) -> None:
+    print(f"plan: {len(plan)} ready, this limit sends about {min(limit, len(plan))}")
+    for row in plan:
+        print(f"  {row['source']} {row['track']} {row['id']} · {row['score']} · "
+              f"{row['title'][:70]} — {row['company'][:30]}")
+    print("drop any of them: queue skip --id ID --reason TEXT")
+
+
+def _reconcile(call: Callable[[list[str]], int], track: str) -> None:
+    if call(["sync", "--track", track]) == 0:
+        call(["queue", "unknowns", "--release"])
+    else:
+        print("cycle: HH sync failed; UNKNOWN stay quarantined")
+
+
 def run_cycle(config: AppConfig, args: Namespace, call: Callable[[list[str]], int]) -> int:
     if args.limit < 1:
         print("cycle: --limit must be positive")
@@ -144,16 +183,14 @@ def run_cycle(config: AppConfig, args: Namespace, call: Callable[[list[str]], in
             if others:
                 scan_args = [item for source in others for item in ("--source", source)]
                 call(["sources", "scan", "--track", track, *scan_args, "--days", "14", "--json"])
-    if HH in sources and not args.dry_run:
-        if call(["sync", "--track", tracks[0]]) == 0:
-            call(["queue", "unknowns", "--release"])
-        else:
-            print("cycle: HH sync failed; UNKNOWN stay quarantined")
+    if HH in sources:
+        _reconcile(call, tracks[0])
     for track in tracks:
         for source in sources:
             call(["queue", "sweep", "--track", track, "--source", source])
     print_board(config, tracks)
     if args.dry_run:
+        print_plan(send_plan(config, tracks, sources), args.limit)
         return 0
     start = _confirmed(config)
     stops: dict[str, str] = {}
@@ -165,18 +202,22 @@ def run_cycle(config: AppConfig, args: Namespace, call: Callable[[list[str]], in
             stops[f"{HH}/{track}"] = _send_hh(call, config, track, left)
             if stops[f"{HH}/{track}"] == "stopped":
                 break
+    # One source per dispatch: each driver owns a Playwright instance, and two
+    # in one call make the later login checks fail.
     for track in tracks:
-        left = args.limit - (_confirmed(config) - start)
-        if left <= 0 or not others:
-            break
-        flags = [ENABLE_FLAGS[source] for source in others if source in ENABLE_FLAGS]
-        scan_args = [item for source in others for item in ("--source", source)]
-        call(["sources", "dispatch-apply", "--track", track, *scan_args, "--allow-live", *flags,
-              "--limit", str(min(100, left)), "--json"])
+        for source in others:
+            left = args.limit - (_confirmed(config) - start)
+            if left <= 0:
+                break
+            if source not in ENABLE_FLAGS or not send_plan(config, [track], [source]):
+                continue
+            call(["sources", "dispatch-apply", "--track", track, "--source", source,
+                  "--allow-live", ENABLE_FLAGS[source], "--limit", str(min(100, left)), "--json"])
     if HH in sources:
-        call(["sync", "--track", tracks[0]])
+        _reconcile(call, tracks[0])
     print(f"cycle: confirmed this run={_confirmed(config) - start} stops={stops}")
     print_board(config, tracks)
     call(["queue", "today"])
+    call(["queue", "unknowns"])
     call(["queue", "forms", "--track", tracks[-1]])
     return 0

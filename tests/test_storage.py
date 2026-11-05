@@ -617,3 +617,16 @@ def test_release_clears_cached_channel_owner(tmp_path):
     with store.connect() as conn:
         row = conn.execute("SELECT duplicate_of_source FROM vacancy_links").fetchone()
     assert row[0] == ""
+
+
+def test_unknown_stops_being_released_after_repeated_failures(tmp_path):
+    store = _unknown_store(tmp_path, in_history=False)
+    with store.connect() as conn:
+        for stamp in ("t1", "t2"):
+            conn.execute(
+                "INSERT INTO events(account,vacancy_id,status,note,run_id,created_at) "
+                "VALUES('a','1','failed_before_submit','released: x','',?)", (stamp,),
+            )
+
+    assert store.unknown_review("a")["items"][0]["verdict"] == "needs_owner"
+    assert store.release_unknowns_absent_from_history("a") == []

@@ -271,6 +271,7 @@ def canonical_channel_key(value: str) -> str:
 
 
 TERMINAL_STATUSES = {"success", "already_applied"}
+MAX_UNKNOWN_RELEASES = 2
 BLOCKED_STATUSES = TERMINAL_STATUSES | {"unknown", "submitting"}
 # Explicit attempt transitions.  A numeric rank is deliberately not used:
 # ``submitting -> unknown`` is a valid outcome, while ``unknown -> success``
@@ -1196,12 +1197,20 @@ class Store:
                 WHERE a.account=? AND a.status='unknown' ORDER BY a.updated_at""",
                 (account,),
             ).fetchall()
+            releases = dict(conn.execute(
+                """SELECT vacancy_id,COUNT(*) FROM events
+                WHERE account=? AND note LIKE 'released:%' GROUP BY vacancy_id""",
+                (account,),
+            ).fetchall())
         synced_at = str(sync["created_at"]) if sync and sync["status"] == "ok" else ""
         items = []
         for row in rows:
             item = dict(row)
             if row["negotiation_status"]:
                 item["verdict"] = "in_history"
+            elif releases.get(row["vacancy_id"], 0) >= MAX_UNKNOWN_RELEASES:
+                # Repeating the same ambiguous submit will not change it.
+                item["verdict"] = "needs_owner"
             elif synced_at and str(row["updated_at"]) < synced_at:
                 item["verdict"] = "absent_from_history"
             else:
@@ -2959,7 +2968,8 @@ class Store:
         with self.connect() as conn:
             for row in conn.execute(
                 "SELECT status, COUNT(DISTINCT vacancy_id) AS n FROM attempts "
-                "WHERE updated_at LIKE ? GROUP BY status", (f"{day}%",),
+                "WHERE updated_at LIKE ? AND note NOT LIKE 'released:%' GROUP BY status",
+                (f"{day}%",),
             ):
                 result.setdefault("hh.ru", {})[str(row["status"])] = int(row["n"])
             for row in conn.execute(
@@ -2968,6 +2978,35 @@ class Store:
             ):
                 result.setdefault(str(row["source"]), {})[str(row["status"])] = int(row["n"])
         return result
+
+    def interview_statuses(self, account: str = "default") -> list[dict[str, Any]]:
+        """HH applications in the "Собеседование" column; the chat tells what they mean."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT n.vacancy_id, COALESCE(v.title,'') AS title, COALESCE(v.company,'') AS company,
+                          n.status_detected_at AS detected_at
+                FROM negotiation_statuses n LEFT JOIN vacancies v
+                  ON v.account=n.account AND v.source='hh.ru' AND v.vacancy_id=n.vacancy_id
+                WHERE n.account=? AND n.status='interview' ORDER BY n.status_detected_at DESC""",
+                (account,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def skip_everywhere(self, vacancy_ids: list[str], reason: str) -> int:
+        """Applies one SKIP to every track and source holding these vacancies."""
+        changed = 0
+        for vacancy_id in vacancy_ids:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    "SELECT account,source,track FROM vacancy_track_scores WHERE vacancy_id=?",
+                    (vacancy_id,),
+                ).fetchall()
+            for row in rows:
+                changed += self.set_review_state_batch(
+                    row["account"], row["source"], [vacancy_id], "SKIP",
+                    reason=reason, track=row["track"],
+                )
+        return changed
 
     def pending_forms(self, account: str = "default", limit: int = 100) -> list[dict[str, Any]]:
         """HH vacancies stopped on screening questions that were never submitted."""

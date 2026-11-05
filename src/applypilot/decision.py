@@ -611,12 +611,15 @@ def sweep_track_decisions(
             blocked[vacancy_id] = decision.reason_code
     updated = 0
     if approved and persist:
+        # decide_row already accepted these rows, including an aged-out listing
+        # whose stored filter status stays "reject" until the next scan.
         # Batch approval is atomic.  Fall back to per-row approval so one bad
         # row can never hide all the clean rows in the sweep.
         try:
             updated = store.set_review_state_batch(
                 account, source, approved, "APPROVED",
                 reason=AUTO_APPROVAL_REASON, track=track,
+                allow_relevance_override=True,
             )
         except ValueError:
             for vacancy_id in approved:
@@ -624,6 +627,7 @@ def sweep_track_decisions(
                     updated += store.set_review_state_batch(
                         account, source, [vacancy_id], "APPROVED",
                         reason=AUTO_APPROVAL_REASON, track=track,
+                        allow_relevance_override=True,
                     )
                 except ValueError as exc:
                     blocked[vacancy_id] = f"approval_rejected: {str(exc)[:180]}"

@@ -202,10 +202,12 @@ CI/CD не используется; проверки и сборку запус
 ## Один запуск на день
 
 ```bash
-.venv/bin/python -m applypilot cycle --limit 50 --dry-run   # sweep и сводка, без отправки
+.venv/bin/python -m applypilot cycle --limit 50 --dry-run   # всё, кроме отправки: sync, возврат UNKNOWN, sweep, точный план
 .venv/bin/python -m applypilot cycle --limit 50             # sync, возврат UNKNOWN, sweep, отправка, итог
 .venv/bin/python -m applypilot cycle --limit 50 --scan      # то же, но сначала скан
 .venv/bin/python -m applypilot queue board                  # новое, старое, скоры, готово, спорное
+.venv/bin/python -m applypilot queue skip --id ID --reason "почему"   # отсеять во всех треках
+.venv/bin/python -m applypilot queue interviews             # отклики в статусе «Собеседование»
 ```
 
 `--limit` задаёт любое число откликов, пакеты по 100 команда формирует сама. `--track` и `--source`
@@ -215,7 +217,7 @@ HH всегда идёт в видимом Chrome: CAPTCHA проходит че
 CAPTCHA после нажатия не запирает вакансию. Кликер сверяет её с историей HH: найдена, значит успех;
 нет в свежей истории, значит вакансия возвращается в очередь. `queue unknowns` показывает остальные
 UNKNOWN, `queue unknowns --release` возвращает те, которых нет в истории. Повтор безопасен: HH сообщает
-о существующем отклике.
+о существующем отклике. После двух безрезультатных возвратов вакансия получает `needs_owner` и больше не повторяется.
 
 Окно `days` ограничивает поиск и не закрывает вакансию: строка старше окна отсекается только если
 поиск не видел её дольше `window_reject_max_unseen_days` (по умолчанию 14 дней).

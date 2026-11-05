@@ -285,10 +285,13 @@ def remote_info(*values: Any) -> dict[str, Any]:
     if ineligible:
         return {"is_remote": False, "remote_confidence": "ineligible",
                 "remote_reason": "remote_except_russia", "work_format": formats}
-    if remote or hybrid:
+    if remote:
         confidence = "listed_mixed" if office and not hybrid else "listed"
         return {"is_remote": True, "remote_confidence": confidence,
                 "remote_reason": "listed", "work_format": formats}
+    if hybrid:
+        return {"is_remote": False, "remote_confidence": "office",
+                "remote_reason": "hybrid_only", "work_format": formats}
     if office:
         return {"is_remote": False, "remote_confidence": "office",
                 "remote_reason": "office_only", "work_format": formats}

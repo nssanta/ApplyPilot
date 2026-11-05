@@ -341,6 +341,13 @@ def build_parser() -> argparse.ArgumentParser:
     queue_today = queue_sub.add_parser("today", help="итог дня: уникальные исходы откликов по площадкам")
     queue_today.add_argument("--day", help="YYYY-MM-DD (UTC); по умолчанию сегодня")
     queue_today.add_argument("--json", action="store_true")
+    queue_skip = queue_sub.add_parser("skip", help="отсеять вакансии сразу во всех треках")
+    queue_skip.add_argument("--id", action="append", required=True)
+    queue_skip.add_argument("--reason", required=True)
+    queue_interviews = queue_sub.add_parser(
+        "interviews", help="отклики HH в статусе «Собеседование»: читать их чаты",
+    )
+    queue_interviews.add_argument("--json", action="store_true")
     queue_board = queue_sub.add_parser(
         "board", help="сводка: новое, старое, скоры, готово и что требует внимания",
     )
@@ -786,7 +793,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--source", action="append", default=[],
                          help="по умолчанию все площадки")
     run_cmd.add_argument("--scan", action="store_true", help="сначала просканировать")
-    run_cmd.add_argument("--dry-run", action="store_true", help="только sweep и сводка")
+    run_cmd.add_argument("--dry-run", action="store_true", help="всё, кроме отправки: sync, возврат UNKNOWN, sweep, точный план")
     sync_cmd = sub.add_parser("sync", help="прочитать статусы откликов без сообщений")
     sync_cmd.add_argument("--track", help="использовать профиль и SQLite-контекст трека")
     sync_cmd.add_argument("--pages", type=int,
@@ -2423,7 +2430,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "cycle":
         from .daily_run import run_cycle
 
-        return run_cycle(config, args, main)
+        # Nested stages must see the same data dir, profile and search.
+        scope = [item for flag, value in (
+            ("--data-dir", args.data_dir), ("--profile", args.profile), ("--search", args.search),
+        ) if value for item in (flag, value)]
+        return run_cycle(config, args, lambda argv: main([*scope, *argv]))
     if args.command == "go":
         try:
             from .execution import run_go
@@ -3969,6 +3980,20 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{day} UTC: confirmed success = {confirmed}")
                     for source, values in outcomes.items():
                         print(f"  {source}: " + ", ".join(f"{k}={v}" for k, v in sorted(values.items())))
+                return 0
+            if args.queue_action == "skip":
+                changed = Store(config.db_path).skip_everywhere(args.id, args.reason)
+                print(f"queue: skipped rows={changed} ids={len(args.id)}")
+                return 0
+            if args.queue_action == "interviews":
+                rows = Store(config.db_path).interview_statuses(_account(_profile(config)))
+                if args.json:
+                    print(json.dumps(rows, ensure_ascii=False, indent=1))
+                else:
+                    print(f"interviews: {len(rows)}")
+                    for row in rows:
+                        print(f"  {row['vacancy_id']} · {row['detected_at'][:10]} · "
+                              f"{row['title']} — {row['company']}")
                 return 0
             if args.queue_action == "board":
                 from .daily_run import active_tracks, print_board

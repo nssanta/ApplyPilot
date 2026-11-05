@@ -23,6 +23,30 @@ def _contains_captcha(text: str) -> bool:
     return "captcha" in lowered or "капч" in lowered or "подтвердите, что вы не робот" in lowered
 
 
+# Employer text can legitimately mention CAPTCHA; only HH's own UI may signal one.
+_EMPLOYER_CONTENT = '[data-qa="vacancy-description"], .vacancy-branded-user-content, .g-user-content'
+
+
+def _challenge_on_page(page, body: str) -> bool:
+    """Detects an HH challenge, ignoring the employer's vacancy text."""
+    if "captcha" in str(page.url).casefold():
+        return True
+    if not _contains_captcha(body):
+        return False
+    try:
+        employer_lines = {
+            line.strip().casefold()
+            for chunk in page.locator(_EMPLOYER_CONTENT).all_inner_texts()
+            for line in chunk.splitlines()
+        }
+    except Exception:
+        LOGGER.debug("Could not read employer content", exc_info=True)
+        return True
+    own_text = "\n".join(line for line in body.splitlines()
+                         if line.strip().casefold() not in employer_lines)
+    return _contains_captcha(own_text)
+
+
 def _is_archived_vacancy(text: str) -> bool:
     """Detect explicit HH archive notices, not incidental archive mentions."""
     normalized = " ".join(str(text).casefold().split())
@@ -46,11 +70,7 @@ def _normalize_resume_title(value: str) -> str:
 def _captcha_page(page) -> bool:
     """Detects an actual HH challenge, not a FAQ mention of the word CAPTCHA."""
     try:
-        url = str(page.url).casefold()
-        if "/captcha" in url or "captcha" in url:
-            return True
-        body = page.locator("body").inner_text(timeout=5000)
-        return _contains_captcha(body)
+        return _challenge_on_page(page, page.locator("body").inner_text(timeout=5000))
     except Exception:
         LOGGER.debug("Could not inspect page for CAPTCHA", exc_info=True)
         return False
@@ -338,7 +358,7 @@ def _wait_for_confirmation(page, timeout_seconds: float) -> ApplyResult | None:
             return ApplyResult("success", "confirmed by HH page after submission")
         if "вы уже откликались" in body or "уже откликались" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if _contains_captcha(body):
+        if _challenge_on_page(page, body):
             return ApplyResult("unknown", "CAPTCHA detected after submission")
         if check + 1 < checks:
             page.wait_for_timeout(500)
@@ -351,7 +371,7 @@ def _classify_after_submit(page, item: dict, cover_letter: str, confirmation_tim
     if not allowed_hh_url(str(page.url)):
         return ApplyResult("needs_manual", "submission navigated to external ATS")
     body = page.locator("body").inner_text(timeout=5000).lower()
-    if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+    if _challenge_on_page(page, body):
         if _manual_captcha(page, manual_captcha_timeout, interactive):
             confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
             if confirmed is not None:
@@ -394,7 +414,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
         page_title = title_reader() if callable(title_reader) else ""
         if _is_archived_vacancy(page_title) or _is_archived_vacancy(body[:2000]):
             return ApplyResult("needs_manual", "HH vacancy is archived or closed; no submit attempted")
-        if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+        if _challenge_on_page(page, body):
             if not _manual_captcha(page, manual_captcha_timeout, interactive):
                 return ApplyResult("needs_manual",
                                    f"{CAPTCHA_NOTE_PREFIX} before submission; manual pass required")
@@ -419,7 +439,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             return ApplyResult("success", "confirmed after first response action")
         if "вы уже откликались" in body or "уже откликались" in body:
             return ApplyResult("already_applied", "HH reports an existing application")
-        if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+        if _challenge_on_page(page, body):
             # No final submit has happened yet. Solving the challenge can
             # continue this vacancy; timing out is manual, never UNKNOWN.
             if not _manual_captcha(page, manual_captcha_timeout, interactive):
@@ -443,7 +463,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("success", "confirmed after delayed HH response")
             if "вы уже откликались" in body or "уже откликались" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
-            if (_contains_captcha(body) or "/captcha" in str(page.url).casefold()) and not _manual_captcha(
+            if _challenge_on_page(page, body) and not _manual_captcha(
                 page, manual_captcha_timeout, interactive
             ):
                 return ApplyResult("needs_manual",
@@ -463,7 +483,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("success", "confirmed on HH full-page response")
             if "вы уже откликались" in body or "уже откликались" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
-            if (_contains_captcha(body) or "/captcha" in str(page.url).casefold()) and not _manual_captcha(
+            if _challenge_on_page(page, body) and not _manual_captcha(
                 page, manual_captcha_timeout, interactive
             ):
                 return ApplyResult("needs_manual",
@@ -562,7 +582,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("success", "confirmed after ambiguous submit click")
             if "вы уже откликались" in body or "уже откликались" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
-            if _contains_captcha(body) or "/captcha" in str(page.url).casefold():
+            if _challenge_on_page(page, body):
                 if _manual_captcha(page, manual_captcha_timeout, interactive):
                     confirmed = _wait_for_confirmation(page, confirmation_timeout_seconds)
                     if confirmed is not None:
