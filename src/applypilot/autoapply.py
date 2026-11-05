@@ -510,7 +510,7 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("unknown", "first response action had no follow-up dialog")
         response_root = dialog or page
         response_text = response_root.inner_text(timeout=2000).lower() if dialog is not None else body
-        if _contains_captcha(response_text):
+        if _challenge_on_page(page, response_text):
             if not _manual_captcha(page, manual_captcha_timeout, interactive):
                 return ApplyResult("needs_manual",
                                    f"{CAPTCHA_NOTE_PREFIX} in response form; no submit attempted")

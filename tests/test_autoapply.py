@@ -853,3 +853,22 @@ def test_hidden_vacancy_notice_counts_as_closed():
     from applypilot.autoapply import _is_archived_vacancy
 
     assert _is_archived_vacancy("Вам недоступна эта вакансия. Войдите как пользователь, у которого есть доступ")
+
+
+def test_employer_captcha_mention_does_not_stop_the_letter_step():
+    class EmployerText:
+        def all_inner_texts(self):
+            return ["Обход SmartCaptcha и Cloudflare"]
+
+    class Page(_Page):
+        def locator(self, selector):
+            if "vacancy-description" in selector:
+                return EmployerText()
+            return super().locator(selector)
+
+    page = Page(body_after_response="Форма отклика\nОбход SmartCaptcha и Cloudflare")
+
+    result = apply_one(page, _item(), "Python", "Здравствуйте, это сопроводительное письмо.")
+
+    assert result.status == "success"
+    assert any("сопроводительное" in str(fill) for fill in page.fills)
