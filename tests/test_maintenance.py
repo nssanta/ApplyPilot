@@ -52,12 +52,18 @@ def test_cleanup_removes_only_old_snapshots_and_keeps_session_files(tmp_path):
     fresh = _file(config.snapshots_dir / "hh_vacancies_new.json", 1, now)
     session = _file(config.snapshots_dir / "hh_session.json", 30, now)
     profile = _file(config.snapshots_dir / "chrome_profile" / "Cookies", 30, now)
+    pointer = _file(config.snapshots_dir / "hh.ru" / "last_successful.json", 30, now)
+    accepted = _file(config.snapshots_dir / "accepted-ai.json", 30, now)
+    old_source_scan = _file(config.snapshots_dir / "providers" / "habr" / "ai" / "scan-1.json", 30, now)
+    source_login = _file(config.snapshots_dir / "providers" / "habr" / "storage_state.json", 30, now)
 
     report = run_maintenance(config, days=7, now=now)
 
-    assert report["snapshots_removed"] == 1
-    assert not old.exists()
+    assert report["snapshots_removed"] == 2
+    assert not old.exists() and not old_source_scan.exists()
+    assert source_login.exists()
     assert fresh.exists() and session.exists() and profile.exists()
+    assert pointer.exists() and accepted.exists()
 
 
 def test_dry_run_changes_nothing(tmp_path):

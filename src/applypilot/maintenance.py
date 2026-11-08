@@ -25,13 +25,21 @@ PROTECTED_MARKERS = (
     "profile", "session", "cookie", "storage_state", "providers", "chrome", "browser",
     "login", "token", "secret", "answers", "config",
 )
+# Small state files that live next to snapshots: pointers to the last good
+# scan and screen results. They are kept whatever their age.
+KEEP_PREFIXES = ("last_successful", ".last_successful", "accepted-")
 MARKER_FILE = ".last_maintenance"
 LATEST_BACKUP = "applypilot-latest.sqlite3"
 
 
-def is_protected(path: Path) -> bool:
+# Inside snapshots/ the per-source scan folders are named "providers/<source>";
+# they hold scan results only, so that one word does not protect them there.
+SNAPSHOT_MARKERS = tuple(marker for marker in PROTECTED_MARKERS if marker != "providers")
+
+
+def is_protected(path: Path, markers: tuple[str, ...] = PROTECTED_MARKERS) -> bool:
     """True for anything that may hold a login, a session or owner settings."""
-    return any(marker in part.casefold() for part in path.parts for marker in PROTECTED_MARKERS)
+    return any(marker in part.casefold() for part in path.parts for marker in markers)
 
 
 def _old_snapshots(snapshots: Path, cutoff: float) -> list[Path]:
@@ -39,8 +47,8 @@ def _old_snapshots(snapshots: Path, cutoff: float) -> list[Path]:
         return []
     return sorted(
         path for path in snapshots.rglob("*")
-        if path.is_file() and not path.is_symlink() and not is_protected(path.relative_to(snapshots))
-        and path.stat().st_mtime < cutoff
+        if path.is_file() and not path.is_symlink() and not is_protected(path.relative_to(snapshots), SNAPSHOT_MARKERS)
+        and not path.name.startswith(KEEP_PREFIXES) and path.stat().st_mtime < cutoff
     )
 
 

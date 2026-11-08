@@ -61,6 +61,10 @@ cp examples/sources.toml private/config/sources.toml
 .venv/bin/python -m applypilot cycle --limit 50
 .venv/bin/python -m applypilot queue board
 
+# Сжать базу и удалить старые снимки (cycle делает это сам раз в неделю);
+# браузерные профили, сессии и куки не удаляются
+.venv/bin/python -m applypilot maintenance --dry-run
+
 # Без отправки заявок
 .venv/bin/python -m applypilot sources dispatch-plan \
   --track default --limit 10 --json
