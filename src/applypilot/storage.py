@@ -3016,6 +3016,10 @@ class Store:
                 FROM vacancies v JOIN attempts a ON a.account=v.account AND a.vacancy_id=v.vacancy_id
                 WHERE v.account=? AND v.source='hh.ru' AND v.application_state='NEEDS_FORM'
                   AND a.status='needs_manual'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM vacancy_track_scores s
+                    WHERE s.account=v.account AND s.source='hh.ru' AND s.vacancy_id=v.vacancy_id
+                      AND s.review_state='SKIP')
                 ORDER BY a.updated_at DESC LIMIT ?""",
                 (account, int(limit)),
             ).fetchall()

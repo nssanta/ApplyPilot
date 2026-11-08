@@ -270,3 +270,19 @@ def test_reopen_form_restores_ready_for_an_already_approved_vacancy(tmp_path):
     with store.connect() as conn:
         state = conn.execute("SELECT application_state FROM vacancies WHERE vacancy_id='8'").fetchone()[0]
     assert state == "READY_TO_APPLY"
+
+
+def test_owner_skipped_vacancy_leaves_the_pending_forms_list(tmp_path):
+    from applypilot.storage import Store
+
+    store = Store(tmp_path / "state.sqlite3")
+    store.start_campaign("c", "acc", "ai", {"query": "AI"})
+    store.save_campaign_items("c", "acc", "ai", [{"id": "8", "name": "Go", "company": "Y",
+                                                      "url": "https://hh.ru/vacancy/8"}],
+                              status="ok", snapshot_path="")
+    store.record({"id": "8", "name": "Go", "company": "Y", "url": "https://hh.ru/vacancy/8", "score": 50},
+                 "needs_manual", "unanswered screening questions: Опыт Go? [textarea]", "run", "acc")
+    assert [form["id"] for form in store.pending_forms("acc")] == ["8"]
+    with store.connect() as conn:
+        conn.execute("UPDATE vacancy_track_scores SET review_state='SKIP' WHERE vacancy_id='8'")
+    assert store.pending_forms("acc") == []
