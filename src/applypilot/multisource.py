@@ -31,7 +31,7 @@ from .parser import ScanSegment
 from .providers import ProviderRegistry, default_registry
 from .providers.base import SourceCapabilities
 from .queue_actions import next_action
-from .scoring import auto_apply_title_eligible, evaluate_search_filter, score_vacancy
+from .scoring import auto_apply_title_eligible, evaluate_search_filter, route_resume, score_vacancy
 from .storage import AUTO_APPROVAL_REASON, Store, needs_manual_reapproval
 
 SOURCE_LABELS = {
@@ -345,7 +345,10 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
         item["fit_score"] = candidate.score
         item["score_decision"] = candidate.decision
         item["score"] = candidate.score
-        item["resume"] = track_resume or candidate.resume
+        # HH chooses the resume per vacancy title; other sources match their
+        # own resume names, so they keep the fixed track resume.
+        item["resume"] = (route_resume(track_resume, candidate.resume, profile)
+                          if source == "hh.ru" else track_resume or candidate.resume)
         filter_result = evaluate_search_filter(item, group)
         filter_status = filter_result.status
         filter_reasons = list(filter_result.reasons)

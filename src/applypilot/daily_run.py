@@ -6,6 +6,7 @@ orders them, so scan, sweep and the clickers keep a single implementation.
 from __future__ import annotations
 
 import json
+import sqlite3
 from argparse import Namespace
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -220,4 +221,22 @@ def run_cycle(config: AppConfig, args: Namespace, call: Callable[[list[str]], in
     call(["queue", "today"])
     call(["queue", "unknowns"])
     call(["queue", "forms", "--track", tracks[-1]])
+    _weekly_maintenance(config)
     return 0
+
+
+def _weekly_maintenance(config: AppConfig) -> None:
+    """Keep the database small once a week; sessions and cookies are never touched."""
+    from .maintenance import maintenance_due, run_maintenance
+
+    try:
+        if not maintenance_due(config):
+            return
+        report = run_maintenance(config)
+    except (AttributeError, OSError, ValueError, sqlite3.Error) as exc:  # never fail a finished cycle
+        print(f"cycle: maintenance skipped: {exc}")
+        return
+    database = report.get("database", {})
+    print(f"cycle: maintenance snapshots_removed={report['snapshots_removed']} "
+          f"db {database.get('size_before', 0) // 2**20}->{database.get('size_after', 0) // 2**20} MiB "
+          f"integrity={database.get('integrity')}")

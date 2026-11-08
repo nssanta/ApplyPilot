@@ -794,6 +794,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="по умолчанию все площадки")
     run_cmd.add_argument("--scan", action="store_true", help="сначала просканировать")
     run_cmd.add_argument("--dry-run", action="store_true", help="всё, кроме отправки: sync, возврат UNKNOWN, sweep, точный план")
+    maint = sub.add_parser(
+        "maintenance", help="сжать базу, удалить старые снимки; сессии и куки не трогает",
+    )
+    maint.add_argument("--days", type=int, default=7, help="удалять снимки старше N дней")
+    maint.add_argument("--dry-run", action="store_true", help="только показать, что будет удалено")
     sync_cmd = sub.add_parser("sync", help="прочитать статусы откликов без сообщений")
     sync_cmd.add_argument("--track", help="использовать профиль и SQLite-контекст трека")
     sync_cmd.add_argument("--pages", type=int,
@@ -2427,6 +2432,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     config = _config(args)
 
+    if args.command == "maintenance":
+        from .maintenance import run_maintenance
+
+        report = run_maintenance(config, days=args.days, dry_run=args.dry_run)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1 if report.get("error") else 0
     if args.command == "cycle":
         from .daily_run import run_cycle
 

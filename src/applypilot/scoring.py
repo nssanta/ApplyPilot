@@ -228,6 +228,24 @@ def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
     )
 
 
+def _salary_reaches(salary: dict[str, Any] | None, salary_cfg: dict[str, Any]) -> bool:
+    """True when the published range reaches ``salary.priority_from`` in its currency."""
+    try:
+        target = int(salary_cfg.get("priority_from", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if not salary or target <= 0:
+        return False
+    wanted = str(salary_cfg.get("currency", "RUR")).upper()
+    if str(salary.get("currency") or wanted).upper() != wanted:
+        return False
+    try:
+        top = max(int(salary.get("to") or 0), int(salary.get("from") or 0))
+    except (TypeError, ValueError):
+        return False
+    return top >= target
+
+
 def route_resume(track_resume: str, candidate_resume: str, profile: dict[str, Any]) -> str:
     """Pick the HH resume for one vacancy.
 
@@ -351,6 +369,9 @@ def score_vacancy(raw: dict[str, Any], profile: dict[str, Any]) -> Candidate:
         experience_component = 8 if str(candidate.experience).lower() in {
             "noexperience", "between1and3", "нет опыта", "от 1 года до 3 лет"} else 0
         salary_component = 10 if candidate.salary else 0
+        if salary_component and _salary_reaches(candidate.salary, search_rules.get("salary") or {}):
+            # Published pay at or above the owner's priority level ranks first.
+            salary_component += 5
         format_component = 5 if candidate.is_remote else 0
         components = {"role": role_component, "stack": stack_component, "duties": duties_component,
                       "experience": experience_component, "salary": salary_component, "format": format_component}

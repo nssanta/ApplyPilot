@@ -56,3 +56,21 @@ def test_track_resume_stays_fixed_without_per_role_opt_in():
 
     assert route_resume(PRIMARY, GO, {"reviewed": True}) == PRIMARY
     assert route_resume(PRIMARY, GO, {"reviewed": False, "apply": {"allow_profile_resumes": True}}) == PRIMARY
+
+
+def test_hh_scan_routes_resume_by_title_but_other_sources_keep_track_resume():
+    from datetime import UTC, datetime, timedelta
+
+    from applypilot.multisource import _prepare_scored_items
+
+    profile = {"reviewed": True, "apply": {"allow_profile_resumes": True},
+               "resumes": {"default": PRIMARY, "ai_agent": PRIMARY, "python": GO}}
+    item = {"id": "1", "name": "Python-разработчик", "description": "Python FastAPI",
+            "published": datetime.now(UTC).isoformat()}
+    cutoff = datetime.now(UTC) - timedelta(days=30)
+    hh = _prepare_scored_items([dict(item)], source="hh.ru", profile=profile, search={},
+                               cutoff=cutoff, track_resume=PRIMARY)
+    other = _prepare_scored_items([dict(item)], source="geekjob.ru", profile=profile, search={},
+                                  cutoff=cutoff, track_resume=PRIMARY)
+    assert hh[0]["resume"] == GO
+    assert other[0]["resume"] == PRIMARY

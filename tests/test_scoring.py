@@ -192,3 +192,17 @@ def test_salary_soft_threshold_keeps_open_ended_and_other_currency_for_review():
         search,
     )
     assert guaranteed.status == "pass"
+
+
+def test_priority_salary_ranks_above_low_published_salary():
+    search = {"role_terms": ["python"], "primary_role_terms": ["python"],
+              "salary": {"currency": "RUR", "from": 170000, "priority_from": 200000}}
+    base = {"name": "Python Developer", "description": "Python FastAPI PostgreSQL", "is_remote": True}
+    high = score_vacancy({**base, "id": "h", "salary": {"from": 200000, "to": 260000, "currency": "RUR"}},
+                         {"search": search, "rescore": True})
+    low = score_vacancy({**base, "id": "l", "salary": {"from": 150000, "to": 180000, "currency": "RUR"}},
+                        {"search": search, "rescore": True})
+    usd = score_vacancy({**base, "id": "u", "salary": {"from": 3000, "to": 5000, "currency": "USD"}},
+                        {"search": search, "rescore": True})
+    assert high.score == low.score + 5
+    assert usd.score == low.score
