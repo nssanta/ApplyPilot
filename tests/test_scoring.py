@@ -129,6 +129,20 @@ def test_ml_resume_matches_hyphenated_russian_title_and_python_backend_rejects_q
     assert "preset_noise:qa" in qa.hard_killers
 
 
+def test_plain_python_titles_use_backend_resume_and_ai_titles_keep_ai_resume():
+    profile = {"resumes": {"default": "AI", "ai_agent": "AI", "python": "Backend", "go": "Backend", "ml": "AI"}}
+
+    assert choose_resume("Python-разработчик", profile) == "Backend"
+    assert choose_resume("Senior Python Developer", profile) == "Backend"
+    assert choose_resume("Бэкенд-разработчик (FastAPI)", profile) == "Backend"
+    assert choose_resume("Python-разработчик AI-агентов", profile) == "AI"
+    assert choose_resume("Python LLM Engineer", profile) == "AI"
+    assert choose_resume("Backend-разработчик (ИИ, RAG)", profile) == "AI"
+    assert choose_resume("Golang developer", profile) == "Backend"
+    assert choose_resume("AI-инженер", profile) == "AI"
+    assert choose_resume("Mail agent integrator", profile) == "AI"
+
+
 def test_ai_agents_llmops_rejects_qa_and_security_but_keeps_llmops_engineering():
     from applypilot.config import effective_search
 

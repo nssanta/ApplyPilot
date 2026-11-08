@@ -41,3 +41,18 @@ def test_missing_primary_resume_is_fail_closed():
 def test_malformed_resume_mapping_is_ignored():
     profile = {"reviewed": True, "apply": {"allow_profile_resumes": True}, "resumes": [GO]}
     assert _permitted_hh_resumes(profile, PRIMARY) == {PRIMARY}
+
+
+def test_reviewed_profile_routes_resume_by_vacancy_title():
+    from applypilot.scoring import route_resume
+
+    profile = {"reviewed": True, "apply": {"allow_profile_resumes": True}}
+    assert route_resume(PRIMARY, GO, profile) == GO
+    assert route_resume(PRIMARY, "", profile) == PRIMARY
+
+
+def test_track_resume_stays_fixed_without_per_role_opt_in():
+    from applypilot.scoring import route_resume
+
+    assert route_resume(PRIMARY, GO, {"reviewed": True}) == PRIMARY
+    assert route_resume(PRIMARY, GO, {"reviewed": False, "apply": {"allow_profile_resumes": True}}) == PRIMARY

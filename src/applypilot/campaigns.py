@@ -16,6 +16,7 @@ from .scoring import (
     auto_apply_title_eligible,
     evaluate_search_filter,
     prioritize_for_enrichment,
+    route_resume,
     score_vacancy,
 )
 from .sources import HhSearchAdapter
@@ -384,7 +385,7 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
             item["fit_score"] = candidate.score
             item["score_decision"] = candidate.decision
             item["score"] = candidate.score
-            item["resume"] = track_resume or candidate.resume
+            item["resume"] = route_resume(track_resume, candidate.resume, profile)
             group = group_search.get(str(item.get("search_group") or "default"), search)
             professional = profile.get("professional")
             skills = professional.get("skills", []) if isinstance(professional, dict) else []

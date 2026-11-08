@@ -228,6 +228,19 @@ def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
     )
 
 
+def route_resume(track_resume: str, candidate_resume: str, profile: dict[str, Any]) -> str:
+    """Pick the HH resume for one vacancy.
+
+    A reviewed profile that opts into per-role resumes routes by vacancy title
+    (``choose_resume``); otherwise the track resume stays fixed.
+    """
+    apply_policy = profile.get("apply") or {}
+    per_role = profile.get("reviewed") is True and apply_policy.get("allow_profile_resumes") is True
+    if per_role and str(candidate_resume or "").strip():
+        return str(candidate_resume).strip()
+    return track_resume or candidate_resume
+
+
 def choose_resume(title: str, profile: dict[str, Any]) -> str:
     resumes = profile.get("resumes", {})
     low = title.lower()
@@ -235,7 +248,11 @@ def choose_resume(title: str, profile: dict[str, Any]) -> str:
         return str(resumes.get("go", ""))
     if re.search(r"(?<![\w])(ml|machine learning|data scientist|nlp)(?![\w])", low):
         return str(resumes.get("ml", resumes.get("default", "")))
-    if any(x in low for x in ("python", "backend", "fastapi", "django")):
+    # An AI/LLM title keeps the AI resume even when it also names Python;
+    # only plain Python/backend titles go to the backend resume.
+    if re.search(r"(?<![\w])(ai|ии|llm|genai|rag|mcp|agents?|агент\w*|нейросет\w*|gpt)(?![\w])", low):
+        return str(resumes.get("ai_agent", resumes.get("default", "")))
+    if any(x in low for x in ("python", "backend", "fastapi", "django", "бэкенд", "бекенд")):
         return str(resumes.get("python", resumes.get("default", "")))
     return str(resumes.get("ai_agent", resumes.get("default", "")))
 
