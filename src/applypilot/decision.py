@@ -145,6 +145,12 @@ def _salary_can_overlap(row: Mapping[str, Any], search: Mapping[str, Any] | None
     return lower is not None and open_min > 0 and lower >= open_min
 
 
+# Salary codes that the listing card alone proves; no description can change them.
+_SALARY_REJECT_CODES = (
+    "salary:possible_below_threshold", "salary:guaranteed_below_threshold", "salary:open_range_too_low",
+)
+
+
 _LEAD_TITLE = re.compile(
     r"(?:\blead\b|\bhead\b|principal|architect|director|\bcto\b|"
     r"руководител|тимлид|лидер|архитектор|директор)",
@@ -461,6 +467,10 @@ def decide_row(
         if title_codes:
             return Decision("REJECT", "title_excluded",
                             "title alone rules the role out: " + ", ".join(title_codes[:3]))
+        salary_codes = [code for code in codes if code.startswith(_SALARY_REJECT_CODES)]
+        if salary_codes:
+            return Decision("REJECT", "salary_below_floor",
+                            "published salary is below the floor: " + ", ".join(salary_codes[:2]))
     if score_decision == "maybe" and str(row.get("description_status") or "") in {
         "telegram", "missing", "provisional",
     }:

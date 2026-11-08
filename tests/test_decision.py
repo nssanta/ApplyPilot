@@ -319,3 +319,28 @@ def test_provisional_card_with_title_verdict_is_rejected_without_enrichment():
     assert (decision.action, decision.reason_code) == ('REJECT', 'title_excluded')
     relevant = {**junk, 'name': 'Python developer', 'problems': ['role:no_match']}
     assert decide_row(relevant).reason_code == 'needs_description'
+
+
+def test_card_salary_below_floor_is_rejected_without_enrichment():
+    low = _item('low', name='Junior Backend-разработчик', description='', description_status='provisional',
+                score=29, score_decision='maybe', filter_status='reject',
+                filter_reasons=['salary:possible_below_threshold'],
+                salary={'currency': 'RUR', 'from': 80000, 'to': 110000})
+    decision = decide_row(low)
+    assert (decision.action, decision.reason_code) == ('REJECT', 'salary_below_floor')
+    unknown_pay = {**low, 'filter_status': 'unknown', 'filter_reasons': ['salary:unpublished'], 'salary': None}
+    assert decide_row(unknown_pay).reason_code == 'needs_description'
+
+
+def test_very_low_open_range_is_rejected_but_near_floor_stays_unknown():
+    from applypilot.scoring import evaluate_search_filter
+
+    search = {'salary': {'currency': 'RUR', 'from': 170000, 'open_range_min': 160000,
+                         'open_range_reject_below': 120000, 'policy': 'possible'}}
+    def status(lower):
+        item = {'id': 'x', 'name': 'Python', 'salary': {'currency': 'RUR', 'from': lower, 'to': None}}
+        return evaluate_search_filter(item, search)
+    assert status(70000).status == 'reject'
+    assert 'salary:open_range_too_low' in status(70000).reasons
+    assert status(140000).status == 'unknown'
+    assert status(160000).status == 'pass'

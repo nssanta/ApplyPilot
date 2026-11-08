@@ -562,6 +562,10 @@ def evaluate_search_filter(raw: dict[str, Any], search: dict[str, Any]) -> Filte
                     open_min = int(salary_cfg.get("open_range_min", 0) or 0)
                     if open_min and int(lower) >= open_min:
                         return FilterDecision("pass", ("salary:open_range_accepted",), tuple(fields))
+                    # "from 60k" with no ceiling is not a real chance at the target.
+                    reject_below = int(salary_cfg.get("open_range_reject_below", 0) or 0)
+                    if reject_below and int(lower) < reject_below:
+                        return FilterDecision("reject", ("salary:open_range_too_low",), tuple(fields))
                     return FilterDecision("unknown", ("salary:open_range_below_target",), tuple(fields))
                 if max(int(lower or 0), int(upper or 0)) < minimum:
                     return FilterDecision("reject", ("salary:possible_below_threshold",), tuple(fields))
