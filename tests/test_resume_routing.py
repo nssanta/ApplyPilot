@@ -74,3 +74,16 @@ def test_hh_scan_routes_resume_by_title_but_other_sources_keep_track_resume():
                                   cutoff=cutoff, track_resume=PRIMARY)
     assert hh[0]["resume"] == GO
     assert other[0]["resume"] == PRIMARY
+
+
+def test_source_specific_resume_name_wins_for_other_sources():
+    from datetime import UTC, datetime, timedelta
+
+    from applypilot.multisource import _prepare_scored_items
+
+    profile = {"resumes": {"default": PRIMARY, "geekjob.ru": "Only GeekJob resume"}}
+    item = {"id": "1", "name": "Python-разработчик", "description": "Python FastAPI",
+            "published": datetime.now(UTC).isoformat()}
+    rows = _prepare_scored_items([item], source="geekjob.ru", profile=profile, search={},
+                                 cutoff=datetime.now(UTC) - timedelta(days=30), track_resume=GO)
+    assert rows[0]["resume"] == "Only GeekJob resume"

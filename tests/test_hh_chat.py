@@ -319,3 +319,44 @@ def test_triage_does_not_flag_bot_hand_over_or_old_bot_questions():
         {"direction": "inbound", "text": "Пройти опрос: https://t.me/hr_screen_bot"},
     ])
     assert survey["kind"] == "form" and survey["needs_owner"]
+
+
+class _FakeBotPage:
+    def __init__(self, body, options):
+        self.body, self.options = body, options
+
+    def locator(self, _selector):
+        page = self
+
+        class _Body:
+            def inner_text(self):
+                return page.body
+        return _Body()
+
+    def evaluate(self, _script):
+        return list(self.options)
+
+
+def test_bot_state_reads_latest_robot_question_and_buttons():
+    from applypilot.hh_chat import _bot_state
+
+    page = _FakeBotPage(
+        "Робот-рекрутер\nСтарый вопрос?\n02:40\nДа\nРобот-рекрутер\n\nКакой формат подходит?\n02:45\n"
+        "Проект\nПолная занятость", ["Проект", "Полная занятость"])
+    state = _bot_state(page)
+    assert state == {"question": "Какой формат подходит?", "options": ["Проект", "Полная занятость"]}
+    assert _bot_state(_FakeBotPage("Обычный чат без бота", []))["question"] == ""
+
+
+def test_chat_choose_requires_send_flag_and_confirm(tmp_path):
+    import pytest
+
+    from applypilot.mcp_server import Service
+
+    service = Service.__new__(Service)
+    service.enable_chat_send = False
+    with pytest.raises(ValueError):
+        service.chat_choose("1", "Вопрос?", "Да", confirm=True)
+    service.enable_chat_send = True
+    with pytest.raises(ValueError):
+        service.chat_choose("1", "Вопрос?", "Да", confirm=False)

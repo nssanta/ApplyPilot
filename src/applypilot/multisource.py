@@ -347,8 +347,11 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
         item["score"] = candidate.score
         # HH chooses the resume per vacancy title; other sources match their
         # own resume names, so they keep the fixed track resume.
+        # A source with its own resume names (one GeekJob resume, for example)
+        # can name it in [resumes] under the source key.
+        source_resume = str((profile.get("resumes") or {}).get(source) or "").strip()
         item["resume"] = (route_resume(track_resume, candidate.resume, profile)
-                          if source == "hh.ru" else track_resume or candidate.resume)
+                          if source == "hh.ru" else source_resume or track_resume or candidate.resume)
         filter_result = evaluate_search_filter(item, group)
         filter_status = filter_result.status
         filter_reasons = list(filter_result.reasons)

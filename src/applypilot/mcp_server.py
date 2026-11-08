@@ -309,9 +309,9 @@ class Service:
             "read_only_tools": [
                 "capabilities", "scans", "status", "queue", "vacancy_detail",
                 "letter_preview", "application_status", "chat_list", "chat_read",
-                "chat_dry_run", "chat_triage",
+                "chat_dry_run", "chat_triage", "chat_options",
             ],
-            "write_tools": ["scan", "review_decide", "apply", "chat_send"],
+            "write_tools": ["scan", "review_decide", "apply", "chat_send", "chat_choose"],
             "writes_require_confirm": True,
             "live_apply_enabled": self.enable_apply,
             "chat_send_enabled": self.enable_chat_send,
@@ -656,6 +656,25 @@ class Service:
             result = triage_chats(self.config, limit)
         return bounded(result)
 
+    def chat_options(self, thread_id: str) -> dict[str, Any]:
+        from .hh_chat import chat_options
+
+        with self.lock:
+            return bounded(chat_options(self.config, thread_id))
+
+    def chat_choose(self, thread_id: str, question: str, option: str,
+                    confirm: bool = False) -> dict[str, Any]:
+        from .hh_chat import chat_choose
+
+        if not self.enable_chat_send:
+            raise ValueError("Chat choose requires startup flag --enable-chat-send")
+        if confirm is not True:
+            raise ValueError("Chat choose requires confirm=true")
+        if not str(option).strip() or not str(question).strip():
+            raise ValueError("question and option are required")
+        with self.lock:
+            return bounded(chat_choose(self.config, thread_id, question, option))
+
     def chat_read(self, thread_id: str) -> dict[str, Any]:
         from .chat_safety import numeric_id
         from .hh_chat import read_chat
@@ -793,6 +812,16 @@ def create_server(service: Service):
         return service.chat_triage(limit)
 
     @server.tool(annotations=read_network)
+    def chat_options(thread_id: str) -> dict:
+        """Read a screening bot's latest question and its quick-reply buttons."""
+        return service.chat_options(thread_id)
+
+    @server.tool(annotations=write)
+    def chat_choose(thread_id: str, question: str, option: str, confirm: bool = False) -> dict:
+        """Click one exact bot button while the bot still asks this question."""
+        return service.chat_choose(thread_id, question, option, confirm)
+
+    @server.tool(annotations=read_network)
     def chat_read(thread_id: str) -> dict:
         """Read one actual HH chat and its latest inbound fingerprint."""
         return service.chat_read(thread_id)
@@ -851,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
         "capabilities", "scans", "status", "queue", "vacancy_detail", "detail",
         "letter_preview", "letter", "application_status", "scan", "review_decide",
         "apply_dry_run", "apply", "chat_list", "chat_read", "chat_dry_run", "chat_send",
-        "chat_triage",
+        "chat_triage", "chat_options", "chat_choose",
     ])
     parser.add_argument("--arguments", default="{}", help="JSON object for one-shot --call")
     parser.add_argument("--enable-apply", action="store_true")

@@ -521,3 +521,56 @@ def triage_chats(config, limit: int = 30) -> dict:
         "checked": len(rows),
         "note": "Only the newest chats are listed; older ones may be absent.",
     }
+
+
+
+_CHAT_URL = "https://chatik.hh.ru/chat/{thread_id}"
+_OPTIONS_JS = """() => [...document.querySelectorAll('button')]
+    .filter(e => e.offsetParent !== null && !e.getAttribute('data-qa'))
+    .map(e => (e.innerText || '').trim()).filter(Boolean)"""
+
+
+def _bot_state(page) -> dict:
+    """Latest robot question and its quick-reply buttons on a chatik page."""
+    body = page.locator("body").inner_text()
+    options = page.evaluate(_OPTIONS_JS)
+    tail = body.rsplit("Робот-рекрутер", 1)[-1] if "Робот-рекрутер" in body else ""
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    question = next((line for line in lines if line not in options and not re.fullmatch(r"\d{1,2}:\d{2}", line)), "")
+    return {"question": question, "options": options}
+
+
+def chat_options(config, thread_id: str) -> dict:
+    """Read the screening bot's latest question and its buttons; no clicks."""
+    numeric_id(thread_id)
+    with browser_page(config) as page:
+        page.goto(_CHAT_URL.format(thread_id=thread_id), wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)
+        return {"thread_id": thread_id, **_bot_state(page)}
+
+
+def chat_choose(config, thread_id: str, question: str, option: str) -> dict:
+    """Click one exact quick-reply button when the bot still asks ``question``.
+
+    The click happens only if the latest robot question matches and exactly one
+    visible button carries ``option``. Afterwards the page is reloaded: success
+    means the question moved on or the bot no longer offers the same buttons.
+    """
+    numeric_id(thread_id)
+    with browser_page(config) as page:
+        page.goto(_CHAT_URL.format(thread_id=thread_id), wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)
+        before = _bot_state(page)
+        if " ".join(before["question"].split()) != " ".join(str(question).split()):
+            return {"status": "question_changed", "clicked": False, **before}
+        buttons = page.get_by_role("button", name=option, exact=True)
+        if buttons.count() != 1 or option not in before["options"]:
+            return {"status": "option_missing", "clicked": False, **before}
+        buttons.first.click(timeout=15000)
+        page.wait_for_timeout(2500)
+        page.reload(wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)
+        after = _bot_state(page)
+        moved = after["question"] != before["question"] or after["options"] != before["options"]
+        return {"status": "success" if moved else "unknown_after_click", "clicked": True,
+                "before": before, "after": after}
