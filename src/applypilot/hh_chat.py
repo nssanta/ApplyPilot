@@ -419,3 +419,105 @@ def send_chat(config, journal, account: str, thread_id: str, vacancy_id: str,
                 "retry": False,
                 "reason": "Chat changed or browser failed; inspect thread before another action",
             }
+
+# Patterns for the employer's latest unanswered messages.  An invitation, a
+# test task or an external form always goes to the owner; a plain question can
+# be answered from the private facts.
+_INVITE = re.compile(
+    r"созвон|позвон|звонок|собеседован|интервью|встреч|zoom|телемост|google meet|"
+    r"календар|слот|удобно.{0,60}(?:время|созвон|сейчас|поговорить)|обсудить вакансию",
+    re.IGNORECASE,
+)
+_TASK = re.compile(r"тестов\w*|техническ\w* задани|\bтз\b|домашн\w* задани", re.IGNORECASE)
+_FORM = re.compile(r"forms\.gle|forms\.yandex|docs\.google\.com/forms|t\.me/\w*bot|анкет", re.IGNORECASE)
+_HANDED_OVER = re.compile(
+    r"передал\w* (?:\w+ )?работодател|представитель работодателя ознакомится|"
+    r"рассмотрим ваше резюме|мы свяжемся с вами|свяжемся с вами|спасибо за ответы",
+    re.IGNORECASE,
+)
+_REJECT = re.compile(
+    r"к сожалению|не готовы предложить|не можем предложить|выбрали другого|отказ|"
+    r"не подходит|приняли решение не",
+    re.IGNORECASE,
+)
+
+
+def classify_thread(messages: list[dict]) -> dict:
+    """Who owes the next message and what the employer asked for.
+
+    The badge on the chat list disappears once a chat is opened, so it cannot
+    tell whether a reply is owed.  This looks at the messages themselves: the
+    thread waits for us when the employer wrote after our last message.
+    """
+    known = [m for m in messages if m.get("direction") in {"inbound", "outbound"}]
+    if not known:
+        return {"waiting_for_us": False, "kind": "empty", "needs_owner": False, "unanswered": ""}
+    last_out = max((i for i, m in enumerate(known) if m["direction"] == "outbound"), default=-1)
+    unanswered = "\n".join(str(m.get("text") or "") for m in known[last_out + 1:]).strip()
+    waiting = known[-1]["direction"] == "inbound"
+    # Bot screenings post many questions in a row; the last message tells
+    # where the thread stands now.
+    latest = str(known[-1].get("text") or "")
+    if not waiting:
+        kind = "answered"
+    elif _INVITE.search(latest):
+        kind = "invite"
+    elif _HANDED_OVER.search(latest):
+        kind = "handed_over"
+    elif _REJECT.search(latest):
+        kind = "rejection"
+    elif _FORM.search(latest):
+        kind = "form"
+    elif _TASK.search(latest):
+        kind = "test_task"
+    elif "?" in latest:
+        kind = "question"
+    else:
+        kind = "info"
+    return {
+        "waiting_for_us": waiting and kind not in {"rejection", "handed_over"},
+        "kind": kind,
+        "needs_owner": kind in {"invite", "test_task", "form"},
+        "unanswered": unanswered[-1500:],
+    }
+
+
+def triage_chats(config, limit: int = 30) -> dict:
+    """Open each recent chat once and report the ones that wait for a reply."""
+    rows: list[dict] = []
+    with browser_page(config) as page:
+        frame = open_first_thread(page)
+        frame.locator('[data-qa="chatik-back-to-chats-button"]').click()
+        chats = walk_chat_links(frame, limit)
+        for chat in chats:
+            thread_id = chat["thread_id"]
+            try:
+                anchor = frame.locator(f'[data-qa="chatik-open-chat-{thread_id}"]')
+                if not anchor.count():
+                    walk_chat_links(frame, 200, target=thread_id)
+                if not anchor.count():
+                    raise ChatUnavailable("thread is not in the loaded chat list")
+                anchor.click()
+                frame.wait_for_url(lambda url, tid=thread_id: frame_thread(str(url)) == tid)
+                data = read_stable(frame)
+                rows.append({
+                    **chat, "vacancy_id": data.get("vacancy_id"), "company": data.get("company"),
+                    **classify_thread(list(data.get("messages") or [])),
+                })
+                frame.locator('[data-qa="chatik-back-to-chats-button"]').click()
+            except Exception as exc:  # noqa: BLE001 - one broken chat must not hide the rest
+                rows.append({**chat, "error": str(exc)[:300]})
+                try:
+                    frame.locator('[data-qa="chatik-back-to-chats-button"]').click(timeout=3000)
+                except Exception as back_exc:  # noqa: BLE001
+                    LOGGER.debug("chat list return failed: %s", back_exc)
+    rows.sort(key=lambda row: (not row.get("needs_owner"), not row.get("waiting_for_us"),
+                               "error" not in row))
+    return {
+        "chats": rows,
+        "waiting_for_us": sum(1 for row in rows if row.get("waiting_for_us")),
+        "needs_owner": sum(1 for row in rows if row.get("needs_owner")),
+        "errors": sum(1 for row in rows if "error" in row),
+        "checked": len(rows),
+        "note": "Only the newest chats are listed; older ones may be absent.",
+    }

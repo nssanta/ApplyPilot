@@ -309,7 +309,7 @@ class Service:
             "read_only_tools": [
                 "capabilities", "scans", "status", "queue", "vacancy_detail",
                 "letter_preview", "application_status", "chat_list", "chat_read",
-                "chat_dry_run",
+                "chat_dry_run", "chat_triage",
             ],
             "write_tools": ["scan", "review_decide", "apply", "chat_send"],
             "writes_require_confirm": True,
@@ -648,6 +648,14 @@ class Service:
             result = list_chats(self.config, limit)
         return bounded(result)
 
+    def chat_triage(self, limit: int = 30) -> dict[str, Any]:
+        from .hh_chat import triage_chats
+
+        _number(limit, 1, 100, "limit")
+        with self.lock:
+            result = triage_chats(self.config, limit)
+        return bounded(result)
+
     def chat_read(self, thread_id: str) -> dict[str, Any]:
         from .chat_safety import numeric_id
         from .hh_chat import read_chat
@@ -780,6 +788,11 @@ def create_server(service: Service):
         return service.chat_list(limit)
 
     @server.tool(annotations=read_network)
+    def chat_triage(limit: int = 30) -> dict:
+        """Open recent HH chats and list the ones where the employer wrote last."""
+        return service.chat_triage(limit)
+
+    @server.tool(annotations=read_network)
     def chat_read(thread_id: str) -> dict:
         """Read one actual HH chat and its latest inbound fingerprint."""
         return service.chat_read(thread_id)
@@ -838,6 +851,7 @@ def main(argv: list[str] | None = None) -> int:
         "capabilities", "scans", "status", "queue", "vacancy_detail", "detail",
         "letter_preview", "letter", "application_status", "scan", "review_decide",
         "apply_dry_run", "apply", "chat_list", "chat_read", "chat_dry_run", "chat_send",
+        "chat_triage",
     ])
     parser.add_argument("--arguments", default="{}", help="JSON object for one-shot --call")
     parser.add_argument("--enable-apply", action="store_true")

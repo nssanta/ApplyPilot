@@ -274,3 +274,48 @@ def test_open_thread_does_not_return_wrong_navigation(monkeypatch, href, navigat
     monkeypatch.setattr(hh_chat, "walk_chat_links", lambda *_a, **_k: [])
     with pytest.raises(hh_chat.ChatUnavailable):
         hh_chat.open_thread(page, thread_id="10")
+
+
+def test_triage_flags_unanswered_invitation_even_after_the_chat_was_read():
+    from applypilot.hh_chat import classify_thread
+
+    invite = classify_thread([
+        {"direction": "outbound", "text": "Без сопроводительного письма"},
+        {"direction": "inbound", "text": "Пишу по поводу Вашего отклика. Предлагаю обсудить вакансию. "
+                                         "Вам удобно сейчас созвониться на 10-15 минут?"},
+    ])
+    assert invite["waiting_for_us"] and invite["kind"] == "invite" and invite["needs_owner"]
+
+
+def test_triage_kinds_and_answered_threads():
+    from applypilot.hh_chat import classify_thread
+
+    def kind(text):
+        return classify_thread([{"direction": "outbound", "text": "отклик"},
+                                {"direction": "inbound", "text": text}])
+
+    assert kind("Пришлите, пожалуйста, решение тестового задания до пятницы")["kind"] == "test_task"
+    assert kind("Заполните анкету https://forms.gle/abc")["kind"] == "form"
+    rejected = kind("К сожалению, мы не готовы предложить вам работу")
+    assert rejected["kind"] == "rejection" and not rejected["waiting_for_us"]
+    assert kind("Какой у вас опыт с PostgreSQL?")["kind"] == "question"
+    answered = classify_thread([{"direction": "inbound", "text": "Есть опыт с Docker?"},
+                                {"direction": "outbound", "text": "Да, постоянно."}])
+    assert answered["kind"] == "answered" and not answered["waiting_for_us"]
+    assert classify_thread([])["kind"] == "empty"
+
+
+def test_triage_does_not_flag_bot_hand_over_or_old_bot_questions():
+    from applypilot.hh_chat import classify_thread
+
+    bot = classify_thread([
+        {"direction": "outbound", "text": "отклик"},
+        {"direction": "inbound", "text": "Есть ли у вас опыт с тестовыми фреймворками?"},
+        {"direction": "inbound", "text": "Спасибо за ответы! Мы передали их работодателю."},
+    ])
+    assert bot["kind"] == "handed_over" and not bot["waiting_for_us"] and not bot["needs_owner"]
+    survey = classify_thread([
+        {"direction": "outbound", "text": "отклик"},
+        {"direction": "inbound", "text": "Пройти опрос: https://t.me/hr_screen_bot"},
+    ])
+    assert survey["kind"] == "form" and survey["needs_owner"]
