@@ -15,6 +15,7 @@ from .parser import ScanSegment, enrich_items, save_snapshot, stamp_first_seen
 from .scoring import (
     auto_apply_title_eligible,
     evaluate_search_filter,
+    normalize_salary,
     prioritize_for_enrichment,
     route_resume,
     score_vacancy,
@@ -379,6 +380,7 @@ def run_campaign(config: AppConfig, track: str, profile: dict[str, Any], search:
         campaign_items: list[dict[str, Any]] = []
         for raw_item in all_items:
             item = dict(raw_item)
+            item["salary"] = normalize_salary(item.get("salary"), search.get("salary") or {})
             scoring_profile = {**profile, "search": search, "rescore": True}
             candidate = score_vacancy(item, scoring_profile)
             item.update(candidate.to_dict())

@@ -206,3 +206,17 @@ def test_priority_salary_ranks_above_low_published_salary():
                         {"search": search, "rescore": True})
     assert high.score == low.score + 5
     assert usd.score == low.score
+
+
+def test_foreign_salary_is_converted_with_configured_rate():
+    from applypilot.scoring import evaluate_search_filter, normalize_salary
+
+    cfg = {"currency": "RUR", "from": 170000, "fx": {"USD": 80, "EUR": 90}}
+    usd = normalize_salary({"from": 3000, "to": 5000, "currency": "USD"}, cfg)
+    assert usd == {"from": 240000, "to": 400000, "currency": "RUR",
+                   "original": {"from": 3000, "to": 5000, "currency": "USD"}}
+    assert normalize_salary(usd, cfg) == usd
+    assert normalize_salary({"from": 100, "currency": "GBP"}, cfg)["currency"] == "GBP"
+    assert evaluate_search_filter({"id": "1", "name": "Python", "salary": usd}, {"salary": cfg}).status == "pass"
+    low = normalize_salary({"from": 1000, "to": 1500, "currency": "USD"}, cfg)
+    assert evaluate_search_filter({"id": "2", "name": "Python", "salary": low}, {"salary": cfg}).status == "reject"

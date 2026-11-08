@@ -31,7 +31,13 @@ from .parser import ScanSegment
 from .providers import ProviderRegistry, default_registry
 from .providers.base import SourceCapabilities
 from .queue_actions import next_action
-from .scoring import auto_apply_title_eligible, evaluate_search_filter, route_resume, score_vacancy
+from .scoring import (
+    auto_apply_title_eligible,
+    evaluate_search_filter,
+    normalize_salary,
+    route_resume,
+    score_vacancy,
+)
 from .storage import AUTO_APPROVAL_REASON, Store, needs_manual_reapproval
 
 SOURCE_LABELS = {
@@ -338,6 +344,7 @@ def _prepare_scored_items(items: list[dict[str, Any]], *, source: str, profile: 
                 "remote_reason": remote["remote_reason"],
                 "work_format": remote["work_format"],
             })
+        item["salary"] = normalize_salary(item.get("salary"), search.get("salary") or {})
         scoring_profile = {**profile, "search": search, "rescore": True}
         candidate = score_vacancy(item, scoring_profile)
         item.update(candidate.to_dict())

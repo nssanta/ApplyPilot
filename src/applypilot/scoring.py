@@ -228,6 +228,38 @@ def auto_apply_title_eligible(item: dict[str, Any], search: dict[str, Any],
     )
 
 
+def normalize_salary(salary: Any, salary_cfg: dict[str, Any]) -> Any:
+    """Convert a foreign-currency range to the target currency with ``salary.fx``.
+
+    ``fx = {USD = 80, EUR = 90}`` turns 3000-5000 USD into 240000-400000 RUR so
+    the floor and priority checks compare like with like. The original numbers
+    stay under ``original``. Without a rate the salary is returned unchanged.
+    """
+    if not isinstance(salary, dict) or not salary:
+        return salary
+    wanted = str(salary_cfg.get("currency") or "").upper()
+    currency = str(salary.get("currency") or "").upper()
+    rates = salary_cfg.get("fx") or {}
+    if not wanted or not currency or currency == wanted or "original" in salary:
+        return salary
+    try:
+        rate = float(rates.get(currency) or rates.get(currency.lower()) or 0)
+    except (TypeError, ValueError):
+        rate = 0.0
+    if rate <= 0:
+        return salary
+    converted = dict(salary)
+    for key in ("from", "to"):
+        if salary.get(key) is not None:
+            try:
+                converted[key] = round(float(salary[key]) * rate)
+            except (TypeError, ValueError):
+                return salary
+    converted["currency"] = wanted
+    converted["original"] = {"from": salary.get("from"), "to": salary.get("to"), "currency": currency}
+    return converted
+
+
 def _salary_reaches(salary: dict[str, Any] | None, salary_cfg: dict[str, Any]) -> bool:
     """True when the published range reaches ``salary.priority_from`` in its currency."""
     try:
