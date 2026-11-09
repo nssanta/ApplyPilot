@@ -428,9 +428,27 @@ def _fetch(
     return text, "ok", "", 1
 
 
+# Getmatch shows the archive banner in Russian or English depending on the
+# visitor locale; the apply preflight uses the same list.
+ARCHIVED_MARKERS = (
+    "вакансия в архиве", "вакансия снята", "набор закрыт",
+    "the vacancy has been archived", "no longer hiring",
+)
+
+
+def is_archived_text(text: str) -> bool:
+    value = str(text or "").casefold()
+    return any(marker in value for marker in ARCHIVED_MARKERS)
+
+
 def _is_archived(soup: BeautifulSoup) -> bool:
-    text = soup.get_text(" ", strip=True).casefold()
-    return "вакансия в архиве" in text
+    return is_archived_text(soup.get_text(" ", strip=True))
+
+
+def _report_archived(filters: Mapping[str, Any], native_id: str) -> None:
+    sink = filters.get("archived_sink")
+    if isinstance(sink, list) and native_id:
+        sink.append(str(native_id))
 
 
 def _job_posting(soup: BeautifulSoup) -> dict[str, Any] | None:
@@ -839,6 +857,7 @@ class GetMatchProvider:
             if _is_archived(soup):
                 archived += 1
                 processed += 1
+                _report_archived(filters, row["native_id"])
                 new_seen.add(row["native_id"])
                 archived_seen.add(row["native_id"])
                 seen_urls.add(row["url"])
@@ -965,6 +984,7 @@ class GetMatchProvider:
             native_id, _ = _native_and_slug(url)
             if _is_archived(BeautifulSoup(html, "html.parser")):
                 archived += 1
+                _report_archived(filters, native_id)
                 new_seen.add(native_id)
                 archived_seen.add(native_id)
                 seen_urls.add(url)

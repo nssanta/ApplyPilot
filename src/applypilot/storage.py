@@ -8,6 +8,7 @@ import json
 import re
 import sqlite3
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from html import unescape
@@ -1924,6 +1925,30 @@ class Store:
                  json.dumps(config, ensure_ascii=False, sort_keys=True), previous_id, timestamp),
             )
         return previous_id
+
+    def mark_source_archived(self, account: str, source: str, vacancy_ids: Iterable[str],
+                             note: str) -> int:
+        """Close vacancies the source itself shows as archived.
+
+        Rows with a confirmed, quarantined or in-flight application keep their
+        state; everything else leaves the review and send queues.
+        """
+        ids = sorted({str(value) for value in vacancy_ids if str(value).strip()})
+        if not ids:
+            return 0
+        timestamp = now()
+        changed = 0
+        with self.connect() as conn:
+            for vacancy_id in ids:
+                cursor = conn.execute(
+                    "UPDATE vacancies SET application_state='NEEDS_MANUAL',application_note=?,"
+                    "last_checked_at=?,updated_at=? WHERE account=? AND source=? AND vacancy_id=? "
+                    "AND application_state NOT IN "
+                    "('APPLIED_CONFIRMED','ALREADY_APPLIED','UNKNOWN','SUBMITTING','NEEDS_MANUAL')",
+                    (str(note)[:500], timestamp, timestamp, account, source, vacancy_id),
+                )
+                changed += cursor.rowcount
+        return changed
 
     def save_campaign_items(self, campaign_id: str, account: str, track: str,
                             items: list[dict[str, Any]], *, status: str,

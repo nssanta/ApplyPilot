@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .dispatch import ApplyOutcome
+from .providers.getmatch import is_archived_text
 
 SOURCE = "getmatch.ru"
 HOST = "getmatch.ru"
@@ -102,10 +103,7 @@ def apply_getmatch_web_page(
                     },
                 )
             return ApplyOutcome("needs_manual", "Getmatch page claims an application but history is missing")
-        if any(flag in body for flag in (
-            "вакансия снята", "вакансия в архиве", "набор закрыт",
-            "the vacancy has been archived", "no longer hiring",
-        )):
+        if is_archived_text(body):
             return ApplyOutcome("needs_manual", "Getmatch vacancy is archived")
         expected = str(row.get("name") or "").strip()
         if expected and expected.casefold() not in body:

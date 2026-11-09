@@ -626,6 +626,8 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             # connection pool instead of paying a new TCP/TLS setup per URL.
             scan_session = requests.Session()
             filters["session"] = scan_session
+        archived_ids: list[str] = []
+        filters["archived_sink"] = archived_ids
         try:
             discovered = provider.discover(filters)
         except KeyboardInterrupt:
@@ -682,6 +684,9 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             source=source,
         )
         committed_cursors = _commit_deferred_cursors(filters)
+        archived_closed = store.mark_source_archived(
+            account, source, archived_ids, f"{source}: vacancy is archived on the site",
+        ) if archived_ids else 0
         telegram_linked = 0
         if telegram_hints and source == "getmatch.ru" and not fixture_mode:
             # Re-attach the saved bot message metadata after scanner enrichment.
@@ -698,6 +703,7 @@ def scan_source(config: AppConfig, track: str, profile: dict[str, Any], search: 
             "account": account, "track": track, "fixture": bool(fixture_dir or fixture_path),
             "items": len(items), "segments": len(segments), "errors": errors,
             "snapshot": str(snapshot), "summary": summary, "top": top,
+            "archived_closed": archived_closed,
             "telegram_links": telegram_linked,
             "cursor_committed": committed_cursors,
             "candidate_ids": [str(item.get("id") or "") for item in items if item.get("id")],
