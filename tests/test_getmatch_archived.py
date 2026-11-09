@@ -83,3 +83,16 @@ def test_archived_rows_leave_queues_but_applied_rows_stay(tmp_path: Path) -> Non
     assert states == {"1": "NEEDS_MANUAL", "2": "NEEDS_MANUAL",
                       "3": "APPLIED_CONFIRMED", "4": "UNKNOWN"}
     assert store.mark_source_archived("acc", "getmatch.ru", [], "x") == 0
+
+
+def test_archive_words_inside_page_scripts_do_not_close_live_vacancy() -> None:
+    from bs4 import BeautifulSoup
+
+    from applypilot.providers.getmatch import _is_archived
+
+    live = (
+        "<html><body><h1>Senior Python Developer</h1><button>Откликнуться</button>"
+        '<script>window.i18n={"closed":"Вакансия снята с публикации"}</script></body></html>'
+    )
+    assert not _is_archived(BeautifulSoup(live, "html.parser"))
+    assert _is_archived(BeautifulSoup(_ARCHIVED_EN, "html.parser"))

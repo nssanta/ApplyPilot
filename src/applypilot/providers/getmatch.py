@@ -442,7 +442,13 @@ def is_archived_text(text: str) -> bool:
 
 
 def _is_archived(soup: BeautifulSoup) -> bool:
-    return is_archived_text(soup.get_text(" ", strip=True))
+    # Page scripts carry every UI string, including the archive banner, so
+    # only rendered text counts.
+    visible = " ".join(
+        str(node) for node in soup.find_all(string=True)
+        if getattr(node.parent, "name", "") not in {"script", "style", "noscript", "template"}
+    )
+    return is_archived_text(visible)
 
 
 def _report_archived(filters: Mapping[str, Any], native_id: str) -> None:
