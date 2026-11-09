@@ -16,6 +16,7 @@ LETTER_SELECTOR = (
     '[data-qa="vacancy-response-popup-form-letter-input"]'
 )
 CAPTCHA_NOTE_PREFIX = "CAPTCHA"
+RESPONSE_LINK_POLLS = 20  # 0.5 s each: up to 10 s for the apply button to render
 
 
 def _contains_captcha(text: str) -> bool:
@@ -422,6 +423,12 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
             if "вы откликнулись" in body or "отклик отправлен" in body:
                 return ApplyResult("already_applied", "HH reports an existing application")
         links = page.locator('[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link"]')
+        # The button is rendered by scripts after domcontentloaded; a single
+        # early look parked live vacancies as manual.
+        for _poll in range(RESPONSE_LINK_POLLS):
+            if links.count():
+                break
+            page.wait_for_timeout(500)
         if links.count() == 0:
             return ApplyResult("needs_manual", "application button not found")
         try:

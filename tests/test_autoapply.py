@@ -189,6 +189,40 @@ def test_first_action_direct_success_is_not_repeated():
     assert len(page.clicks) == 1
 
 
+class _SlowButtonPage(_Page):
+    """The apply button appears only after scripts render it."""
+
+    def __init__(self, ready_after, **kwargs):
+        super().__init__(**kwargs)
+        self.state = "loading"
+        self.ready_after = ready_after
+        self.waits = 0
+
+    def wait_for_timeout(self, milliseconds):
+        self.waits += 1
+        if self.waits >= self.ready_after and self.state == "loading":
+            self.state = "initial"
+
+
+def test_apply_button_rendered_late_is_still_clicked():
+    page = _SlowButtonPage(4, dialog_after_response=False, body_after_response="Отклик отправлен")
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "success"
+    assert len(page.clicks) == 1
+
+
+def test_apply_button_that_never_renders_stays_manual():
+    page = _SlowButtonPage(10_000)
+
+    result = apply_one(page, _item(), "Python")
+
+    assert result.status == "needs_manual"
+    assert result.note == "application button not found"
+    assert page.clicks == []
+
+
 def test_first_action_without_follow_up_is_unknown_and_not_repeated():
     page = _Page(dialog_after_response=False, body_after_response="Vacancy")
 
