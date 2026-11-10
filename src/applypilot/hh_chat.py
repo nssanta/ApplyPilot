@@ -428,6 +428,10 @@ _INVITE = re.compile(
     r"календар|слот|удобно.{0,60}(?:время|созвон|сейчас|поговорить)|обсудить вакансию",
     re.IGNORECASE,
 )
+# "Не готовы пригласить вас на интервью" names an interview but declines it.
+_DECLINED_INVITE = re.compile(
+    r"(?:не готовы|не можем|не сможем)\s+(?:\w+\s+){0,3}пригласить", re.IGNORECASE,
+)
 _TASK = re.compile(r"тестов\w*|техническ\w* задани|\bтз\b|домашн\w* задани", re.IGNORECASE)
 _FORM = re.compile(r"forms\.gle|forms\.yandex|docs\.google\.com/forms|t\.me/\w*bot|анкет", re.IGNORECASE)
 _HANDED_OVER = re.compile(
@@ -461,6 +465,8 @@ def classify_thread(messages: list[dict]) -> dict:
     latest = str(known[-1].get("text") or "")
     if not waiting:
         kind = "answered"
+    elif _DECLINED_INVITE.search(latest):
+        kind = "rejection"
     elif _INVITE.search(latest):
         kind = "invite"
     elif _HANDED_OVER.search(latest):

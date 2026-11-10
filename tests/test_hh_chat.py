@@ -302,6 +302,10 @@ def test_triage_kinds_and_answered_threads():
                   "но уже закрыли эту позицию. Возможно, скоро снова появится подходящая позиция.")
     assert closed["kind"] == "rejection" and not closed["waiting_for_us"]
     assert kind("Добрый день, вакансия уже закрыта")["kind"] == "rejection"
+    declined = kind("Большое спасибо за интерес, проявленный к нашей вакансии. К сожалению, "
+                    "в настоящий момент мы не готовы пригласить вас на интервью.")
+    assert declined["kind"] == "rejection" and not declined["needs_owner"]
+    assert kind("Готовы пригласить вас на интервью, когда удобно?")["kind"] == "invite"
     assert kind("Какой у вас опыт с PostgreSQL?")["kind"] == "question"
     answered = classify_thread([{"direction": "inbound", "text": "Есть опыт с Docker?"},
                                 {"direction": "outbound", "text": "Да, постоянно."}])
