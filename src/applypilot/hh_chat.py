@@ -428,9 +428,17 @@ _INVITE = re.compile(
     r"календар|слот|удобно.{0,60}(?:время|созвон|сейчас|поговорить)|обсудить вакансию",
     re.IGNORECASE,
 )
-# "Не готовы пригласить вас на интервью" names an interview but declines it.
+# "Не готовы пригласить вас на интервью" names an interview but declines it,
+# and so does "после собеседования ... решили продолжить поиски".
 _DECLINED_INVITE = re.compile(
-    r"(?:не готовы|не можем|не сможем)\s+(?:\w+\s+){0,3}пригласить", re.IGNORECASE,
+    r"(?:не готовы|не можем|не сможем)\s+(?:\w+\s+){0,3}пригласить|продолжить поиск",
+    re.IGNORECASE,
+)
+# "Продолжаем рассматривать кандидатов ... по итогам собеседований" is a hold:
+# the employer owes the next step, not us.
+_STILL_DECIDING = re.compile(
+    r"продолжаем рассматривать|оста[её]тся в числе|остаетесь в числе|остаётесь в числе",
+    re.IGNORECASE,
 )
 _TASK = re.compile(r"тестов\w*|техническ\w* задани|\bтз\b|домашн\w* задани", re.IGNORECASE)
 _FORM = re.compile(r"forms\.gle|forms\.yandex|docs\.google\.com/forms|t\.me/\w*bot|анкет", re.IGNORECASE)
@@ -467,6 +475,8 @@ def classify_thread(messages: list[dict]) -> dict:
         kind = "answered"
     elif _DECLINED_INVITE.search(latest):
         kind = "rejection"
+    elif _STILL_DECIDING.search(latest):
+        kind = "handed_over"
     elif _INVITE.search(latest):
         kind = "invite"
     elif _HANDED_OVER.search(latest):
