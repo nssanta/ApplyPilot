@@ -9,6 +9,7 @@ def test_screening_answers_use_only_configured_private_facts():
     answers = {"salary": "140000", "english": "A2", "motivation": "AI products"}
 
     assert screening_answer_for("Ваши зарплатные ожидания?", answers) == "140000"
+    assert screening_answer_for("От каких сумм рассматриваете предложения о работе для себя?", answers) == "140000"
     assert screening_answer_for("What is your English level?", answers) == "A2"
     assert screening_answer_for("Why are you interested in this role?", answers) == "AI products"
     assert screening_answer_for("How many years of Kubernetes experience?", answers) == ""
@@ -906,3 +907,15 @@ def test_employer_captcha_mention_does_not_stop_the_letter_step():
 
     assert result.status == "success"
     assert any("сопроводительное" in str(fill) for fill in page.fills)
+
+
+def test_letter_required_needs_the_words_together():
+    from applypilot.autoapply import _letter_required
+
+    assert _letter_required("Сопроводительное письмо обязательное для этой вакансии")
+    assert _letter_required("Письмо работодателю — обязательно")
+    # Real HH response page: optional letter toggle plus an English warning.
+    assert not _letter_required(
+        "AI Agent Engineer 180 000 ₽ Сопроводительное письмо Добавить Откликнуться ПАО Биржа "
+        "Английский язык в резюме ниже обязательного уровня, который указал работодатель."
+    )

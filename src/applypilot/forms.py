@@ -25,7 +25,7 @@ ANSWER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("it_accreditation", ("аккредитац", "accreditation")),
     ("military_id", ("военный билет", "приписн")),
     ("employment_type", ("оформлени", "оформит", "тк рф", "трудовому договору")),
-    ("salary", ("зарплат", "доход", "оклад", "compensation", "salary", "от какой суммы", "ожидаемая сумма")),
+    ("salary", ("зарплат", "доход", "оклад", "compensation", "salary", "от какой суммы", "от каких сумм", "какую сумму", "ожидаемая сумма")),
     ("english", ("english", "английск", "уровень владения языком")),
     ("motivation", ("почему", "мотивац", "why", "заинтерес", "interest")),
     ("citizenship", ("гражданств", "citizenship")),

@@ -312,6 +312,12 @@ def test_triage_kinds_and_answered_threads():
     hold = kind("Мы продолжаем рассматривать кандидатов и анализировать результаты "
                 "собеседований. Ваша кандидатура остается в числе тех, кто нас заинтересовал.")
     assert hold["kind"] == "handed_over" and not hold["waiting_for_us"]
+    stopped = kind("На данный момент подбор на данную позицию остановлен, так как ожидается "
+                   "трудоустройство финального кандидата.")
+    assert stopped["kind"] == "rejection" and not stopped["waiting_for_us"]
+    taken = kind("Добрый день! Спасибо, что откликнулись на нашу вакансию. Мы взяли Ваше резюме "
+                 "в работу, в случае положительного решения - вернемся с обратной связью.")
+    assert taken["kind"] == "handed_over" and not taken["waiting_for_us"]
     assert kind("Какой у вас опыт с PostgreSQL?")["kind"] == "question"
     answered = classify_thread([{"direction": "inbound", "text": "Есть опыт с Docker?"},
                                 {"direction": "outbound", "text": "Да, постоянно."}])

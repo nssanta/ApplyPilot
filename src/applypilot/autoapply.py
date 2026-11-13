@@ -103,13 +103,18 @@ def _manual_captcha(page, timeout_seconds: float, interactive: bool) -> bool:
     return False
 
 
+_LETTER_REQUIRED = re.compile(r"письм\w*\W+(?:\w+\W+){0,3}?обязательн|обязательн\w*\W+(?:\w+\W+){0,2}?сопроводительн")
+# HH prints this on the response page when the employer set a hard language
+# requirement above the resume's level; such responses are auto-rejected.
+_LANGUAGE_BELOW_REQUIRED = "ниже обязательного уровня"
+
+
 def _letter_required(text: str) -> bool:
+    # The two words must be near each other: a response page can say
+    # "Сопроводительное письмо · Добавить" and, elsewhere, "ниже обязательного
+    # уровня" about English, which is not a letter requirement.
     lowered = " ".join(str(text).split()).casefold()
-    return (
-        "сопроводительное письмо обязательное" in lowered
-        or "сопроводительное письмо обязательно" in lowered
-        or ("письмо" in lowered and "обязательн" in lowered)
-    )
+    return bool(_LETTER_REQUIRED.search(lowered))
 
 
 @dataclass(frozen=True)
@@ -210,7 +215,7 @@ def screening_answer_for(question: str, answers: dict | None) -> str:
     """Return only an explicitly configured private answer for a known prompt."""
     text = " ".join(str(question or "").casefold().split())
     answers = answers or {}
-    if re.search(r"salary|compensation|зарплат|доход|оклад", text):
+    if re.search(r"salary|compensation|зарплат|доход|оклад|от как\w* сумм|какую сумму|ожидаемая сумма", text):
         key = "salary"
     elif re.search(r"english|английск|уровень владения языком", text):
         key = "english"
@@ -522,6 +527,10 @@ def apply_one(page, item: dict, resume: str, cover_letter: str = "", dry_run: bo
                 return ApplyResult("needs_manual",
                                    f"{CAPTCHA_NOTE_PREFIX} in response form; no submit attempted")
             response_text = response_root.inner_text(timeout=2000).lower()
+        if _LANGUAGE_BELOW_REQUIRED in " ".join(response_text.split()).casefold():
+            return ApplyResult(
+                "needs_manual", "HH: resume language level is below the employer's required level",
+            )
         letter_required = _letter_required(response_text)
         if letter_required and not cover_letter.strip():
             # The visibility banner is frequently stale on HH. The actual
