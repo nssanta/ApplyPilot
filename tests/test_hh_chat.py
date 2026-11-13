@@ -318,6 +318,9 @@ def test_triage_kinds_and_answered_threads():
     taken = kind("Добрый день! Спасибо, что откликнулись на нашу вакансию. Мы взяли Ваше резюме "
                  "в работу, в случае положительного решения - вернемся с обратной связью.")
     assert taken["kind"] == "handed_over" and not taken["waiting_for_us"]
+    passing = kind("Зафиксировал, спасибо. Передаю информацию работодателю. Если ваши ответы "
+                   "будут соответствовать ожиданиям, представитель обсудит с вами детали.")
+    assert passing["kind"] == "handed_over" and not passing["waiting_for_us"]
     assert kind("Какой у вас опыт с PostgreSQL?")["kind"] == "question"
     answered = classify_thread([{"direction": "inbound", "text": "Есть опыт с Docker?"},
                                 {"direction": "outbound", "text": "Да, постоянно."}])
