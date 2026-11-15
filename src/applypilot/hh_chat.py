@@ -434,6 +434,9 @@ _DECLINED_INVITE = re.compile(
     r"(?:не готовы|не можем|не сможем)\s+(?:\w+\s+){0,3}пригласить|продолжить поиск",
     re.IGNORECASE,
 )
+# "К сожалению, не дождалась вашего ответа. Можем продолжить?" opens with a
+# rejection word but asks us to reply.
+_NUDGE = re.compile(r"не дожда\w* (?:вашего )?ответа|можем (?:ли )?(?:мы )?продолжить", re.IGNORECASE)
 # "Продолжаем рассматривать кандидатов ... по итогам собеседований" is a hold:
 # the employer owes the next step, not us.
 _STILL_DECIDING = re.compile(
@@ -474,6 +477,8 @@ def classify_thread(messages: list[dict]) -> dict:
     latest = str(known[-1].get("text") or "")
     if not waiting:
         kind = "answered"
+    elif _NUDGE.search(latest):
+        kind = "question"
     elif _DECLINED_INVITE.search(latest):
         kind = "rejection"
     elif _STILL_DECIDING.search(latest):
