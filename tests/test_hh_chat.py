@@ -321,6 +321,9 @@ def test_triage_kinds_and_answered_threads():
     passing = kind("Зафиксировал, спасибо. Передаю информацию работодателю. Если ваши ответы "
                    "будут соответствовать ожиданиям, представитель обсудит с вами детали.")
     assert passing["kind"] == "handed_over" and not passing["waiting_for_us"]
+    bot_done = kind("Спасибо! На этом работа ИИ-помощника завершена. Ваши данные уже есть у "
+                    "представителя работодателя, и если они подойдут, он продолжит общение.")
+    assert bot_done["kind"] == "handed_over" and not bot_done["waiting_for_us"]
     nudge = kind("Здравствуйте. К сожалению, не дождалась вашего ответа. "
                  "Мы можем продолжить наше общение по вакансии?")
     assert nudge["kind"] == "question" and nudge["waiting_for_us"]
