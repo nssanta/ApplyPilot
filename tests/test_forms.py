@@ -13,6 +13,8 @@ def test_answers_use_explicit_facts_and_leave_unknown_personal_questions_empty()
     assert answer_question("How many years of experience?", "number", (), answers, facts) == "3"
     assert answer_question("Do you have Python experience?", "radio", ["Да", "Нет"], answers, facts) == "Да"
     assert answer_question("How many years of Kubernetes experience?", "number", (), answers, facts) == ""
+    located = {"current_location": "Красноярск"}
+    assert answer_question("Где вы сейчас территориально находитесь?", "textarea", (), located, {}) == "Красноярск"
     assert answer_question("How many years of Python experience?", "number", (), answers, facts) == ""
     assert answer_question("Гражданство?", "text", (), answers, facts) == ""
 

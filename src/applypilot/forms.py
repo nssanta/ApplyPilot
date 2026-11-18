@@ -36,7 +36,7 @@ ANSWER_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("remote", ("удален", "удалён", "remote")),
     ("experience_years", ("сколько лет", "years of experience", "опыт работы", "стаж")),
     ("education", ("образование", "degree", "education")),
-    ("current_location", ("город", "location", "место жительства")),
+    ("current_location", ("город", "location", "место жительства", "территориально", "где вы находитесь", "где вы сейчас находитесь", "где вы проживаете")),
 )
 
 TECH_TERMS = {
